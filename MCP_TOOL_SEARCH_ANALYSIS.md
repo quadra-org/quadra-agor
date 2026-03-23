@@ -169,417 +169,397 @@ This means we could implement a hybrid approach: start with search tools, then d
 
 ---
 
-## 4. Framework Landscape & Build vs Buy
+## 4. Framework Landscape
 
 ### The Three Contenders
 
-| Framework | npm | Stars | What It Is |
-|-----------|-----|-------|-----------|
-| **@modelcontextprotocol/sdk** | `@modelcontextprotocol/sdk` | Official | The official MCP SDK. Low-level, protocol-correct. |
-| **FastMCP (TS)** | `fastmcp` | ~3K | Opinionated framework by punkpeye/glama. Built on Hono. |
-| **mcp-framework** | `mcp-framework` | ~1K | Directory-based tool discovery, OAuth 2.1, CLI scaffolding. |
+| Framework | npm | What It Is | Embed in Express? |
+|-----------|-----|-----------|-------------------|
+| **@modelcontextprotocol/sdk** | `@modelcontextprotocol/sdk` | Official MCP SDK. Protocol-correct, low-level. | **Yes** — Express middleware |
+| **FastMCP (TS)** | `fastmcp` | Opinionated framework (punkpeye/glama). Built on Hono. | **No** — Hono app, needs adapter |
+| **mcp-framework** | `mcp-framework` | Directory-based tool discovery, CLI scaffolding. | **No** — standalone process |
 
-### Feature Comparison
+FastMCP and mcp-framework are non-starters for our "plugin" constraint — they require their own process. **The Official SDK is the only option that mounts cleanly into our existing FeathersJS/Express app.**
 
-| Feature | Our Custom Server | Official SDK | FastMCP (TS) | mcp-framework |
-|---------|-------------------|-------------|-------------|---------------|
-| **Tool search** | No | No | No | No |
-| **Zod schemas** | No (raw JSON) | Yes | Yes | Yes |
-| **Tool annotations** | No | Yes (read-only, destructive, idempotent) | Yes | Yes |
-| **Streaming/SSE** | Custom (Socket.io) | Yes (Streamable HTTP) | Yes (HTTP Streaming + SSE) | Yes |
-| **Notifications (list_changed)** | No | Yes (built-in) | Yes | Unclear |
-| **Auth** | Custom JWT | Auth helpers | Built-in bearer/sessions | OAuth 2.1 |
-| **Express integration** | Native (it IS Express) | `@modelcontextprotocol/express` middleware | Via `server.getApp()` (Hono) | Standalone only |
-| **Embed in existing server** | N/A | **Yes** — mount at sub-route | **Partial** — Hono app, needs adapter | **No** — standalone process |
-| **Custom HTTP routes** | Yes (FeathersJS) | Via Express app | Yes (`server.addRoute()`) | No |
-| **Progress notifications** | No | Yes | Yes | No |
-| **Sampling/elicitation** | No | Yes (server-initiated) | Yes | No |
-| **Edge runtime** | No | No | Yes (Cloudflare Workers) | No |
+### Does the SDK Offer Tool Search?
 
-### Can They Be a "Plugin" in Our Server?
+**No built-in tool search.** No framework in any language ships tool search — FastMCP (Python) is the only one, and even there it's a "transform" add-on, not core.
 
-This is the key constraint — **no separate process, must mount under our existing FeathersJS/Express app**.
+**But the SDK gives us the perfect primitives to build it:**
 
-#### Official SDK: Yes, this works
-
-The SDK publishes `@modelcontextprotocol/express` which provides `createMcpExpressApp()` with Host header validation. The core pattern:
+The `RegisteredTool` object returned by `registerTool()` has:
 
 ```typescript
-import { McpServer } from '@modelcontextprotocol/server';
-import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/server/streamableHttp';
+interface RegisteredTool {
+  // Metadata
+  title?: string;
+  description?: string;
+  inputSchema?: AnySchema;       // Zod schema
+  outputSchema?: AnySchema;      // Zod schema
+  annotations?: ToolAnnotations; // { readOnlyHint, destructiveHint, idempotentHint, openWorldHint }
+  _meta?: Record<string, unknown>; // Custom metadata (categories, search tags, etc.)
 
-// Mount on our existing FeathersJS/Express app at /mcp
+  // Lifecycle — THE KEY PRIMITIVES
+  enabled: boolean;
+  enable(): void;   // Make tool visible in tools/list
+  disable(): void;  // Hide tool from tools/list (but keep registered)
+  remove(): void;   // Fully unregister
+
+  // Hot update without re-registration
+  update(updates: {
+    name?: string;
+    description?: string;
+    paramsSchema?: ZodSchema;
+    annotations?: ToolAnnotations;
+    callback?: ToolCallback;
+    enabled?: boolean;
+  }): void;
+}
+```
+
+Plus `McpServer` exposes:
+
+```typescript
+class McpServer {
+  sendToolListChanged(): void;  // Notify client to re-fetch tools/list
+  sendResourceListChanged(): void;
+  sendPromptListChanged(): void;
+  // ...
+}
+```
+
+**The pattern becomes:** register all 44 tools but `disable()` most of them. Register `search_tools` as always-enabled. When an agent searches, `enable()` the matching tools and call `sendToolListChanged()`. The SDK handles the protocol notification — the client re-fetches the tool list and now sees the discovered tools natively.
+
+This is **better than FastMCP's approach** because:
+- No `call_tool` proxy needed — discovered tools become real tools in the client
+- Agents see proper tool definitions with full schemas after discovery
+- No extra indirection layer
+- Works with any MCP client, not just ones that understand a custom `call_tool` convention
+
+### Feature Comparison: What We Gain
+
+| Feature | Our Custom Server | Official SDK |
+|---------|-------------------|-------------|
+| **Tool search** | No | No (but `enable()/disable()/sendToolListChanged()` makes it trivial) |
+| **Zod schema validation** | No (raw JSON, no validation) | Yes — invalid inputs caught before handler |
+| **Tool annotations** | No | `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint` |
+| **Output schemas** | No | Yes — structured responses with validation |
+| **Dynamic tool visibility** | No | `enable()` / `disable()` + `sendToolListChanged()` |
+| **Hot tool updates** | No | `tool.update({ description, schema, ... })` without re-register |
+| **Progress notifications** | No | Yes — agents see progress for long ops (env start, repo clone) |
+| **Logging** | Console only | `ctx.mcpReq.log('info', ...)` — structured logging to client |
+| **Sampling/elicitation** | No | Server can ask the LLM questions mid-tool |
+| **Custom tool metadata** | No | `_meta` field — categories, search keywords, anything |
+| **Protocol evolution** | Manual patches | SDK upgrade |
+| **JSON-RPC handling** | Custom (500+ lines) | SDK handles framing, errors, capabilities |
+| **Express integration** | Native | `@modelcontextprotocol/express` middleware at sub-route |
+
+### What We Lose
+
+- Direct control over JSON-RPC parsing (but we don't need it — it's boilerplate)
+- Our custom session token validation wraps the SDK handler (straightforward)
+- Some familiarity with the current monolithic code
+
+---
+
+## 5. Recommendation: Migrate to Official SDK
+
+### Why the SDK, not a quick patch
+
+The original analysis recommended a phased approach (quick search now, SDK later). After deeper analysis of the SDK's `RegisteredTool` API, **the SDK migration IS the tool search implementation**. The `enable()`/`disable()`/`sendToolListChanged()` primitives are exactly what we need — building this on our custom server would mean reimplementing what the SDK already provides.
+
+The SDK also gives us a natural decomposition of `routes.ts` (currently 4,300 lines) — each tool becomes a `registerTool()` call with co-located definition + handler, which is the refactoring we wanted anyway.
+
+### Implementation Plan
+
+#### Phase 1: SDK Scaffolding + Express Mount (0.5 day)
+
+Replace the custom JSON-RPC handler with the SDK's `McpServer`, mounted at the same `/mcp` endpoint.
+
+```typescript
+// apps/agor-daemon/src/mcp/server.ts
+
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+
+export function createAgorMcpServer() {
+  return new McpServer(
+    { name: 'agor', version: '0.15.0' },
+    { capabilities: { tools: { listChanged: true }, logging: {} } }
+  );
+}
+```
+
+Mount in `apps/agor-daemon/src/index.ts`:
+
+```typescript
 app.post('/mcp', async (req, res) => {
-  const server = new McpServer({ name: 'agor', version: '0.14.3' });
-  // Register tools with Zod schemas
-  server.registerTool('agor_sessions_list', {
-    description: 'List all sessions...',
-    inputSchema: z.object({ limit: z.number().optional(), ... }),
-  }, async (args) => { ... });
+  const sessionToken = req.query.sessionToken as string;
+  const context = await validateSessionToken(app, sessionToken);
+  if (!context) return res.status(401).json({ ... });
 
-  const transport = new NodeStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  const server = createAgorMcpServer();
+  registerAllTools(server, { app, db, context });
+
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   await server.connect(transport);
   await transport.handleRequest(req, res, req.body);
 });
 ```
 
-This replaces our custom JSON-RPC parsing with the SDK's transport layer, while keeping everything inside the same Express process.
+**Deliverable:** SDK serving the same tools, passing existing behavior tests.
 
-**Benefits beyond tool search:**
-- Protocol correctness for free (JSON-RPC framing, error codes, capability negotiation)
-- `notifications/tools/list_changed` built-in — needed for dynamic tool exposure
-- Tool annotations (mark tools as `destructive`, `readOnlyHint`, `idempotent`) — helps agents make better choices
-- Zod schema validation — catch bad inputs before they hit our services
-- Progress notifications — agents can show progress for long-running operations (environment start, repo clone)
-- Sampling/elicitation — server can ask the LLM questions mid-tool-execution
-- Future protocol changes handled by upgrading the SDK, not patching our code
+#### Phase 2: Migrate Tool Definitions + Handlers (2-3 days)
 
-**What we'd lose:**
-- Direct control over JSON-RPC parsing (but we don't need it)
-- Our custom session token validation would need to wrap the SDK handler
+Convert all 44 tools from inline JSON to `registerTool()` with Zod schemas. Group by domain into separate files:
 
-#### FastMCP (TS): Awkward fit
+```
+apps/agor-daemon/src/mcp/
+├── server.ts              # McpServer factory + Express mount
+├── tools/
+│   ├── sessions.ts        # 9 session tools
+│   ├── worktrees.ts       # 8 worktree tools
+│   ├── environment.ts     # 6 environment tools
+│   ├── users.ts           # 6 user tools
+│   ├── repos.ts           # 4 repo tools
+│   ├── boards.ts          # 4 board tools
+│   ├── mcp-servers.ts     # 3 MCP server tools
+│   ├── tasks.ts           # 2 task tools
+│   ├── messages.ts        # 1 message tool
+│   ├── analytics.ts       # 1 analytics tool
+│   └── search.ts          # search_tools (Phase 3)
+├── tokens.ts              # JWT auth (unchanged)
+└── routes.ts              # DELETED after migration
+```
 
-FastMCP uses Hono internally, not Express. You can get the Hono app via `server.getApp()`, but mounting a Hono app inside an Express app requires an adapter. It's designed as a standalone server.
-
-**Verdict:** Not a good fit for our "plugin" requirement. We'd be fighting the framework.
-
-#### mcp-framework: No
-
-Designed as a standalone process with its own CLI. No embedding API.
-
-**Verdict:** Won't work.
-
-### Framework Recommendation
-
-**If we want a framework: go with the Official SDK (`@modelcontextprotocol/sdk`).**
-
-It's the only one that cleanly mounts into our existing Express app. It gives us protocol correctness, notifications, annotations, and Zod validation — all things we'd eventually want anyway. And we'd still build tool search ourselves on top (no framework offers it).
-
-### Updated Options
-
-#### Option A: Add Tool Search to Our Custom Server (Minimal)
-
-Just add `search_tools` + `call_tool` to the existing `routes.ts`. No refactoring.
-
-| Aspect | Assessment |
-|--------|-----------|
-| **Effort** | Low (1-2 days) |
-| **Risk** | Low — additive change |
-| **Token savings** | 88-96% |
-| **Framework benefits** | None |
-| **Maintenance** | More custom code to maintain |
-
-#### Option B: Migrate to Official SDK + Add Tool Search
-
-Replace our custom JSON-RPC handler with `McpServer` from the official SDK. Add tool search on top.
-
-| Aspect | Assessment |
-|--------|-----------|
-| **Effort** | Medium (3-5 days) |
-| **Risk** | Medium — rewrite of handler code, but tool definitions stay similar |
-| **Token savings** | 88-96% |
-| **Framework benefits** | Protocol correctness, notifications, annotations, Zod, progress, sampling |
-| **Maintenance** | Less custom code, SDK handles protocol evolution |
-
-**Migration path:** The SDK's `registerTool` API is very close to our current inline definitions. Each tool becomes a `server.registerTool(name, { description, inputSchema: z.object(...) }, handler)` call. The 44 tool handlers mostly stay the same — they already dispatch to FeathersJS services.
-
-#### Option C: Hybrid Refactor + Tool Search (Previous Recommendation)
-
-Extract tool registry + handlers from `routes.ts`, add search layer, keep custom JSON-RPC.
-
-| Aspect | Assessment |
-|--------|-----------|
-| **Effort** | Low-Medium (2-3 days) |
-| **Risk** | Low — refactor, not rewrite |
-| **Token savings** | 88-96% |
-| **Framework benefits** | None (but cleaner code structure) |
-| **Maintenance** | We own everything |
-
-#### Option D: Official SDK + Tool Search + Phased Migration
-
-Start with tool search on our custom server (Option A), then migrate to the SDK incrementally.
-
-| Aspect | Assessment |
-|--------|-----------|
-| **Effort** | 1-2 days now, 2-3 days later |
-| **Risk** | Lowest — get value immediately, migrate when ready |
-| **Token savings** | 88-96% immediately |
-| **Framework benefits** | Deferred but planned |
-
-### Decision Matrix
-
-| Criteria | Weight | Option A (Quick) | Option B (SDK) | Option C (Refactor) | Option D (Phased) |
-|----------|--------|---------|---------|---------|---------|
-| Time to token savings | High | ★★★ | ★★ | ★★★ | ★★★ |
-| Long-term maintainability | High | ★ | ★★★ | ★★ | ★★★ |
-| Protocol correctness | Medium | ★ | ★★★ | ★ | ★★★ |
-| Risk | High | ★★★ | ★★ | ★★★ | ★★★ |
-| Future-proofing | Medium | ★ | ★★★ | ★★ | ★★★ |
-| **Total** | | 9 | 13 | 11 | **15** |
-
----
-
-## 5. Recommendation
-
-### Go with Option D: Phased — Tool Search Now, SDK Migration Later
-
-**Why:**
-- **Immediate value** — get 88-96% token savings in 1-2 days
-- **Lowest risk** — additive change, no rewrite
-- **Clear upgrade path** — migrate to official SDK when ready for notifications, annotations, Zod, progress
-- **Best of both worlds** — don't delay token savings waiting for a larger migration
-
-### Implementation Plan
-
-#### Phase 1: Extract Tool Registry (1 day)
-
-Create `apps/agor-daemon/src/mcp/tool-registry.ts`:
+Each tool file exports a `register` function:
 
 ```typescript
-export interface ToolDefinition {
-  name: string;
-  description: string;
-  inputSchema: object;
-  category: string;        // for search boost
-  alwaysVisible?: boolean; // exempt from search-only mode
+// apps/agor-daemon/src/mcp/tools/sessions.ts
+import { z } from 'zod';
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+
+export function registerSessionTools(server: McpServer, ctx: ToolContext) {
+  server.registerTool('agor_sessions_list', {
+    description: 'List all sessions accessible to the current user.',
+    inputSchema: z.object({
+      limit: z.number().optional().describe('Maximum number of sessions to return (default: 50)'),
+      status: z.enum(['idle', 'running', 'completed', 'failed']).optional().describe('Filter by session status'),
+      boardId: z.string().optional().describe('Filter sessions by board ID (UUIDv7 or short ID)'),
+      worktreeId: z.string().optional().describe('Filter sessions by worktree ID'),
+      includeArchived: z.boolean().optional().describe('Include archived sessions in results (default: false)'),
+      archived: z.boolean().optional().describe('Filter to show ONLY archived sessions'),
+    }),
+    annotations: { readOnlyHint: true },
+  }, async (args) => {
+    const query = {};
+    if (args.limit) query.$limit = args.limit;
+    // ... existing handler logic, unchanged
+    const sessions = await ctx.app.service('sessions').find({ query, ...ctx.baseParams });
+    return { content: [{ type: 'text', text: JSON.stringify(sessions, null, 2) }] };
+  });
+
+  server.registerTool('agor_sessions_spawn', {
+    description: 'Spawn a child session for delegating work to another agent.',
+    inputSchema: z.object({
+      prompt: z.string().describe('The prompt/task for the subsession agent to execute'),
+      title: z.string().optional().describe('Optional title for the session'),
+      agenticTool: z.enum(['claude-code', 'codex', 'gemini', 'opencode']).optional(),
+      enableCallback: z.boolean().optional().describe('Enable callback to parent on completion (default: true)'),
+      // ...
+    }),
+    annotations: { destructiveHint: false, idempotentHint: false },
+  }, async (args) => {
+    // ... existing spawn handler
+  });
+
+  // ... 7 more session tools
 }
-
-export const toolRegistry: Map<string, ToolDefinition> = new Map();
-
-// Register all 44 tools
-toolRegistry.set('agor_sessions_list', {
-  name: 'agor_sessions_list',
-  description: 'List all sessions...',
-  inputSchema: { ... },
-  category: 'sessions',
-});
-// ... etc
 ```
 
-#### Phase 2: Extract Tool Handlers (1 day)
+**Key annotation decisions:**
 
-Create `apps/agor-daemon/src/mcp/tool-handlers.ts`:
+| Tool Category | Annotations |
+|--------------|------------|
+| All `*_list`, `*_get`, `*_get_current` | `readOnlyHint: true` |
+| `*_create`, `*_spawn` | `destructiveHint: false` |
+| `*_update`, `*_set_zone` | `destructiveHint: false, idempotentHint: true` |
+| `*_archive`, `*_delete`, `*_nuke` | `destructiveHint: true` |
+| `environment_start/stop` | `idempotentHint: true` |
 
-```typescript
-export type ToolHandler = (
-  args: Record<string, unknown>,
-  context: { userId: string; sessionId: string; app: Application; db: Database }
-) => Promise<MCPToolResult>;
-
-export const toolHandlers: Map<string, ToolHandler> = new Map();
-
-toolHandlers.set('agor_sessions_list', async (args, ctx) => {
-  const query: Record<string, unknown> = {};
-  if (args.limit) query.$limit = args.limit;
-  // ...
-  const sessions = await ctx.app.service('sessions').find({ query, ...baseParams });
-  return { content: [{ type: 'text', text: JSON.stringify(sessions, null, 2) }] };
-});
-```
+**Deliverable:** `routes.ts` replaced by `server.ts` + 10 domain files. All 44 tools registered with Zod schemas and annotations.
 
 #### Phase 3: Add Tool Search (1 day)
 
-Add two synthetic tools:
+Register `agor_search_tools` as an always-enabled tool. All other tools start disabled.
 
 ```typescript
-// search_tools: searches registry by keyword
-toolRegistry.set('search_tools', {
-  name: 'search_tools',
-  description: 'Search for available Agor tools by keyword. Returns matching tool definitions with full schemas. Use this before calling tools you haven\'t seen yet.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      query: { type: 'string', description: 'Search query (matches tool names, descriptions, parameter names)' },
-      max_results: { type: 'number', description: 'Maximum results to return (default: 5)' },
-    },
-    required: ['query'],
-  },
-  category: 'meta',
-  alwaysVisible: true,
-});
-```
+// apps/agor-daemon/src/mcp/tools/search.ts
+import { z } from 'zod';
+import type { McpServer, RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
 
-Search implementation — simple substring matching is sufficient for 44 tools:
+// Tools that are always visible (no search needed)
+const ALWAYS_VISIBLE = new Set([
+  'agor_search_tools',
+  'agor_sessions_get_current',
+  'agor_sessions_spawn',
+  'agor_sessions_prompt',
+]);
 
-```typescript
-function searchTools(query: string, maxResults = 5): ToolDefinition[] {
-  const terms = query.toLowerCase().split(/\s+/);
-  const scored = [...toolRegistry.values()]
-    .filter(t => !t.alwaysVisible) // don't return meta tools
-    .map(tool => {
-      const text = `${tool.name} ${tool.description} ${JSON.stringify(tool.inputSchema)}`.toLowerCase();
-      const score = terms.reduce((s, term) => s + (text.includes(term) ? 1 : 0), 0);
-      return { tool, score };
-    })
-    .filter(({ score }) => score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, maxResults);
-  return scored.map(({ tool }) => tool);
-}
-```
+export function registerSearchTool(
+  server: McpServer,
+  allTools: Map<string, { def: ToolDefinition; registered: RegisteredTool }>
+) {
+  server.registerTool('agor_search_tools', {
+    description: [
+      'Search for available Agor MCP tools by keyword.',
+      'Returns matching tool definitions with full parameter schemas.',
+      'After searching, matching tools become available for direct use.',
+      'Example queries: "worktree create", "session spawn", "board zone", "environment logs".',
+    ].join(' '),
+    inputSchema: z.object({
+      query: z.string().describe('Search keywords (matches tool names, descriptions, parameters)'),
+      max_results: z.number().min(1).max(20).optional().describe('Max results (default: 5)'),
+    }),
+    annotations: { readOnlyHint: true },
+  }, async ({ query, max_results }) => {
+    const results = searchTools([...allTools.values()].map(t => t.def), query, max_results ?? 5);
 
-#### Phase 4: Configurable Mode (0.5 day)
-
-Make tool search opt-in via config or per-session setting:
-
-```typescript
-// In tools/list handler:
-if (toolSearchEnabled) {
-  // Return only: search_tools + always_visible tools
-  return tools.filter(t => t.alwaysVisible);
-} else {
-  // Return all tools (current behavior)
-  return [...toolRegistry.values()];
-}
-```
-
-Suggested `alwaysVisible` tools (most commonly needed):
-- `search_tools` — tool discovery
-- `agor_sessions_get_current` — session context (agents need this immediately)
-- `agor_sessions_spawn` — multi-agent orchestration
-- `agor_sessions_prompt` — continue/fork/subsession
-
-#### Phase 5: Dynamic Tool Exposure via list_changed (optional, 0.5 day)
-
-After an agent discovers tools via search, dynamically add them to the tool list and send `notifications/tools/list_changed`. This way, agents only pay the token cost for tools they actually use, and subsequent turns don't require re-searching.
-
-### Effort Summary
-
-| Phase | Effort | Description |
-|-------|--------|-------------|
-| 1. Tool Registry | 1 day | Extract definitions from routes.ts |
-| 2. Tool Handlers | 1 day | Extract handlers into dispatch map |
-| 3. Tool Search | 1 day | search_tools + matching logic |
-| 4. Config | 0.5 day | Opt-in mode, always_visible list |
-| 5. list_changed | 0.5 day | Dynamic tool exposure (optional) |
-| **Total** | **3-4 days** | |
-
-### Expected Impact
-
-| Metric | Before | After | Improvement |
-|--------|--------|-------|-------------|
-| Tokens per tools/list | ~13,000 | ~1,500 | **88% reduction** |
-| Context window pressure | 6.5% | 0.75% | **5.75% reclaimed** |
-| Opus cost at 10K req/day | $58.50/mo | $7.02/mo | **$51.48/mo saved** |
-| Scalability | Linear growth | Constant | **Decoupled from tool count** |
-
----
-
-## 6. Prototype: Tool Search Implementation
-
-Below is a minimal working prototype that can be dropped into the existing codebase:
-
-```typescript
-// apps/agor-daemon/src/mcp/tool-search.ts
-
-interface ToolDef {
-  name: string;
-  description: string;
-  inputSchema: Record<string, unknown>;
-}
-
-/**
- * Simple term-frequency search over tool definitions.
- * Searches tool names, descriptions, and parameter names/descriptions.
- */
-export function searchTools(
-  tools: ToolDef[],
-  query: string,
-  maxResults = 5
-): ToolDef[] {
-  const terms = query
-    .toLowerCase()
-    .split(/\s+/)
-    .filter((t) => t.length > 0);
-
-  if (terms.length === 0) return tools.slice(0, maxResults);
-
-  const scored = tools.map((tool) => {
-    // Build searchable text from all tool metadata
-    const searchText = buildSearchText(tool).toLowerCase();
-
-    // Score: count matching terms + bonus for name matches
-    let score = 0;
-    for (const term of terms) {
-      if (tool.name.toLowerCase().includes(term)) score += 3; // name match = 3x weight
-      if (searchText.includes(term)) score += 1;
+    // Enable discovered tools so they appear in subsequent tools/list
+    for (const result of results) {
+      const tool = allTools.get(result.name);
+      if (tool && !tool.registered.enabled) {
+        tool.registered.enable();
+      }
     }
-    return { tool, score };
+
+    // Notify client that tool list has changed
+    if (results.length > 0) {
+      server.sendToolListChanged();
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(results.map(r => ({
+          name: r.name,
+          description: r.description,
+          inputSchema: r.inputSchema,
+        })), null, 2),
+      }],
+    };
   });
 
-  return scored
+  // Disable non-essential tools initially
+  for (const [name, tool] of allTools) {
+    if (!ALWAYS_VISIBLE.has(name)) {
+      tool.registered.disable();
+    }
+  }
+}
+```
+
+The search logic itself — simple weighted substring matching:
+
+```typescript
+function searchTools(tools: ToolDefinition[], query: string, maxResults: number): ToolDefinition[] {
+  const terms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
+  if (terms.length === 0) return tools.slice(0, maxResults);
+
+  return tools
+    .map(tool => {
+      const nameText = tool.name.toLowerCase();
+      const descText = tool.description.toLowerCase();
+      const schemaText = JSON.stringify(tool.inputSchema).toLowerCase();
+      let score = 0;
+      for (const term of terms) {
+        if (nameText.includes(term)) score += 3;
+        if (descText.includes(term)) score += 2;
+        if (schemaText.includes(term)) score += 1;
+      }
+      return { tool, score };
+    })
     .filter(({ score }) => score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, maxResults)
     .map(({ tool }) => tool);
 }
-
-function buildSearchText(tool: ToolDef): string {
-  const parts = [tool.name, tool.description];
-
-  // Extract parameter names and descriptions from schema
-  const props = (tool.inputSchema as Record<string, unknown>)?.properties;
-  if (props && typeof props === 'object') {
-    for (const [key, value] of Object.entries(props)) {
-      parts.push(key);
-      if (value && typeof value === 'object' && 'description' in value) {
-        parts.push(String((value as { description: string }).description));
-      }
-    }
-  }
-
-  return parts.join(' ');
-}
-
-/**
- * The search_tools tool definition itself
- */
-export const SEARCH_TOOLS_DEF: ToolDef = {
-  name: 'agor_search_tools',
-  description:
-    'Search for available Agor MCP tools by keyword. Returns matching tool definitions with full parameter schemas so you can call them. Use this to discover tools before calling them. Example queries: "worktree", "session spawn", "board zone", "environment logs".',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      query: {
-        type: 'string',
-        description:
-          'Search query — matches against tool names, descriptions, and parameter names. Use keywords like "session", "worktree", "board", "environment", etc.',
-      },
-      max_results: {
-        type: 'number',
-        description: 'Maximum number of tool definitions to return (default: 5, max: 10)',
-      },
-    },
-    required: ['query'],
-  },
-};
 ```
 
-### Integration Point
+**Agent UX flow with `enable()` + `sendToolListChanged()`:**
 
-In the existing `tools/list` handler in `routes.ts`, the change would be minimal:
-
-```typescript
-// Before (current):
-mcpResponse = { tools: ALL_44_TOOLS };
-
-// After (with tool search enabled):
-const alwaysVisible = allTools.filter(t => ALWAYS_VISIBLE.has(t.name));
-mcpResponse = { tools: [SEARCH_TOOLS_DEF, ...alwaysVisible] };
-
-// In the tools/call handler, add:
-if (name === 'agor_search_tools') {
-  const results = searchTools(allTools, args.query, args.max_results ?? 5);
-  mcpResponse = {
-    content: [{
-      type: 'text',
-      text: JSON.stringify(results, null, 2),
-    }],
-  };
-}
 ```
+Turn 1: Agent sees tools → [agor_search_tools, agor_sessions_get_current, agor_sessions_spawn, agor_sessions_prompt]
+         Agent calls: agor_search_tools({ query: "worktree create" })
+         Server: enables agor_worktrees_create, agor_worktrees_list, sends list_changed
+         Returns: matching tool definitions
+
+Turn 2: Client re-fetches tools/list → now sees worktree tools as REAL tools
+         Agent calls: agor_worktrees_create({ repoId: "...", ... })  ← native tool call, no proxy!
+```
+
+This is **strictly better than FastMCP's `call_tool` proxy** — discovered tools become first-class citizens in the client.
+
+**Deliverable:** Tool search working, agents see only 4 tools initially, discovered tools materialize as real tools.
+
+#### Phase 4: Configuration + Polish (0.5 day)
+
+Make tool search mode configurable:
+
+```yaml
+# ~/.agor/config.yaml
+mcp:
+  tool_search: true         # Enable search mode (default: true for new installs)
+  always_visible:            # Override default always-visible tools
+    - agor_search_tools
+    - agor_sessions_get_current
+    - agor_sessions_spawn
+    - agor_sessions_prompt
+```
+
+Add a fallback: if `tool_search: false`, all tools are enabled (current behavior). Existing users aren't affected.
+
+**Deliverable:** Opt-in/opt-out config, backwards compatible.
+
+### Effort Summary
+
+| Phase | Effort | What |
+|-------|--------|------|
+| 1. SDK Scaffolding | 0.5 day | McpServer + Express mount, same endpoint |
+| 2. Tool Migration | 2-3 days | 44 tools → Zod schemas + annotations, split into 10 domain files |
+| 3. Tool Search | 1 day | `agor_search_tools` + `enable()/disable()/sendToolListChanged()` |
+| 4. Config + Polish | 0.5 day | Config flag, always_visible override, backwards compat |
+| **Total** | **4-5 days** |
+
+### Expected Impact
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| Tokens per tools/list | ~13,000 | ~1,500 (4 always-visible) | **88% reduction** |
+| Context window pressure | 6.5% | 0.75% | **5.75% reclaimed** |
+| Opus cost at 10K req/day | $58.50/mo | $7.02/mo | **$51.48/mo saved** |
+| Scalability | Linear growth | Constant | **Decoupled from tool count** |
+| routes.ts | 4,300 lines (monolith) | Deleted | **10 focused domain files** |
+| Input validation | None | Zod schemas | **Bad inputs caught early** |
+| Agent safety hints | None | Tool annotations | **Agents know which tools are destructive** |
+| Protocol correctness | Best-effort | SDK-guaranteed | **Future-proof** |
+
+---
+
+## 6. Why This Is Better Than FastMCP's Approach
+
+FastMCP (Python) uses a `call_tool` proxy — agents discover tools via search, then call them indirectly through a generic proxy tool. The SDK's `enable()`/`disable()` + `sendToolListChanged()` pattern is strictly better:
+
+| Aspect | FastMCP `call_tool` Proxy | SDK `enable()` + `sendToolListChanged()` |
+|--------|--------------------------|----------------------------------------|
+| **Tool calling** | Indirect via `call_tool(name, args)` | Native tool calls — full schema in client |
+| **Schema validation** | Proxy validates | SDK validates with Zod before handler |
+| **Client compatibility** | Custom convention | Standard MCP protocol |
+| **Agent experience** | Must remember tool names from search results | Tools appear as real tools after search |
+| **Extra round-trips** | 1 (search) + proxy overhead per call | 1 (search) + auto-refresh via list_changed |
+| **Annotation support** | No | Yes — destructive/readonly hints on discovered tools |
+
+The key insight: **discovered tools become first-class tools** in the client. No proxy, no indirection, no custom conventions. The MCP protocol's `list_changed` notification is the right abstraction.
 
 ---
 
