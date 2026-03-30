@@ -39,7 +39,7 @@ import type express from 'express';
  *   ?name=MyApp     — Custom app name (default: "Agor")
  *   ?org=my-org     — Create under an org (default: user's personal account)
  */
-function handleNewApp(uiUrl: string) {
+function handleNewApp(uiUrl: string, daemonUrl: string) {
   return (req: express.Request, res: express.Response) => {
     const appName = (req.query.name as string) || 'Agor';
     const org = req.query.org as string | undefined;
@@ -57,10 +57,10 @@ function handleNewApp(uiUrl: string) {
     params.set('public', 'false');
     // Do NOT set webhook_active — GitHub docs say "Webhook is disabled by default"
     // when the parameter is omitted. Setting it to any value (even "false") enables it.
-    // setup_url points to the UI — GitHub redirects the browser there after
-    // installation with ?installation_id=ID. The UI detects this and opens
-    // the settings modal to complete channel setup.
-    params.set('setup_url', `${uiUrl}/gateway/github/setup`);
+    // setup_url points to the daemon callback — GitHub redirects the browser there
+    // after installation with ?installation_id=ID. The callback writes the
+    // installation_id directly to the GitHub channel config in the DB.
+    params.set('setup_url', `${daemonUrl}/api/github/setup/callback`);
     // Permissions
     params.set('issues', 'write');
     params.set('pull_requests', 'write');
@@ -107,9 +107,75 @@ function handleNewApp(uiUrl: string) {
   };
 }
 
-// No daemon callback route needed — setup_url points directly to the UI.
-// GitHub redirects the browser to: {uiUrl}/gateway/github/setup?installation_id=ID
-// The UI's useEffect detects this and opens the settings modal.
+/**
+ * GET /api/github/setup/callback?installation_id=ID
+ *
+ * GitHub redirects the browser here after the app is installed.
+ * Finds the GitHub gateway channel and sets the installation_id on it,
+ * then shows a "done, close this tab" page.
+ */
+function handleSetupCallback(db: Database) {
+  return async (req: express.Request, res: express.Response) => {
+    const installationId = req.query.installation_id as string | undefined;
+
+    if (!installationId) {
+      res.status(400).send('Missing installation_id parameter');
+      return;
+    }
+
+    const installationIdNum = Number(installationId);
+    if (Number.isNaN(installationIdNum)) {
+      res.status(400).send('installation_id must be a number');
+      return;
+    }
+
+    try {
+      const { GatewayChannelRepository } = await import('@agor/core/db');
+      const channelRepo = new GatewayChannelRepository(db);
+      const channels = await channelRepo.findAll();
+      const githubChannel = channels.find((ch) => ch.channel_type === 'github');
+
+      if (!githubChannel) {
+        res.status(404).send('No GitHub gateway channel found. Create one first in Settings.');
+        return;
+      }
+
+      // Merge installation_id into existing config
+      const config = { ...(githubChannel.config as Record<string, unknown>) };
+      config.installation_id = installationIdNum;
+      await channelRepo.update(githubChannel.id, { config });
+
+      console.log(
+        `[github-app-setup] Set installation_id=${installationIdNum} on channel "${githubChannel.name}"`
+      );
+
+      res.setHeader('Content-Type', 'text/html');
+      res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <title>GitHub App Installed — Agor</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #0d1117; color: #e6edf3; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 32px; max-width: 420px; text-align: center; }
+    h2 { margin: 0 0 12px; color: #3fb950; }
+    p { color: #8b949e; margin: 0; line-height: 1.6; }
+    code { background: #30363d; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>GitHub App Installed</h2>
+    <p>Installation ID <code>${installationIdNum}</code> saved to channel <strong>${githubChannel.name}</strong>.</p>
+    <p style="margin-top: 12px;">You can close this tab. The gateway will start polling shortly.</p>
+  </div>
+</body>
+</html>`);
+    } catch (error) {
+      console.error('[github-app-setup] Callback error:', error);
+      res.status(500).send('Failed to save installation_id');
+    }
+  };
+}
 
 /**
  * GET /api/github/installations?app_id=APP_ID&private_key=...
@@ -215,11 +281,15 @@ export function registerGitHubAppSetupRoutes(
   app: any,
   opts: {
     uiUrl: string;
+    daemonUrl: string;
     db: Database;
   }
 ): void {
-  app.get('/api/github/setup/new', handleNewApp(opts.uiUrl));
+  app.get('/api/github/setup/new', handleNewApp(opts.uiUrl, opts.daemonUrl));
+  app.get('/api/github/setup/callback', handleSetupCallback(opts.db));
   app.get('/api/github/installations', handleListInstallations(opts.db));
 
-  console.log('[github-app-setup] Routes registered: /api/github/setup/new, installations');
+  console.log(
+    '[github-app-setup] Routes registered: /api/github/setup/new, callback, installations'
+  );
 }

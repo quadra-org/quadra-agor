@@ -2655,6 +2655,7 @@ async function main() {
   const uiUrl = isProduction ? `${daemonUrl}/ui` : `http://localhost:${UI_PORT}`;
   registerGitHubAppSetupRoutes(app, {
     uiUrl,
+    daemonUrl,
     db,
   });
 

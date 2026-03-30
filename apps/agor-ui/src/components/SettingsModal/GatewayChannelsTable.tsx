@@ -395,6 +395,14 @@ const ChannelFormFields: React.FC<{
                 />
               </Form.Item>
 
+              <Form.Item
+                label="Installation ID"
+                name="github_installation_id"
+                tooltip="Set automatically via the setup callback, or paste from your GitHub App's installation URL"
+              >
+                <Input placeholder="123456789" />
+              </Form.Item>
+
               {githubError && (
                 <Alert type="error" showIcon message={githubError} style={{ marginBottom: 12 }} />
               )}
@@ -473,6 +481,13 @@ const ChannelFormFields: React.FC<{
                                 }
                                 style={{ fontFamily: 'monospace', fontSize: 11 }}
                               />
+                            </Form.Item>
+                            <Form.Item
+                              label="Installation ID"
+                              name="github_installation_id"
+                              tooltip="Set automatically via the setup callback, or paste from your GitHub App's installation URL"
+                            >
+                              <Input placeholder="123456789" />
                             </Form.Item>
                           </>
                         ),
