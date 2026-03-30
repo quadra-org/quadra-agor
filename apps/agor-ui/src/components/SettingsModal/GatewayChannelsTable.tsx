@@ -506,22 +506,14 @@ const ChannelFormFields: React.FC<{
                   children: (
                     <>
                       <Form.Item
-                        label="Owner"
-                        name="github_owner"
-                        rules={[{ required: true, message: 'GitHub org or user name is required' }]}
-                        tooltip="GitHub organization or user that owns the repos (e.g. 'preset-io')"
-                      >
-                        <Input placeholder="preset-io" />
-                      </Form.Item>
-
-                      <Form.Item
                         label="Watch Repos"
                         name="github_watch_repos"
-                        tooltip="Repos to watch for @mentions. Leave empty to watch all repos accessible to the installation."
+                        rules={[{ required: true, message: 'At least one repo is required' }]}
+                        tooltip="Repos to watch for @mentions, in owner/repo format"
                       >
                         <Select
                           mode="tags"
-                          placeholder="owner/repo (leave empty for all)"
+                          placeholder="preset-io/agor"
                           tokenSeparators={[',', ' ']}
                         />
                       </Form.Item>
@@ -1050,9 +1042,6 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
       if (values.github_installation_id) {
         config.installation_id = Number(values.github_installation_id);
       }
-      if (values.github_owner) {
-        config.owner = values.github_owner;
-      }
       config.watch_repos = values.github_watch_repos ?? [];
       config.require_mention = values.github_require_mention ?? true;
       config.mention_name = values.github_mention_name || 'agor';
@@ -1189,7 +1178,6 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
     } else if (channel.channel_type === 'github') {
       formValues.github_app_id = config?.app_id;
       formValues.github_installation_id = config?.installation_id;
-      formValues.github_owner = config?.owner;
       formValues.github_watch_repos = (config?.watch_repos as string[]) ?? [];
       formValues.github_require_mention = config?.require_mention ?? true;
       formValues.github_mention_name = (config?.mention_name as string) || 'agor';
