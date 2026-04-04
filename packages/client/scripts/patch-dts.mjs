@@ -17,6 +17,8 @@ import { fileURLToPath } from 'node:url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const distDir = join(__dirname, '..', 'dist');
 
+let failed = false;
+
 for (const file of ['index.d.ts', 'index.d.cts']) {
   const path = join(distDir, file);
   let content = readFileSync(path, 'utf8');
@@ -31,4 +33,20 @@ for (const file of ['index.d.ts', 'index.d.cts']) {
   } else {
     console.log(`✓ ${file} — no @agor/core references found`);
   }
+
+  // Hard assertion: fail the build if any @agor/core references remain
+  const final = readFileSync(path, 'utf8');
+  const remaining = final.match(/@agor\/core[^'"]*/g);
+  if (remaining) {
+    console.error(`❌ ${file} still contains @agor/core references after patching:`);
+    for (const ref of remaining) {
+      console.error(`   ${ref}`);
+    }
+    failed = true;
+  }
+}
+
+if (failed) {
+  console.error('\nBuild failed: @agor-live/client must be fully self-contained.');
+  process.exit(1);
 }

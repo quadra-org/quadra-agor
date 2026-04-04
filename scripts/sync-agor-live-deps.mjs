@@ -8,7 +8,9 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const repoRoot = resolve(__dirname, '..');
 
-const targetManifest = 'packages/agor-live/package.json';
+// Target packages whose dependencies should stay in sync with workspace sources
+const targetManifests = ['packages/agor-live/package.json', 'packages/client/package.json'];
+
 const sourceManifests = [
   'packages/core/package.json',
   'apps/agor-cli/package.json',
@@ -23,9 +25,7 @@ const readJson = (relPath) => JSON.parse(readFileSync(resolve(repoRoot, relPath)
 const writeJson = (relPath, data) =>
   writeFileSync(resolve(repoRoot, relPath), `${JSON.stringify(data, null, 2)}\n`);
 
-const target = readJson(targetManifest);
-const targetDeps = { ...(target.dependencies ?? {}) };
-
+// Aggregate all dependencies from source packages
 const aggregated = new Map();
 const conflicts = [];
 
@@ -52,44 +52,65 @@ if (conflicts.length) {
   process.exit(1);
 }
 
-const updates = [];
-for (const [dep, version] of aggregated) {
-  const current = targetDeps[dep];
-  if (current !== version) {
-    updates.push({ dep, from: current, to: version });
+// Sync each target manifest
+let allInSync = true;
+const allUpdates = [];
+
+for (const targetManifest of targetManifests) {
+  const target = readJson(targetManifest);
+  const targetDeps = { ...(target.dependencies ?? {}) };
+  const updates = [];
+
+  // Only check deps that the target already declares (don't add new ones)
+  for (const [dep, version] of aggregated) {
+    const current = targetDeps[dep];
+    if (current !== undefined && current !== version) {
+      updates.push({ dep, from: current, to: version });
+      if (mode === 'write') {
+        targetDeps[dep] = version;
+      }
+    }
+  }
+
+  if (updates.length) {
+    allInSync = false;
+    allUpdates.push({ targetManifest, updates });
+
     if (mode === 'write') {
-      targetDeps[dep] = version;
+      const sortedDeps = {};
+      for (const dep of Object.keys(targetDeps).sort()) {
+        sortedDeps[dep] = targetDeps[dep];
+      }
+      target.dependencies = sortedDeps;
+      writeJson(targetManifest, target);
     }
   }
 }
 
 if (mode === 'check') {
-  if (updates.length) {
-    console.error('packages/agor-live/package.json is missing dependency updates:');
-    for (const update of updates) {
-      console.error(` - ${update.dep}: expected ${update.to}, found ${update.from ?? '∅'}`);
+  if (!allInSync) {
+    console.error('Published packages have dependency version mismatches:');
+    for (const { targetManifest, updates } of allUpdates) {
+      console.error(`\n  ${targetManifest}:`);
+      for (const update of updates) {
+        console.error(`   - ${update.dep}: expected ${update.to}, found ${update.from ?? '∅'}`);
+      }
     }
-    console.error('Run pnpm sync:agor-live-deps to fix.');
+    console.error('\nRun pnpm sync:agor-live-deps to fix.');
     process.exit(1);
   }
-  console.log('agor-live dependencies are in sync.');
+  console.log('All published package dependencies are in sync.');
   process.exit(0);
 }
 
-if (!updates.length) {
-  console.log('agor-live dependencies already match workspace manifests.');
+if (allInSync) {
+  console.log('All published package dependencies already match workspace manifests.');
   process.exit(0);
 }
 
-const sortedDeps = {};
-for (const dep of Object.keys(targetDeps).sort()) {
-  sortedDeps[dep] = targetDeps[dep];
-}
-
-target.dependencies = sortedDeps;
-writeJson(targetManifest, target);
-
-console.log(`Updated ${targetManifest} with ${updates.length} change(s):`);
-for (const update of updates) {
-  console.log(` - ${update.dep}: ${update.from ?? '∅'} -> ${update.to}`);
+for (const { targetManifest, updates } of allUpdates) {
+  console.log(`Updated ${targetManifest} with ${updates.length} change(s):`);
+  for (const update of updates) {
+    console.log(` - ${update.dep}: ${update.from ?? '∅'} -> ${update.to}`);
+  }
 }

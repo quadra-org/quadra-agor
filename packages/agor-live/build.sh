@@ -10,7 +10,7 @@
 #   ./build.sh --dry-run          # Show what would be published without actually publishing
 #   ./build.sh --skip-install     # Skip pnpm install step
 
-set -e  # Exit on error
+set -eo pipefail  # Exit on error, catch failures in pipes
 
 # ── Parse flags ──────────────────────────────────────────────────────────────
 
@@ -23,7 +23,12 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     --publish)   PUBLISH=true; shift ;;
     --dry-run)   DRY_RUN=true; PUBLISH=true; shift ;;
-    --bump)      BUMP="$2"; PUBLISH=true; shift 2 ;;
+    --bump)
+      if [[ -z "${2:-}" || "$2" == --* ]]; then
+        echo "Error: --bump requires a value (patch, minor, or major)"
+        exit 1
+      fi
+      BUMP="$2"; PUBLISH=true; shift 2 ;;
     --skip-install) SKIP_INSTALL=true; shift ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
