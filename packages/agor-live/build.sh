@@ -1,74 +1,165 @@
 #!/bin/bash
 
-# Build Script for agor-live Package
-# Builds all components and bundles them into a single npm package
+# Build & Publish Script for agor-live + @agor-live/client
+#
+# Usage:
+#   ./build.sh                    # Build only
+#   ./build.sh --publish          # Build and publish both packages
+#   ./build.sh --bump patch       # Bump version (patch/minor/major), build, and publish
+#   ./build.sh --bump minor       # Bump to next minor version
+#   ./build.sh --dry-run          # Show what would be published without actually publishing
+#   ./build.sh --skip-install     # Skip pnpm install step
 
 set -e  # Exit on error
 
-echo "🏗️  Building agor-live package..."
-echo ""
+# ── Parse flags ──────────────────────────────────────────────────────────────
 
-# Get script directory (packages/agor-live)
+PUBLISH=false
+DRY_RUN=false
+SKIP_INSTALL=false
+BUMP=""
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --publish)   PUBLISH=true; shift ;;
+    --dry-run)   DRY_RUN=true; PUBLISH=true; shift ;;
+    --bump)      BUMP="$2"; PUBLISH=true; shift 2 ;;
+    --skip-install) SKIP_INSTALL=true; shift ;;
+    *) echo "Unknown option: $1"; exit 1 ;;
+  esac
+done
+
+if [[ -n "$BUMP" && "$BUMP" != "patch" && "$BUMP" != "minor" && "$BUMP" != "major" ]]; then
+  echo "Invalid bump type: $BUMP (must be patch, minor, or major)"
+  exit 1
+fi
+
+# ── Setup paths ──────────────────────────────────────────────────────────────
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+CLIENT_DIR="$REPO_ROOT/packages/client"
 
-echo "📍 Repository root: $REPO_ROOT"
-echo "📦 Package directory: $SCRIPT_DIR"
+echo "🏗️  Building agor-live + @agor-live/client"
 echo ""
+echo "📍 Repository root: $REPO_ROOT"
+echo "📦 agor-live:       $SCRIPT_DIR"
+echo "📦 @agor-live/client: $CLIENT_DIR"
+echo ""
+
+# ── Version bump ─────────────────────────────────────────────────────────────
+
+if [[ -n "$BUMP" ]]; then
+  CURRENT_VERSION=$(node -p "require('$SCRIPT_DIR/package.json').version")
+  IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+
+  case $BUMP in
+    patch) PATCH=$((PATCH + 1)) ;;
+    minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+    major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+  esac
+
+  NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+  echo "📌 Version bump: $CURRENT_VERSION → $NEW_VERSION ($BUMP)"
+
+  # Update both package.json files
+  node -e "
+    const fs = require('fs');
+    for (const p of ['$SCRIPT_DIR/package.json', '$CLIENT_DIR/package.json']) {
+      const pkg = JSON.parse(fs.readFileSync(p, 'utf8'));
+      pkg.version = '$NEW_VERSION';
+      fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + '\n');
+    }
+  "
+  echo "  ✓ Updated agor-live/package.json"
+  echo "  ✓ Updated @agor-live/client/package.json"
+  echo ""
+else
+  NEW_VERSION=$(node -p "require('$SCRIPT_DIR/package.json').version")
+
+  # Sync client version to match agor-live (no bump, just align)
+  CLIENT_VERSION=$(node -p "require('$CLIENT_DIR/package.json').version")
+  if [[ "$CLIENT_VERSION" != "$NEW_VERSION" ]]; then
+    node -e "
+      const fs = require('fs');
+      const pkg = JSON.parse(fs.readFileSync('$CLIENT_DIR/package.json', 'utf8'));
+      pkg.version = '$NEW_VERSION';
+      fs.writeFileSync('$CLIENT_DIR/package.json', JSON.stringify(pkg, null, 2) + '\n');
+    "
+    echo "📌 Synced @agor-live/client version: $CLIENT_VERSION → $NEW_VERSION"
+    echo ""
+  fi
+fi
+
+echo "📦 Version: $NEW_VERSION"
+echo ""
+
+# ── Install dependencies ─────────────────────────────────────────────────────
+
+if [[ "$SKIP_INSTALL" == false ]]; then
+  echo "📥 Installing dependencies..."
+  cd "$REPO_ROOT"
+  pnpm install
+  echo ""
+fi
+
+# ── Verify dependency alignment ─────────────────────────────────────────────
 
 echo "🔍 Verifying agor-live dependency alignment..."
 cd "$REPO_ROOT"
 pnpm check:agor-live-deps
 echo ""
 
-# Clean previous build
-echo "🧹 Cleaning previous build..."
+# ── Clean previous builds ────────────────────────────────────────────────────
+
+echo "🧹 Cleaning previous builds..."
 rm -rf "$SCRIPT_DIR/dist"
 rm -rf "$SCRIPT_DIR/node_modules/@agor"
+rm -rf "$CLIENT_DIR/dist"
 mkdir -p "$SCRIPT_DIR/dist"
 
-# Build @agor/core
+# ── Build all components ─────────────────────────────────────────────────────
+
 echo ""
 echo "📦 Building @agor/core..."
 cd "$REPO_ROOT/packages/core"
 pnpm build
 
-# Build CLI
 echo ""
 echo "🖥️  Building CLI..."
 cd "$REPO_ROOT/apps/agor-cli"
 pnpm build
 
-# Build Daemon
 echo ""
 echo "⚙️  Building Daemon..."
 cd "$REPO_ROOT/apps/agor-daemon"
 pnpm build
 
-# Build Executor
 echo ""
 echo "🔧 Building Executor..."
 cd "$REPO_ROOT/packages/executor"
 pnpm build
 
-# Build UI
 echo ""
 echo "🎨 Building UI..."
 cd "$REPO_ROOT/apps/agor-ui"
 NODE_ENV=production pnpm build
 
-# Copy built artifacts to agor-live package
 echo ""
-echo "📋 Copying build artifacts..."
+echo "📦 Building @agor-live/client..."
+cd "$CLIENT_DIR"
+pnpm build
 
-# Copy core
+# ── Copy artifacts to agor-live ──────────────────────────────────────────────
+
+echo ""
+echo "📋 Copying build artifacts to agor-live..."
+
 echo "  → Copying core..."
 mkdir -p "$SCRIPT_DIR/dist/core"
 cp -r "$REPO_ROOT/packages/core/dist/"* "$SCRIPT_DIR/dist/core/"
 
-# Create package.json for @agor/core in dist/core by copying exports from source
 echo "  → Creating package.json for bundled @agor/core..."
-# Use jq to extract exports from source package.json and strip "dist/" prefix from paths
 jq '
   def strip_dist: gsub("\\./dist/"; "./");
   {
@@ -81,55 +172,77 @@ jq '
   }
 ' "$REPO_ROOT/packages/core/package.json" > "$SCRIPT_DIR/dist/core/package.json"
 
-# Copy CLI
 echo "  → Copying CLI..."
 mkdir -p "$SCRIPT_DIR/dist/cli"
 cp -r "$REPO_ROOT/apps/agor-cli/dist/"* "$SCRIPT_DIR/dist/cli/"
 
-# Copy Daemon
 echo "  → Copying daemon..."
 mkdir -p "$SCRIPT_DIR/dist/daemon"
 cp -r "$REPO_ROOT/apps/agor-daemon/dist/"* "$SCRIPT_DIR/dist/daemon/"
 
-# Copy Executor
 echo "  → Copying executor..."
 mkdir -p "$SCRIPT_DIR/dist/executor"
 cp -r "$REPO_ROOT/packages/executor/dist/"* "$SCRIPT_DIR/dist/executor/"
 
-# Copy UI
 echo "  → Copying UI..."
 mkdir -p "$SCRIPT_DIR/dist/ui"
 cp -r "$REPO_ROOT/apps/agor-ui/dist/"* "$SCRIPT_DIR/dist/ui/"
 
-# Create node_modules/@agor/core as symlink to dist/core for local development
 echo ""
 echo "📦 Setting up @agor/core symlink for local development..."
 mkdir -p "$SCRIPT_DIR/node_modules/@agor"
 rm -f "$SCRIPT_DIR/node_modules/@agor/core"
 ln -s "../../dist/core" "$SCRIPT_DIR/node_modules/@agor/core"
 
-# Calculate package size
+# ── Package sizes ────────────────────────────────────────────────────────────
+
 echo ""
-echo "📊 Package size:"
-du -sh "$SCRIPT_DIR/dist" | awk '{print "  Total: " $1}'
-echo ""
-du -sh "$SCRIPT_DIR/dist/core" | awk '{print "  Core:     " $1}'
-du -sh "$SCRIPT_DIR/dist/cli" | awk '{print "  CLI:      " $1}'
-du -sh "$SCRIPT_DIR/dist/daemon" | awk '{print "  Daemon:   " $1}'
-du -sh "$SCRIPT_DIR/dist/executor" | awk '{print "  Executor: " $1}'
-du -sh "$SCRIPT_DIR/dist/ui" | awk '{print "  UI:       " $1}'
+echo "📊 Package sizes:"
+du -sh "$SCRIPT_DIR/dist" | awk '{print "  agor-live total: " $1}'
+du -sh "$SCRIPT_DIR/dist/core" | awk '{print "    Core:     " $1}'
+du -sh "$SCRIPT_DIR/dist/cli" | awk '{print "    CLI:      " $1}'
+du -sh "$SCRIPT_DIR/dist/daemon" | awk '{print "    Daemon:   " $1}'
+du -sh "$SCRIPT_DIR/dist/executor" | awk '{print "    Executor: " $1}'
+du -sh "$SCRIPT_DIR/dist/ui" | awk '{print "    UI:       " $1}'
+du -sh "$CLIENT_DIR/dist" | awk '{print "  @agor-live/client: " $1}'
 
 echo ""
 echo "✅ Build complete!"
-echo ""
-echo "📦 Package structure:"
-tree -L 2 -d "$SCRIPT_DIR/dist" 2>/dev/null || find "$SCRIPT_DIR/dist" -type d -maxdepth 2 | sed 's|^|  |'
 
-echo ""
-echo "🚀 Next steps:"
-echo "  1. Test local installation:"
-echo "     npm install -g $SCRIPT_DIR"
-echo ""
-echo "  2. Or publish to npm:"
-echo "     cd $SCRIPT_DIR && npm publish"
-echo ""
+# ── Publish ──────────────────────────────────────────────────────────────────
+
+if [[ "$PUBLISH" == true ]]; then
+  echo ""
+
+  if [[ "$DRY_RUN" == true ]]; then
+    echo "🧪 Dry run — showing what would be published..."
+    echo ""
+    echo "── agor-live@$NEW_VERSION ──"
+    cd "$SCRIPT_DIR" && npm publish --dry-run 2>&1 | tail -20
+    echo ""
+    echo "── @agor-live/client@$NEW_VERSION ──"
+    cd "$CLIENT_DIR" && npm publish --access public --dry-run 2>&1 | tail -20
+  else
+    echo "🚀 Publishing packages..."
+    echo ""
+    echo "── Publishing agor-live@$NEW_VERSION ──"
+    cd "$SCRIPT_DIR" && npm publish
+    echo ""
+    echo "── Publishing @agor-live/client@$NEW_VERSION ──"
+    cd "$CLIENT_DIR" && npm publish --access public
+    echo ""
+    echo "✅ Both packages published!"
+    echo "  npm i agor-live@$NEW_VERSION"
+    echo "  npm i @agor-live/client@$NEW_VERSION"
+  fi
+else
+  echo ""
+  echo "📦 Package structure:"
+  tree -L 2 -d "$SCRIPT_DIR/dist" 2>/dev/null || find "$SCRIPT_DIR/dist" -type d -maxdepth 2 | sed 's|^|  |'
+
+  echo ""
+  echo "🚀 Next steps:"
+  echo "  ./build.sh --dry-run         # Preview publish"
+  echo "  ./build.sh --publish          # Publish current version ($NEW_VERSION)"
+  echo "  ./build.sh --bump patch       # Bump + publish"
+fi
