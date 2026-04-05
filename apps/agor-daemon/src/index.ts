@@ -1240,13 +1240,24 @@ async function main() {
       typeof __dirname !== 'undefined' ? __dirname : pathMod.dirname(toPath(import.meta.url));
     const sandpackPath = pathMod.resolve(dir, '../static/sandpack');
     if (exists(sandpackPath)) {
-      const baseUrl = await getBaseUrl();
-      if (baseUrl.includes('localhost') || baseUrl.includes('127.0.0.1')) {
+      // Use the daemon's origin (not getBaseUrl() which may include a /ui path).
+      // daemonUrl comes from config.daemon.public_url — fall back to extracting
+      // the origin from getBaseUrl() when daemonUrl is localhost.
+      let origin = daemonUrl;
+      if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
+        const baseUrl = await getBaseUrl();
+        try {
+          origin = new URL(baseUrl).origin;
+        } catch {
+          origin = baseUrl;
+        }
+      }
+      if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
         console.log(
-          `⚠️  Sandpack bundler found but base URL is ${baseUrl} — skipping self-hosted bundler (set AGOR_BASE_URL to enable)`
+          `⚠️  Sandpack bundler found but daemon URL is ${origin} — skipping self-hosted bundler (set AGOR_BASE_URL or daemon.public_url to enable)`
         );
       } else {
-        const bundlerURL = `${baseUrl}/static/sandpack/`;
+        const bundlerURL = `${origin}/static/sandpack/`;
         const artifactsService = app.service('artifacts') as unknown as ArtifactsService;
         artifactsService.selfHostedBundlerURL = bundlerURL;
         console.log(`🧩 Self-hosted Sandpack bundler detected: ${bundlerURL}`);
