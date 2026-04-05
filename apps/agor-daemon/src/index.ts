@@ -1241,10 +1241,16 @@ async function main() {
     const sandpackPath = pathMod.resolve(dir, '../static/sandpack');
     if (exists(sandpackPath)) {
       const baseUrl = await getBaseUrl();
-      const bundlerURL = `${baseUrl}/static/sandpack/`;
-      const artifactsService = app.service('artifacts') as unknown as ArtifactsService;
-      artifactsService.selfHostedBundlerURL = bundlerURL;
-      console.log(`🧩 Self-hosted Sandpack bundler detected: ${bundlerURL}`);
+      if (baseUrl.includes('localhost') || baseUrl.includes('127.0.0.1')) {
+        console.log(
+          `⚠️  Sandpack bundler found but base URL is ${baseUrl} — skipping self-hosted bundler (set AGOR_BASE_URL to enable)`
+        );
+      } else {
+        const bundlerURL = `${baseUrl}/static/sandpack/`;
+        const artifactsService = app.service('artifacts') as unknown as ArtifactsService;
+        artifactsService.selfHostedBundlerURL = bundlerURL;
+        console.log(`🧩 Self-hosted Sandpack bundler detected: ${bundlerURL}`);
+      }
     }
   }
 
