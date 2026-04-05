@@ -166,8 +166,8 @@ if [[ "$WITH_SANDPACK" == true ]]; then
   cd "$SANDPACK_DIR"
   echo "  → Installing dependencies..."
   yarn install --frozen-lockfile 2>/dev/null || yarn install
-  echo "  → Building..."
-  yarn build
+  echo "  → Building (with relative public URL for subpath serving)..."
+  npx parcel build ./src/index.html --no-scope-hoist --public-url ./ && cp _headers dist/_headers
   echo "  ✓ Sandpack bundler built"
 fi
 
