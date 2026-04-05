@@ -1240,7 +1240,8 @@ async function main() {
       typeof __dirname !== 'undefined' ? __dirname : pathMod.dirname(toPath(import.meta.url));
     const sandpackPath = pathMod.resolve(dir, '../static/sandpack');
     if (exists(sandpackPath)) {
-      const bundlerURL = `${daemonUrl}/static/sandpack/`;
+      const baseUrl = await getBaseUrl();
+      const bundlerURL = `${baseUrl}/static/sandpack/`;
       const artifactsService = app.service('artifacts') as unknown as ArtifactsService;
       artifactsService.selfHostedBundlerURL = bundlerURL;
       console.log(`🧩 Self-hosted Sandpack bundler detected: ${bundlerURL}`);
