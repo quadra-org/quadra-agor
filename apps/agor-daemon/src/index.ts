@@ -703,7 +703,7 @@ async function main() {
     const staticPath = pathMod.resolve(dir, '../static');
     if (exists(staticPath)) {
       console.log(`📂 Serving static assets from: ${staticPath}`);
-      app.use('/static', express.static(staticPath, { maxAge: '7d' }) as never);
+      app.use('/static', express.static(staticPath) as never);
     }
   }
 
@@ -1240,8 +1240,6 @@ async function main() {
       typeof __dirname !== 'undefined' ? __dirname : pathMod.dirname(toPath(import.meta.url));
     const sandpackPath = pathMod.resolve(dir, '../static/sandpack');
     if (exists(sandpackPath)) {
-      const daemonUrl =
-        process.env.VITE_DAEMON_URL || `http://localhost:${process.env.PORT || '3030'}`;
       const bundlerURL = `${daemonUrl}/static/sandpack/`;
       const artifactsService = app.service('artifacts') as unknown as ArtifactsService;
       artifactsService.selfHostedBundlerURL = bundlerURL;
