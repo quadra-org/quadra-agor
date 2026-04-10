@@ -599,52 +599,6 @@ export function registerSessionTools(server: McpServer, ctx: McpContext): void {
           status: promptResponse.status,
           note: 'Subsession created and prompt execution started.',
         });
-      } else if (mode === 'btw') {
-        // "btw" mode: ephemeral fork with auto-callback and auto-archive
-        // Works even on running sessions — forks from persisted conversation history
-        const forkData: { prompt: string; task_id?: string } = { prompt: args.prompt };
-        if (args.taskId) forkData.task_id = args.taskId;
-
-        const forkedSession = await (
-          ctx.app.service('sessions') as unknown as SessionsServiceImpl
-        ).fork(sessionId, forkData, ctx.baseServiceParams);
-
-        // Set btw-specific metadata: fork_origin, callback config with once mode
-        const callerSessionId = ctx.sessionId;
-        await ctx.app.service('sessions').patch(
-          forkedSession.session_id,
-          {
-            fork_origin: 'btw',
-            callback_config: {
-              enabled: true,
-              callback_session_id: callerSessionId,
-              callback_created_by: ctx.userId,
-              callback_mode: 'once',
-            },
-            ...(args.title ? { title: args.title } : {}),
-          },
-          ctx.baseServiceParams
-        );
-
-        const updatedSession = await ctx.app
-          .service('sessions')
-          .get(forkedSession.session_id, ctx.baseServiceParams);
-
-        const promptResponse = await ctx.app.service('/sessions/:id/prompt').create(
-          {
-            prompt: args.prompt,
-            permissionMode: updatedSession.permission_config?.mode,
-            stream: true,
-          },
-          { ...ctx.baseServiceParams, route: { id: forkedSession.session_id } }
-        );
-
-        return textResult({
-          session: updatedSession,
-          taskId: promptResponse.taskId,
-          status: promptResponse.status,
-          note: `Ephemeral "btw" fork created. Result will be sent back via callback when done, then the fork will auto-archive.`,
-        });
       }
 
       return textResult({ error: `Unknown mode: ${mode}` });
