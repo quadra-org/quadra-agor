@@ -792,6 +792,21 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
                   disabled={connectionDisabled}
                 />
               </Tooltip>
+              {isRunning && (
+                <Tooltip title="Ask a side question via fork (btw)">
+                  <Button
+                    icon={<ForkOutlined />}
+                    onClick={handleBtwSend}
+                    disabled={connectionDisabled || !inputValue.trim()}
+                    style={{
+                      borderColor: token.colorWarning,
+                      color: token.colorWarning,
+                    }}
+                  >
+                    btw
+                  </Button>
+                </Tooltip>
+              )}
               <Tooltip
                 title={
                   connectionDisabled
