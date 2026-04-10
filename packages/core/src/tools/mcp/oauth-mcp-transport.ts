@@ -632,12 +632,21 @@ export async function performMCPOAuthFlow(
 
     // Compute scopes early — needed for both DCR registration and auth URL.
     // Skip auto-populating from resource metadata when client_id is pre-registered.
+    console.log('[MCP OAuth performFlow] Scope computation inputs:', {
+      clientId,
+      actualClientId,
+      hasResourceScopes: !!(
+        resourceMetadata.scopes_supported && resourceMetadata.scopes_supported.length > 0
+      ),
+      resourceScopes: resourceMetadata.scopes_supported,
+    });
     const scopeString =
       !actualClientId &&
       resourceMetadata.scopes_supported &&
       resourceMetadata.scopes_supported.length > 0
         ? resourceMetadata.scopes_supported.join(' ')
         : undefined;
+    console.log('[MCP OAuth performFlow] Computed scopeString:', scopeString);
 
     if (!actualClientId) {
       // Check if server supports Dynamic Client Registration (RFC 7591)
@@ -995,11 +1004,21 @@ export async function startMCPOAuthFlow(
   // from resource metadata — the resource server may advertise scopes (like "mcp:connect")
   // that the authorization server doesn't recognize. Pre-registered apps have scopes
   // configured during app registration, so omitting them lets the auth server use defaults.
+  console.log('[MCP OAuth] Scope computation inputs:', {
+    hasOptionsScope: !!options?.scope,
+    optionsScope: options?.scope,
+    clientId,
+    hasResourceScopes: !!(
+      resourceMetadata.scopes_supported && resourceMetadata.scopes_supported.length > 0
+    ),
+    resourceScopes: resourceMetadata.scopes_supported,
+  });
   const scopeString = options?.scope
     ? options.scope
     : !clientId && resourceMetadata.scopes_supported && resourceMetadata.scopes_supported.length > 0
       ? resourceMetadata.scopes_supported.join(' ')
       : undefined;
+  console.log('[MCP OAuth] Computed scopeString:', scopeString);
 
   // Step 6: Get or register client_id
   let actualClientId = clientId;

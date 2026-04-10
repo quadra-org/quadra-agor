@@ -2045,6 +2045,12 @@ async function main() {
         const redirectUri = new URL('/mcp-servers/oauth-callback', baseUrl).toString();
         // Use client_id from request (UI form) or fall back to saved server config
         const effectiveClientId = data.client_id || clientIdFromConfig;
+        console.log('[OAuth Start] client_id debug:', {
+          'data.client_id': data.client_id,
+          clientIdFromConfig,
+          effectiveClientId,
+          scopeOverride,
+        });
         const context = await startMCPOAuthFlow(wwwAuthenticate, effectiveClientId, redirectUri, {
           authorizationUrlOverride,
           tokenUrlOverride,
