@@ -456,14 +456,14 @@ export function registerSessionTools(server: McpServer, ctx: McpContext): void {
     'agor_sessions_prompt',
     {
       description:
-        'Prompt an existing session to continue work. Supports four modes: continue (append to conversation), fork (branch at decision point), subsession (delegate to child agent), or btw (ephemeral fork — ask a side question without disrupting the target session, even if running). Configuration is inherited from parent session or user defaults.',
+        'Prompt an existing session to continue work. Supports four modes: continue (queue work for the session), fork (branch into a new persistent session), subsession (delegate to a fresh child agent), or btw (ephemeral fork for quick side questions — runs concurrently without disrupting the target, auto-archives when done). Configuration is inherited from parent session or user defaults.',
       inputSchema: z.object({
         sessionId: z.string().describe('Session ID to prompt (UUIDv7 or short ID)'),
         prompt: z.string().describe('The prompt/task to execute'),
         mode: z
           .enum(['continue', 'fork', 'subsession', 'btw'])
           .describe(
-            'How to route the work: continue (add to existing session), fork (create sibling session), subsession (create child session), btw (ephemeral fork — works even on running sessions, auto-callbacks result to caller, auto-archives when done)'
+            'How to route the work: continue (queue prompt for the session — use for follow-up instructions, fixes, or new tasks), fork (create a persistent sibling session branching from conversation history), subsession (delegate to a fresh child agent — use for substantial independent work), btw (ephemeral fork for quick side questions like "what is your status?", "summarize progress", "btw fix CI" — runs concurrently on running sessions, auto-callbacks result to caller, auto-archives when done)'
           ),
         agenticTool: z
           .enum(['claude-code', 'codex', 'gemini'])
