@@ -38,30 +38,16 @@ import {
   persistOAuthToken,
   saveOAuth21TokenToDB,
 } from './oauth-cache.js';
-import type { ArtifactsService } from './services/artifacts.js';
-import { createArtifactsService } from './services/artifacts.js';
-import { createBoardCommentsService } from './services/board-comments.js';
-import { createBoardObjectsService } from './services/board-objects.js';
-import { createBoardsService } from './services/boards.js';
-import { createCardTypesService } from './services/card-types.js';
-import { createCardsService } from './services/cards.js';
 import { createConfigService } from './services/config.js';
 import { createContextService } from './services/context.js';
 import { createFileService } from './services/file.js';
 import { createFilesService } from './services/files.js';
-import { createGatewayService } from './services/gateway.js';
-import { createGatewayChannelsService } from './services/gateway-channels.js';
-import { registerGitHubAppSetupRoutes } from './services/github-app-setup.js';
-import { createLeaderboardService } from './services/leaderboard.js';
-import { createMCPServersService } from './services/mcp-servers.js';
 import { createMessagesService } from './services/messages.js';
 import { performOAuthDisconnect } from './services/oauth-disconnect.js';
 import { createReposService } from './services/repos.js';
 import { createSessionMCPServersService } from './services/session-mcp-servers.js';
 import { createSessionsService } from './services/sessions.js';
 import { createTasksService } from './services/tasks.js';
-import { TerminalsService } from './services/terminals.js';
-import { createThreadSessionMapService } from './services/thread-session-map.js';
 import { createUsersService } from './services/users.js';
 import { setupWorktreeOwnersService } from './services/worktree-owners.js';
 import { createWorktreesService } from './services/worktrees.js';
@@ -95,7 +81,7 @@ export interface RegisteredServices {
   usersRepository: import('@agor/core/db').UsersRepository;
   sessionsRepository: import('@agor/core/db').SessionRepository;
   sessionMCPServersService: ReturnType<typeof createSessionMCPServersService>;
-  terminalsService: TerminalsService | null;
+  terminalsService: import('./services/terminals.js').TerminalsService | null;
   configService: ReturnType<typeof createConfigService>;
   boardCommentsService: unknown;
 }
@@ -154,6 +140,7 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
     events: ['tool:start', 'tool:complete', 'thinking:chunk'],
   });
   if (svcEnabled('leaderboard')) {
+    const { createLeaderboardService } = await import('./services/leaderboard.js');
     app.use('/leaderboard', createLeaderboardService(db));
   }
   const messagesService = createMessagesService(db) as unknown as MessagesServiceImpl;
@@ -210,6 +197,8 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   // ============================================================================
 
   if (svcEnabled('boards')) {
+    const { createBoardsService } = await import('./services/boards.js');
+    const { createBoardObjectsService } = await import('./services/board-objects.js');
     app.use('/boards', createBoardsService(db), {
       methods: [
         'find',
@@ -231,11 +220,14 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   const boardsService = safeService('boards') as unknown as BoardsServiceImpl | undefined;
 
   if (svcEnabled('cards')) {
+    const { createCardTypesService } = await import('./services/card-types.js');
+    const { createCardsService } = await import('./services/cards.js');
     app.use('/card-types', createCardTypesService(db));
     app.use('/cards', createCardsService(db));
   }
 
   if (svcEnabled('artifacts')) {
+    const { createArtifactsService } = await import('./services/artifacts.js');
     app.use('/artifacts', createArtifactsService(db, app));
 
     // Detect self-hosted Sandpack bundler
@@ -250,6 +242,7 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
         const baseUrl = await getBaseUrl();
         const origin = new URL(baseUrl).origin;
         const bundlerURL = `${origin}/static/sandpack/`;
+        type ArtifactsService = { selfHostedBundlerURL?: string };
         const artifactsService = app.service('artifacts') as unknown as ArtifactsService;
         artifactsService.selfHostedBundlerURL = bundlerURL;
         console.log(`🧩 Self-hosted Sandpack bundler detected: ${bundlerURL}`);
@@ -258,6 +251,7 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   }
 
   if (svcEnabled('boards')) {
+    const { createBoardCommentsService } = await import('./services/board-comments.js');
     app.use('/board-comments', createBoardCommentsService(db));
   }
 
@@ -307,6 +301,10 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   // ============================================================================
 
   if (svcEnabled('gateway')) {
+    const { createGatewayChannelsService } = await import('./services/gateway-channels.js');
+    const { createThreadSessionMapService } = await import('./services/thread-session-map.js');
+    const { createGatewayService } = await import('./services/gateway.js');
+    const { registerGitHubAppSetupRoutes } = await import('./services/github-app-setup.js');
     app.use('/gateway-channels', createGatewayChannelsService(db));
     app.use('/thread-session-map', createThreadSessionMapService(db));
     app.use('/gateway', createGatewayService(db, app), {
@@ -344,8 +342,10 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
     app.use('/files', createFilesService(db));
   }
 
-  const terminalsService = svcEnabled('terminals') ? new TerminalsService(app, db) : null;
-  if (terminalsService) {
+  let terminalsService: import('./services/terminals.js').TerminalsService | null = null;
+  if (svcEnabled('terminals')) {
+    const { TerminalsService } = await import('./services/terminals.js');
+    terminalsService = new TerminalsService(app, db);
     app.use('/terminals', terminalsService, {
       events: ['data', 'exit'],
     });
@@ -886,6 +886,7 @@ async function registerMCPServices(
     }
   };
 
+  const { createMCPServersService } = await import('./services/mcp-servers.js');
   app.use('/mcp-servers', createMCPServersService(db));
 
   // JWT test endpoint

@@ -23,6 +23,26 @@ export const SERVICE_TIER_RANK: Record<ServiceTier, number> = {
 /**
  * The 13 service groups configurable in config.yaml under `services:`.
  * All default to 'on' for backward compatibility.
+ *
+ * ## Lean / Headless Preset
+ *
+ * For minimal headless deployments (e.g., k8s executor pods), disable non-essential
+ * services to reduce boot time and memory footprint:
+ *
+ * ```yaml
+ * services:
+ *   scheduler: off    # no cron-based session spawning
+ *   terminals: off    # no xterm/pty (heavy native deps)
+ *   gateway: off      # no Slack/Discord SDK (heavy)
+ *   boards: off       # no spatial canvas
+ *   cards: off        # no kanban cards
+ *   artifacts: off    # no sandpack artifacts
+ *   leaderboard: off  # no usage analytics
+ *   static_files: off # no UI bundle serving
+ * ```
+ *
+ * This leaves core, worktrees, repos, users, file_browser, and mcp_servers active —
+ * the minimum needed for prompt execution and worktree management.
  */
 export interface DaemonServicesConfig {
   /** sessions, tasks, messages — the prompt loop */

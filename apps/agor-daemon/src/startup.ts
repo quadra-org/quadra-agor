@@ -12,7 +12,6 @@ import { SessionStatus, TaskStatus } from '@agor/core/types';
 import type { Application, SessionsServiceImpl, TasksServiceImpl } from './declarations.js';
 import type { GatewayService } from './services/gateway.js';
 import { createHealthMonitor } from './services/health-monitor.js';
-import { SchedulerService } from './services/scheduler.js';
 import type { TerminalsService } from './services/terminals.js';
 
 // ---------------------------------------------------------------------------
@@ -35,6 +34,8 @@ export interface StartupContext {
   /** Services returned from registerServices() */
   sessionsService: SessionsServiceImpl;
   terminalsService: TerminalsService | null;
+  /** Boot start timestamp from startDaemon() for total boot timing */
+  tBoot: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -177,19 +178,30 @@ export async function startup(ctx: StartupContext): Promise<void> {
     safeService,
     getSocketServer,
     terminalsService,
+    tBoot,
   } = ctx;
 
+  const tStartup = performance.now();
+
   // 1. Cleanup orphaned tasks/sessions from previous daemon instance
+  let t0 = performance.now();
   await cleanupOrphans(ctx);
+  console.log(`⏱️  [boot]   cleanupOrphans: ${(performance.now() - t0).toFixed(0)}ms`);
 
   // 2. Initialize Health Monitor for periodic environment health checks
+  t0 = performance.now();
   const healthMonitor = await createHealthMonitor(app);
+  console.log(`⏱️  [boot]   createHealthMonitor: ${(performance.now() - t0).toFixed(0)}ms`);
 
   // 3. Validate/generate master secret for API key encryption
+  t0 = performance.now();
   await ensureMasterSecret(config);
+  console.log(`⏱️  [boot]   ensureMasterSecret: ${(performance.now() - t0).toFixed(0)}ms`);
 
   // 4. Start server
+  t0 = performance.now();
   const server = await app.listen(DAEMON_PORT, DAEMON_HOST);
+  console.log(`⏱️  [boot]   app.listen: ${(performance.now() - t0).toFixed(0)}ms`);
 
   const displayHost = DAEMON_HOST === '0.0.0.0' ? 'localhost' : DAEMON_HOST;
   console.log(
@@ -211,9 +223,12 @@ export async function startup(ctx: StartupContext): Promise<void> {
   console.log(`     - /context`);
   console.log(`     - /users`);
 
-  // 5. Start scheduler service (background worker)
-  let schedulerService: SchedulerService | null = null;
+  // 5. Start scheduler service (background worker) — dynamically imported to avoid
+  //    loading the module at all when scheduler is disabled (lean mode optimization)
+  let schedulerService: import('./services/scheduler.js').SchedulerService | null = null;
   if (svcEnabled('scheduler')) {
+    t0 = performance.now();
+    const { SchedulerService } = await import('./services/scheduler.js');
     schedulerService = new SchedulerService(db, app, {
       tickInterval: 30000, // 30 seconds
       gracePeriod: 120000, // 2 minutes
@@ -221,16 +236,21 @@ export async function startup(ctx: StartupContext): Promise<void> {
       unixUserMode: config.execution?.unix_user_mode ?? 'simple',
     });
     schedulerService.start();
+    console.log(`⏱️  [boot]   scheduler init: ${(performance.now() - t0).toFixed(0)}ms`);
     console.log(`🔄 Scheduler started (tick interval: 30s)`);
   }
 
   // 6. Initialize gateway: refresh channel state cache, then start Socket Mode listeners
   const gatewayService = safeService('gateway') as unknown as GatewayService | undefined;
   if (gatewayService) {
+    const tGw = performance.now();
     gatewayService
       .refreshChannelState()
       .then(() => {
         return gatewayService.startListeners();
+      })
+      .then(() => {
+        console.log(`⏱️  [boot]   gateway init (async): ${(performance.now() - tGw).toFixed(0)}ms`);
       })
       .catch((error: unknown) => {
         console.error('[gateway] Failed to start listeners:', error);
@@ -308,4 +328,7 @@ export async function startup(ctx: StartupContext): Promise<void> {
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
+
+  console.log(`⏱️  [boot] Phase 4 — startup: ${(performance.now() - tStartup).toFixed(0)}ms`);
+  console.log(`⏱️  [boot] Total boot time: ${(performance.now() - tBoot).toFixed(0)}ms`);
 }

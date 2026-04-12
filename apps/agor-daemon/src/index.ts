@@ -104,24 +104,31 @@ export interface DaemonStartOptions {
  * or from main.ts with no args for direct execution.
  */
 export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
+  const tBoot = performance.now();
+
   // Initialize Handlebars helpers for template rendering
+  let t0 = performance.now();
   registerHandlebarsHelpers();
-  console.log('✅ Handlebars helpers registered');
+  console.log(`⏱️  [boot] Handlebars helpers: ${(performance.now() - t0).toFixed(0)}ms`);
 
   // Configure Git to fail fast instead of prompting for credentials
   process.env.GIT_TERMINAL_PROMPT = '0';
   process.env.GIT_ASKPASS = 'echo';
 
   // Load config: CLI-provided > configPath > default loadConfig()
+  t0 = performance.now();
   const config: AgorConfig = options?.config
     ? options.config
     : options?.configPath
       ? await loadConfigFromFile(options.configPath)
       : await loadConfig();
+  console.log(`⏱️  [boot] Config load: ${(performance.now() - t0).toFixed(0)}ms`);
 
   // Resolve service tier configuration (validate deps, auto-promote)
+  t0 = performance.now();
   const servicesConfig = resolveServicesConfig(config.services);
   logServicesConfig(servicesConfig);
+  console.log(`⏱️  [boot] Service tier resolution: ${(performance.now() - t0).toFixed(0)}ms`);
 
   const svcTier = (group: string): ServiceTier =>
     getServiceTier(servicesConfig, group as ServiceGroupName);
@@ -342,7 +349,9 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
   configureChannels(app);
   configureSwagger(app, { version: DAEMON_VERSION, port: DAEMON_PORT });
 
+  t0 = performance.now();
   const { db } = await initializeDatabase(DB_PATH);
+  console.log(`⏱️  [boot] Database init: ${(performance.now() - t0).toFixed(0)}ms`);
 
   // --------------------------------------------------------------------------
   // RBAC flags
@@ -354,6 +363,7 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
   // --------------------------------------------------------------------------
   // Phase 1: Register services
   // --------------------------------------------------------------------------
+  t0 = performance.now();
   const services = await registerServices({
     db,
     app,
@@ -368,10 +378,12 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     allowSuperadmin,
     requireAuth,
   });
+  console.log(`⏱️  [boot] Phase 1 — registerServices: ${(performance.now() - t0).toFixed(0)}ms`);
 
   // --------------------------------------------------------------------------
   // Phase 2: Register hooks
   // --------------------------------------------------------------------------
+  t0 = performance.now();
   registerHooks({
     db,
     app,
@@ -390,10 +402,12 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     usersRepository: services.usersRepository,
     sessionsRepository: services.sessionsRepository,
   });
+  console.log(`⏱️  [boot] Phase 2 — registerHooks: ${(performance.now() - t0).toFixed(0)}ms`);
 
   // --------------------------------------------------------------------------
   // Phase 3: Register routes (auth, REST, tier hooks, error handler)
   // --------------------------------------------------------------------------
+  t0 = performance.now();
   await registerRoutes({
     db,
     app,
@@ -419,6 +433,7 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     sessionMCPServersService: services.sessionMCPServersService,
     terminalsService: services.terminalsService,
   });
+  console.log(`⏱️  [boot] Phase 3 — registerRoutes: ${(performance.now() - t0).toFixed(0)}ms`);
 
   // --------------------------------------------------------------------------
   // Phase 4: Startup (orphan cleanup, health, scheduler, listen, shutdown)
@@ -434,5 +449,6 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     getSocketServer: socketIOConfig.getSocketServer,
     sessionsService: services.sessionsService,
     terminalsService: services.terminalsService,
+    tBoot,
   });
 }

@@ -1,0 +1,47 @@
+# config-lean.example.yaml — Minimal headless daemon for k8s / cloud deployments
+#
+# Copy to ~/.agor/config.yaml (or pass via --config flag) to run the daemon
+# with only the essential services needed for API/chatbot use cases.
+#
+# Services disabled in lean mode:
+#   scheduler  — Cron-based session spawning (background timer + DB polling)
+#   terminals  — Web terminal / xterm.js (node-pty, per-session PTY allocation)
+#   gateway    — Slack/Discord/GitHub integrations (Socket Mode listeners, channel cache)
+#   boards     — Spatial canvas boards, board-objects, board-comments (UI-only)
+#   cards      — Kanban cards and card type definitions (UI-only)
+#   artifacts  — Sandpack artifact previews (UI-only, bundler detection)
+#   file_browser — File/context browsing endpoints (UI file explorer)
+#   leaderboard  — Usage analytics / cost tracking (UI dashboard)
+#
+# Services kept enabled:
+#   core         — Sessions, tasks, messages (the prompt loop)
+#   worktrees    — Worktree CRUD (required FK for sessions)
+#   repos        — Repository management
+#   users        — User accounts + authentication
+#   mcp_servers  — MCP server configuration (needed for agent tool access)
+
+daemon:
+  port: 3030
+  host: 0.0.0.0
+  allowAnonymous: false
+
+services:
+  # Core services (cannot be disabled)
+  core: on
+  worktrees: on
+  repos: on
+  users: on
+
+  # Keep MCP servers for agent tool integration
+  mcp_servers: on
+
+  # Disable UI-only and heavyweight services
+  scheduler: off
+  terminals: off
+  gateway: off
+  boards: off
+  cards: off
+  artifacts: off
+  file_browser: off
+  leaderboard: off
+  static_files: off
