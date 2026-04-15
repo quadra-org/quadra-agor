@@ -103,6 +103,7 @@ const SessionsTabInner: React.FC<SessionsTabProps> = ({
     }
   }, [worktree.worktree_id]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentionally reset only on worktree change
   useEffect(() => {
     // Reset per-worktree state when switching modal context.
     // Seed active list from prop for instant render, then refresh from API.
@@ -114,7 +115,6 @@ const SessionsTabInner: React.FC<SessionsTabProps> = ({
     setArchivedLoaded(false);
     setArchivedLoading(false);
     void loadActiveSessions();
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally reset only on worktree change
   }, [worktree.worktree_id]);
 
   useEffect(() => {
