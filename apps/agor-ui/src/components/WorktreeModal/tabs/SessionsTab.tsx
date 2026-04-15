@@ -43,14 +43,11 @@ const SessionsTabInner: React.FC<SessionsTabProps> = ({
   const [archivedLoaded, setArchivedLoaded] = useState(false);
   const [archivedLoading, setArchivedLoading] = useState(false);
   const [archivingIds, setArchivingIds] = useState<Set<string>>(new Set());
-  const initialActiveSessions = useMemo(
-    () => sessions.filter((session) => !session.archived),
-    [sessions]
-  );
-
   // Keep client ref stable for callbacks
   const clientRef = useRef(client);
   clientRef.current = client;
+  const sessionsRef = useRef(sessions);
+  sessionsRef.current = sessions;
 
   const upsertSession = useCallback((list: Session[], session: Session): Session[] => {
     const index = list.findIndex((s) => s.session_id === session.session_id);
@@ -109,14 +106,16 @@ const SessionsTabInner: React.FC<SessionsTabProps> = ({
   useEffect(() => {
     // Reset per-worktree state when switching modal context.
     // Seed active list from prop for instant render, then refresh from API.
-    setActiveSessions(initialActiveSessions);
+    // Only reset on worktree switch — WebSocket handlers keep lists current.
+    setActiveSessions(sessionsRef.current.filter((s) => !s.archived));
     setActiveLoading(false);
     setShowArchived(worktree.archived);
     setArchivedSessions([]);
     setArchivedLoaded(false);
     setArchivedLoading(false);
     void loadActiveSessions();
-  }, [initialActiveSessions, loadActiveSessions, worktree.archived]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally reset only on worktree change
+  }, [worktree.worktree_id]);
 
   useEffect(() => {
     if (showArchived && !archivedLoaded && !archivedLoading) {
