@@ -372,6 +372,23 @@ async function main() {
     })
   );
 
+  // Support Chrome's Private Network Access (PNA) spec — required for
+  // Sandpack artifacts (which run on codesandbox.io, a public origin) to
+  // call this daemon when it's on a private/local network address.
+  // Chrome sends `Access-Control-Request-Private-Network: true` in the
+  // OPTIONS preflight; without this response header the browser hard-blocks
+  // the request regardless of the regular CORS config.
+  // Security note: this only grants the *ability* to attempt a cross-origin
+  // request from a public page to a private address — the existing CORS
+  // origin check still runs and will reject unknown origins.  The PNA header
+  // has no effect when both sides are on the same network tier.
+  app.use((req, res, next) => {
+    if (req.headers['access-control-request-private-network']) {
+      res.setHeader('Access-Control-Allow-Private-Network', 'true');
+    }
+    next();
+  });
+
   // Parse JSON with size limits (security: prevent DoS via large payloads)
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ extended: true, limit: '10mb' }));
