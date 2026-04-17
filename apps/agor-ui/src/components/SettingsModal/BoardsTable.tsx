@@ -446,7 +446,7 @@ export const BoardsTable: React.FC<BoardsTableProps> = ({
         <Form form={form} layout="vertical" style={{ marginTop: 16 }}>
           <Form.Item label="Name" style={{ marginBottom: 24 }}>
             <Flex gap={8}>
-              <Form.Item name="icon" noStyle>
+              <Form.Item name="icon" initialValue="📋" noStyle>
                 <FormEmojiPickerInput form={form} fieldName="icon" defaultEmoji="📋" />
               </Form.Item>
               <Form.Item
@@ -545,7 +545,7 @@ export const BoardsTable: React.FC<BoardsTableProps> = ({
         <Form form={form} layout="vertical" style={{ marginTop: 16 }}>
           <Form.Item label="Name" style={{ marginBottom: 24 }}>
             <Flex gap={8}>
-              <Form.Item name="icon" noStyle>
+              <Form.Item name="icon" initialValue="📋" noStyle>
                 <FormEmojiPickerInput form={form} fieldName="icon" defaultEmoji="📋" />
               </Form.Item>
               <Form.Item
