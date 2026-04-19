@@ -270,6 +270,37 @@ describe('LeaderboardService backward compatibility', () => {
     // New split metrics
     expect(alice?.totalInputTokens).toBe(7_000);
     expect(alice?.totalOutputTokens).toBe(3_500);
+    // User display fields are hydrated via LEFT JOIN on users (avoids N+1)
+    expect(alice?.userName).toBe('Alice');
+    expect(alice?.userEmail).toBe('alice@example.com');
+    expect(alice?.userEmoji).toBe('emoji');
+
+    const bob = result.data.find((r) => r.userId === 'user-bob');
+    expect(bob?.userName).toBe('Bob');
+    expect(bob?.userEmail).toBe('bob@example.com');
+  });
+
+  dbTest('groupBy: "user,worktree" hydrates both user and worktree names', async ({ db }) => {
+    await seedCanonicalDataset(db);
+    const service = new LeaderboardService(db);
+
+    const result = await service.find({ query: { groupBy: 'user,worktree' } });
+    const alice = result.data.find((r) => r.userId === 'user-alice');
+    expect(alice?.userName).toBe('Alice');
+    expect(alice?.userEmail).toBe('alice@example.com');
+    expect(alice?.worktreeName).toBe('main-wt');
+  });
+
+  dbTest('groupBy without "user" does not populate user display fields', async ({ db }) => {
+    await seedCanonicalDataset(db);
+    const service = new LeaderboardService(db);
+
+    const result = await service.find({ query: { groupBy: 'worktree' } });
+    for (const row of result.data) {
+      expect(row.userId).toBeUndefined();
+      expect(row.userName).toBeUndefined();
+      expect(row.userEmail).toBeUndefined();
+    }
   });
 });
 
