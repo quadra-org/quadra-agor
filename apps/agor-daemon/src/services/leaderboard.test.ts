@@ -279,7 +279,13 @@ describe('LeaderboardService backward compatibility', () => {
     expect(bob?.userName).toBe('Bob');
     expect(bob?.userEmail).toBe('bob@example.com');
   });
+});
 
+// ---------------------------------------------------------------------------
+// Hydration (user/worktree display fields populated via JOINs)
+// ---------------------------------------------------------------------------
+
+describe('LeaderboardService hydration', () => {
   dbTest('groupBy: "user,worktree" hydrates both user and worktree names', async ({ db }) => {
     await seedCanonicalDataset(db);
     const service = new LeaderboardService(db);
@@ -300,6 +306,7 @@ describe('LeaderboardService backward compatibility', () => {
       expect(row.userId).toBeUndefined();
       expect(row.userName).toBeUndefined();
       expect(row.userEmail).toBeUndefined();
+      expect(row.userEmoji).toBeUndefined();
     }
   });
 });
