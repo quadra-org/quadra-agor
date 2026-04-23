@@ -88,6 +88,8 @@ function hasListeningConfig(channel: GatewayChannel): boolean {
         config.installation_id &&
         (config.watch_repos as string[] | undefined)?.length
       );
+    case 'teams':
+      return !!(config.app_id && config.app_password);
     default:
       return false;
   }
@@ -194,6 +196,29 @@ function buildGatewayContext(channel: GatewayChannel, data: PostMessageData): Ga
         userHandle: githubUser ? `@${githubUser}` : undefined,
         userEmail: (meta.github_user_email as string) ?? undefined,
         extras,
+      };
+    }
+
+    case 'teams': {
+      const conversationType = meta.teams_conversation_type as string | undefined;
+      const isPersonal = conversationType === 'personal';
+      let channelKind: string | undefined;
+      if (isPersonal) {
+        channelKind = 'DM';
+      } else if (conversationType === 'channel') {
+        channelKind = 'Channel';
+      } else if (conversationType === 'groupChat') {
+        channelKind = 'Group Chat';
+      }
+      const channelName = isPersonal
+        ? undefined
+        : ((meta.teams_channel_name as string) ?? (meta.teams_team_name as string) ?? undefined);
+      return {
+        platform: 'teams',
+        channelName,
+        channelKind,
+        userName: (meta.teams_user_name as string) ?? undefined,
+        userEmail: (meta.teams_user_email as string) ?? undefined,
       };
     }
 
