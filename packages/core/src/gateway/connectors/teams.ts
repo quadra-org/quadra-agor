@@ -104,6 +104,44 @@ function stripHtmlTags(text: string): string {
 }
 
 /**
+ * Extract the actual user text from a Teams quoted-reply message.
+ *
+ * When a user replies to a specific message in a 1:1 (personal) chat, Teams
+ * prepends the quoted message content to `activity.text` (making it garbled),
+ * but provides the structured data in an HTML attachment like:
+ *
+ * ```html
+ * <blockquote itemtype="http://schema.skype.com/Reply" ...>
+ *   ...quoted message preview...
+ * </blockquote>
+ * <p>actual user message</p>
+ * ```
+ *
+ * This function checks for that pattern and returns only the user's text.
+ * Returns null if no quoted-reply attachment is found.
+ */
+export function extractQuotedReplyText(
+  attachments: Array<{ contentType?: string; content?: string }> | undefined
+): string | null {
+  if (!attachments) return null;
+
+  for (const attachment of attachments) {
+    if (attachment.contentType !== 'text/html' || !attachment.content) continue;
+    if (!attachment.content.includes('schema.skype.com/Reply')) continue;
+
+    // Extract everything after the closing </blockquote> tag
+    const afterQuote = attachment.content.split('</blockquote>').pop();
+    if (!afterQuote) continue;
+
+    // Strip HTML tags to get plain text
+    const text = stripHtmlTags(afterQuote).trim();
+    if (text) return text;
+  }
+
+  return null;
+}
+
+/**
  * Wrap a Node.js ServerResponse to satisfy Bot Framework's WebResponse interface.
  *
  * Bot Framework expects `send()` and `status()` methods (Express-like),
@@ -274,8 +312,13 @@ export class TeamsConnector implements GatewayConnector {
             // Store reference for this thread
             this.conversationRefs.set(threadId, ref);
 
-            // Extract message text
-            let messageText = activity.text ?? '';
+            // Extract message text — check for quoted-reply first.
+            // In 1:1 chats, replying to a message prepends the quoted content
+            // to activity.text (garbled). The clean text is in the HTML attachment.
+            const quotedReplyText = extractQuotedReplyText(
+              activity.attachments as Array<{ contentType?: string; content?: string }> | undefined
+            );
+            let messageText = quotedReplyText ?? activity.text ?? '';
 
             // Check entities array for bot mentions and strip them.
             // Teams bot IDs in entities use format "28:<app_id>" or just "<app_id>",

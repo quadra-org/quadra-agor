@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { parseThreadId, stripMention, TeamsConnector } from './teams';
+import { extractQuotedReplyText, parseThreadId, stripMention, TeamsConnector } from './teams';
 
 describe('parseThreadId', () => {
   it('parses a valid thread ID', () => {
@@ -81,6 +81,75 @@ describe('stripMention', () => {
 
   it('handles regex special characters in bot name', () => {
     expect(stripMention('<at>Bot (Test)</at> hello', 'Bot (Test)')).toBe('hello');
+  });
+});
+
+describe('extractQuotedReplyText', () => {
+  it('extracts user text from a quoted-reply attachment', () => {
+    const attachments = [
+      {
+        contentType: 'text/html',
+        content:
+          '<blockquote itemscope itemtype="http://schema.skype.com/Reply" itemid="1777427261272">' +
+          '<strong itemprop="mri" itemid="28:bot-id">Display Name</strong>' +
+          '<span itemprop="time" itemid="1777427261272"></span>' +
+          '<p itemprop="preview">Echo: hello</p>' +
+          '</blockquote>\n<p>test reply</p>',
+      },
+    ];
+    expect(extractQuotedReplyText(attachments)).toBe('test reply');
+  });
+
+  it('extracts multi-paragraph user text after blockquote', () => {
+    // Teams separates the blockquote and user content with a newline
+    const attachments = [
+      {
+        contentType: 'text/html',
+        content:
+          '<blockquote itemscope itemtype="http://schema.skype.com/Reply" itemid="123">' +
+          '<p itemprop="preview">quoted text</p>' +
+          '</blockquote>\n<p>line one</p>\n<p>line two</p>',
+      },
+    ];
+    // Newlines between <p> tags are preserved after HTML stripping
+    expect(extractQuotedReplyText(attachments)).toBe('line one\nline two');
+  });
+
+  it('returns null when no attachments', () => {
+    expect(extractQuotedReplyText(undefined)).toBeNull();
+  });
+
+  it('returns null when attachments have no quoted reply', () => {
+    const attachments = [
+      {
+        contentType: 'text/html',
+        content: '<p>just a normal attachment</p>',
+      },
+    ];
+    expect(extractQuotedReplyText(attachments)).toBeNull();
+  });
+
+  it('returns null for non-HTML attachment', () => {
+    const attachments = [
+      {
+        contentType: 'application/json',
+        content: '{"key": "value"}',
+      },
+    ];
+    expect(extractQuotedReplyText(attachments)).toBeNull();
+  });
+
+  it('returns null when content after blockquote is empty', () => {
+    const attachments = [
+      {
+        contentType: 'text/html',
+        content:
+          '<blockquote itemscope itemtype="http://schema.skype.com/Reply" itemid="123">' +
+          '<p itemprop="preview">quoted</p>' +
+          '</blockquote>',
+      },
+    ];
+    expect(extractQuotedReplyText(attachments)).toBeNull();
   });
 });
 
