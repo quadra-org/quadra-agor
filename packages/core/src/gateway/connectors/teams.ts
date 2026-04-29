@@ -311,18 +311,34 @@ export class TeamsConnector implements GatewayConnector {
             // is one thread = one session. Every message in the same 1:1 chat
             // shares the same conversationId regardless of quotes/replies.
             //
-            // Channel threads: use conversationId|rootMessageId. The root
-            // message creates the thread; replies use replyToId (pointing to
-            // the root) so all messages in the same thread map to one session.
-            const conversationId = activity.conversation?.id ?? '';
+            // Channel threads: use baseConversationId|rootMessageId. Teams
+            // appends ";messageid=<rootTimestamp>" to conversation.id for
+            // thread replies, so we strip that to normalize. The root message
+            // ID comes from either the messageid parameter, replyToId, or
+            // the activity's own ID.
+            const rawConversationId = activity.conversation?.id ?? '';
             const replyToId = activity.replyToId;
 
             let threadId: string;
             if (isPersonal) {
-              threadId = conversationId;
+              threadId = rawConversationId;
             } else {
-              const rootId = replyToId ?? activity.id ?? '';
-              threadId = `${conversationId}|${rootId}`;
+              // Normalize: strip ";messageid=..." from conversation.id
+              // Root messages: "19:channel@thread.tacv2"
+              // Thread replies: "19:channel@thread.tacv2;messageid=<rootTimestamp>"
+              let baseConversationId = rawConversationId;
+              let messageIdFromConv: string | undefined;
+
+              const msgIdIdx = rawConversationId.indexOf(';messageid=');
+              if (msgIdIdx !== -1) {
+                baseConversationId = rawConversationId.substring(0, msgIdIdx);
+                messageIdFromConv = rawConversationId.substring(msgIdIdx + ';messageid='.length);
+              }
+
+              // Root message ID: prefer messageid from conversation.id, then
+              // replyToId, then activity.id
+              const rootId = messageIdFromConv ?? replyToId ?? activity.id ?? '';
+              threadId = `${baseConversationId}|${rootId}`;
             }
 
             // Store reference for this thread (always update with latest activity)
