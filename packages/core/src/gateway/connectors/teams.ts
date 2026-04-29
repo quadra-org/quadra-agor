@@ -277,8 +277,11 @@ export class TeamsConnector implements GatewayConnector {
             // Extract message text
             let messageText = activity.text ?? '';
 
-            // Check for @mention in the entities array as well
+            // Check for @mention in the entities array and collect all
+            // display names used for bot mentions (Teams can use different
+            // names like "Display Name", the bot registration name, etc.)
             let hasMentionEntity = false;
+            const botMentionNames: string[] = [];
             if (activity.entities) {
               for (const entity of activity.entities) {
                 if (
@@ -290,29 +293,37 @@ export class TeamsConnector implements GatewayConnector {
                     | undefined;
                   if (mentioned?.id === this.config.app_id) {
                     hasMentionEntity = true;
-                    break;
+                    // Collect the display name used in this mention
+                    const mentionName = mentioned?.name as string | undefined;
+                    if (mentionName) {
+                      botMentionNames.push(mentionName);
+                    }
                   }
                 }
               }
             }
 
             // Mention detection and stripping
+            // Strip all known bot display names from the text
             let hasMention = false;
-            if (botName) {
-              hasMention = hasActiveMention(messageText, botName);
-              if (hasMention) {
-                messageText = stripMention(messageText, botName);
+
+            // Collect all possible bot names to strip
+            const allBotNames = new Set<string>();
+            if (botName) allBotNames.add(botName);
+            if (activity.recipient?.name) allBotNames.add(activity.recipient.name);
+            for (const name of botMentionNames) allBotNames.add(name);
+
+            // Strip mentions for all known bot names
+            for (const name of allBotNames) {
+              if (hasActiveMention(messageText, name)) {
+                hasMention = true;
+                messageText = stripMention(messageText, name);
               }
             }
 
-            // Also consider entity-based mentions
+            // Also flag as mention if entity detected even without text match
             if (!hasMention && hasMentionEntity) {
               hasMention = true;
-              // Strip mention tags even if we didn't have botName
-              // Teams includes <at>BotName</at> in text
-              if (activity.recipient?.name) {
-                messageText = stripMention(messageText, activity.recipient.name);
-              }
             }
 
             // Clean up any remaining HTML tags Teams might inject
