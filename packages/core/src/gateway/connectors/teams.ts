@@ -301,15 +301,31 @@ export class TeamsConnector implements GatewayConnector {
             const conversationType = (activity.conversation as unknown as Record<string, unknown>)
               ?.conversationType as string | undefined;
             const isPersonal = conversationType === 'personal';
-            const isThreadReply = !!activity.replyToId;
+            // In channels, replyToId indicates a thread reply to the root message.
+            // In personal chats, replyToId indicates a quote-reply (not a separate thread).
+            const isThreadReply = !isPersonal && !!activity.replyToId;
 
             // Build thread ID
+            //
+            // Personal (1:1) chats: use conversationId only. The entire DM
+            // is one thread = one session. Every message in the same 1:1 chat
+            // shares the same conversationId regardless of quotes/replies.
+            //
+            // Channel threads: use conversationId|rootMessageId. The root
+            // message creates the thread; replies use replyToId (pointing to
+            // the root) so all messages in the same thread map to one session.
             const conversationId = activity.conversation?.id ?? '';
             const replyToId = activity.replyToId;
-            const activityId = replyToId ?? activity.id ?? '';
-            const threadId = `${conversationId}|${activityId}`;
 
-            // Store reference for this thread
+            let threadId: string;
+            if (isPersonal) {
+              threadId = conversationId;
+            } else {
+              const rootId = replyToId ?? activity.id ?? '';
+              threadId = `${conversationId}|${rootId}`;
+            }
+
+            // Store reference for this thread (always update with latest activity)
             this.conversationRefs.set(threadId, ref);
 
             // Extract message text — check for quoted-reply first.
