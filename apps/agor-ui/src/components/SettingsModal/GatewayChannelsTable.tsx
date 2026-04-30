@@ -971,7 +971,6 @@ const ChannelFormFields: React.FC<{
                   >
                     <Switch />
                   </Form.Item>
-
                 </>
               ),
             },
