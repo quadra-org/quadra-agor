@@ -906,9 +906,15 @@ const ChannelFormFields: React.FC<{
                   <Form.Item
                     label="Tenant ID"
                     name="teams_tenant_id"
-                    tooltip="Optional — restrict to a single Azure AD tenant. Leave empty for multi-tenant."
+                    rules={[
+                      {
+                        required: true,
+                        message: 'Tenant ID is required for Teams bots',
+                      },
+                    ]}
+                    tooltip="Azure AD Tenant ID. Required so the bot can acquire tokens to send replies."
                   >
-                    <Input placeholder="25f44488-c176-4a87-8d0a-25d7448dc676 (optional)" />
+                    <Input placeholder="25f44488-c176-4a87-8d0a-25d7448dc676" />
                   </Form.Item>
 
                   <Alert
@@ -925,9 +931,9 @@ const ChannelFormFields: React.FC<{
                         >
                           Azure Portal
                         </Typography.Link>
-                        . The app registration must be <strong>multi-tenant</strong> for Bot
-                        Framework to work. Then sideload the bot as a Teams app via a custom
-                        manifest.
+                        . Both single-tenant and multi-tenant bots are supported. The{' '}
+                        <strong>Tenant ID</strong> is required so the bot can send replies. Then
+                        sideload the bot as a Teams app via a custom manifest.
                       </span>
                     }
                     style={{ fontSize: 12 }}
@@ -1603,7 +1609,7 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
     } else if (values.channel_type === 'teams') {
       if (values.teams_app_id) config.app_id = values.teams_app_id;
       if (values.teams_app_password) config.app_password = values.teams_app_password;
-      if (values.teams_tenant_id) config.tenant_id = values.teams_tenant_id;
+      config.tenant_id = values.teams_tenant_id;
       config.webhook_port = (values.teams_webhook_port as number) ?? 3978;
       config.webhook_path = (values.teams_webhook_path as string) || '/api/messages';
       config.require_mention = values.teams_require_mention ?? true;
