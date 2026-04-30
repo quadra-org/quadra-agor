@@ -166,10 +166,11 @@ Teams requires a `ConversationReference` to send messages outside of a direct tu
 Before configuring the connector in Agor, you need a **Bot registration** in Azure:
 
 1. Go to [Azure Portal](https://portal.azure.com) > **Bot Services** > **Create Azure Bot**
-2. Choose **Multi-Tenant** for the bot type
+2. Choose **Single-Tenant** or **Multi-Tenant** for the bot type
 3. Under **Configuration**, note the:
    - **Microsoft App ID** (a GUID)
    - **Microsoft App Password** (client secret — create one under Certificates & Secrets)
+   - **Directory (tenant) ID** (from the App Registration overview page)
 4. Set the **Messaging Endpoint** to your Agor daemon's public URL:
    ```
    https://<your-agor-host>/gateway/teams/webhook
@@ -187,7 +188,7 @@ Create a gateway channel in Agor (via UI or API) with:
 | `target_worktree_id` | The worktree where sessions will be created |
 | `config.app_id` | Microsoft App ID from Azure |
 | `config.app_password` | Microsoft App Password from Azure |
-| `config.tenant_id` | *(Optional)* Restrict to a single Azure AD tenant |
+| `config.tenant_id` | **Required.** Azure AD Tenant ID — needed for the bot to acquire tokens for outbound replies. Without it, the Bot Framework SDK cannot authenticate proactive messages and outbound replies will fail with a 401. |
 | `config.webhook_port` | *(Optional)* Custom port for the HTTP webhook server |
 | `config.webhook_path` | *(Optional)* Custom URL path for the webhook endpoint |
 | `config.require_mention` | *(Optional, default: true)* Require @mention in channels |
