@@ -139,13 +139,13 @@ pnpm build
 pnpm check:pack
 
 echo ""
-echo "🖥️  Building CLI..."
-cd "$REPO_ROOT/apps/agor-cli"
+echo "⚙️  Building Daemon..."
+cd "$REPO_ROOT/apps/agor-daemon"
 pnpm build
 
 echo ""
-echo "⚙️  Building Daemon..."
-cd "$REPO_ROOT/apps/agor-daemon"
+echo "🖥️  Building CLI..."
+cd "$REPO_ROOT/apps/agor-cli"
 pnpm build
 
 echo ""
