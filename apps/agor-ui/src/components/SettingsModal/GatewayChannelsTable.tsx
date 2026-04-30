@@ -972,15 +972,6 @@ const ChannelFormFields: React.FC<{
                     <Switch />
                   </Form.Item>
 
-                  <Form.Item
-                    label="Allow thread replies without @mention"
-                    name="teams_allow_thread_replies"
-                    valuePropName="checked"
-                    initialValue={true}
-                    tooltip="When enabled, replies within an existing bot thread don't require @mention"
-                  >
-                    <Switch />
-                  </Form.Item>
                 </>
               ),
             },
@@ -1613,7 +1604,6 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
       config.webhook_port = (values.teams_webhook_port as number) ?? 3978;
       config.webhook_path = (values.teams_webhook_path as string) || '/api/messages';
       config.require_mention = values.teams_require_mention ?? true;
-      config.allow_thread_replies_without_mention = values.teams_allow_thread_replies ?? true;
     } else if (values.channel_type === 'slack') {
       if (values.bot_token) config.bot_token = values.bot_token;
       if (values.app_token) config.app_token = values.app_token;
@@ -1755,7 +1745,6 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
       formValues.teams_webhook_port = (config?.webhook_port as number) ?? 3978;
       formValues.teams_webhook_path = (config?.webhook_path as string) || '/api/messages';
       formValues.teams_require_mention = config?.require_mention ?? true;
-      formValues.teams_allow_thread_replies = config?.allow_thread_replies_without_mention ?? true;
     }
 
     editForm.setFieldsValue(formValues);
