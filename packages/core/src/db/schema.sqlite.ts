@@ -1259,7 +1259,7 @@ export const gatewayChannels = sqliteTable(
     // Materialized for queries
     name: text('name').notNull(),
     channel_type: text('channel_type', {
-      enum: ['slack', 'discord', 'whatsapp', 'telegram', 'github'],
+      enum: ['slack', 'discord', 'whatsapp', 'telegram', 'github', 'teams'],
     }).notNull(),
     target_worktree_id: text('target_worktree_id', { length: 36 })
       .notNull()

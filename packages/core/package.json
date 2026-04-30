@@ -251,6 +251,7 @@
     "@opencode-ai/sdk": "^1.2.15",
     "@slack/socket-mode": "^2.0.5",
     "@slack/web-api": "^7.14.1",
+    "botbuilder": "^4.23.3",
     "bcryptjs": "^2.4.3",
     "cron-parser": "^5.5.0",
     "cronstrue": "^3.13.0",

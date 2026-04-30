@@ -88,6 +88,8 @@ function hasListeningConfig(channel: GatewayChannel): boolean {
         config.installation_id &&
         (config.watch_repos as string[] | undefined)?.length
       );
+    case 'teams':
+      return !!(config.app_id && config.app_password);
     default:
       return false;
   }
@@ -197,6 +199,29 @@ function buildGatewayContext(channel: GatewayChannel, data: PostMessageData): Ga
       };
     }
 
+    case 'teams': {
+      const conversationType = meta.teams_conversation_type as string | undefined;
+      const isPersonal = conversationType === 'personal';
+      let channelKind: string | undefined;
+      if (isPersonal) {
+        channelKind = 'DM';
+      } else if (conversationType === 'channel') {
+        channelKind = 'Channel';
+      } else if (conversationType === 'groupChat') {
+        channelKind = 'Group Chat';
+      }
+      const channelName = isPersonal
+        ? undefined
+        : ((meta.teams_channel_name as string) ?? (meta.teams_team_name as string) ?? undefined);
+      return {
+        platform: 'teams',
+        channelName,
+        channelKind,
+        userName: (meta.teams_user_name as string) ?? undefined,
+        userEmail: (meta.teams_user_email as string) ?? undefined,
+      };
+    }
+
     default:
       // Generic fallback for future platforms
       return {
@@ -272,7 +297,12 @@ export class GatewayService {
 
     if (!hasConnector(channel.channel_type as ChannelType)) return;
     try {
-      const connector = getConnector(channel.channel_type as ChannelType, channel.config);
+      // Prefer the active listener instance — webhook-based connectors (e.g. Teams)
+      // store ConversationReferences in memory on the listener instance.
+      // Creating a new connector via getConnector() would lose that state.
+      const connector =
+        this.activeListeners.get(channel.id) ??
+        getConnector(channel.channel_type as ChannelType, channel.config);
       connector
         .sendMessage({ threadId, text: `_[system] ${text}_` })
         .catch((err) => console.warn('[gateway] Debug message failed:', err));
@@ -832,9 +862,13 @@ export class GatewayService {
       return { routed: true, channelType: 'github' };
     }
 
-    // Non-GitHub channels (e.g. Slack): send immediately
+    // Non-GitHub channels (e.g. Slack, Teams): send immediately
     try {
-      const connector = getConnector(channel.channel_type as ChannelType, channel.config);
+      // Prefer the active listener instance — webhook-based connectors (e.g. Teams)
+      // store ConversationReferences in memory on the listener instance.
+      const connector =
+        this.activeListeners.get(channel.id) ??
+        getConnector(channel.channel_type as ChannelType, channel.config);
 
       const text = connector.formatMessage ? connector.formatMessage(data.message) : data.message;
 
