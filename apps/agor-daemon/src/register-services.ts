@@ -559,6 +559,17 @@ function createExecuteHandler(
       }
     }
 
+    // Validate cwd exists before spawning — a non-existent cwd causes
+    // spawn to emit ENOENT which is confusingly reported as "spawn node ENOENT"
+    const { existsSync: cwdExists } = await import('node:fs');
+    if (!cwdExists(cwd)) {
+      throw new Error(
+        `Worktree path does not exist on this host: ${cwd}. ` +
+          `The target worktree may have been created on a different machine. ` +
+          `Create the worktree on this host or change the gateway channel's target worktree.`
+      );
+    }
+
     // Find executor binary
     const dirname =
       typeof __dirname !== 'undefined' ? __dirname : path.dirname(fileURLToPath(import.meta.url));
@@ -771,6 +782,16 @@ function createExecuteHandler(
       cwd,
       env: executorUnixUser ? undefined : executorEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    // Handle spawn errors (e.g. ENOENT if node binary or cwd not found)
+    // Without this handler, the 'error' event becomes an uncaught exception
+    // that crashes the daemon.
+    executorProcess.on('error', (error) => {
+      console.error(
+        `❌ [Executor ${sessionId.slice(0, 8)}] Spawn error: ${error.message} (cwd: ${cwd})`
+      );
+      untrackExecutorProcess(sessionId);
     });
 
     // Safety-net cleanup for the env file. The inner bash script `rm -f`s
