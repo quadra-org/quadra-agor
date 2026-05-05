@@ -54,17 +54,17 @@ Roma is commercially sharp — it leads with insight, not features. Use it for a
 
 Sleuth is evidence-first — every claim is backed by data. It treats anomalies as signals worth investigating, leads with findings rather than methodology, and defaults to tables over paragraphs. Use it when your question has a data answer.
 
-### Cadence (Program Manager)
+### PM Assistant (Program Manager)
 
 | | |
 |---|---|
 | **What it does** | Quadra's process enforcement and program management agent. Enforces the CRISPY workflow (iteration limits, wall-clock time, commits-without-PR), tracks cross-repo dependencies, owns the GitHub Projects roadmap, runs sprint planning, maintains board hygiene (cleaning stale sessions, archiving completed work), and generates weekly status reports. |
 | **Best for** | Sprint planning, status reports, dependency tracking, board hygiene, issue triage, roadmap updates, workflow enforcement. |
 | **Tools** | GitHub Projects (roadmap), Agor boards (Alignment + Execution + Roma boards), issue monitoring. |
-| **How to reach it** | `@PM Assistant` in any Teams channel or DM the PM Assistant bot directly. (Internal name: Cadence) |
+| **How to reach it** | `@PM Assistant` in any Teams channel or DM the PM Assistant bot directly. |
 | **Worktree** | `private-pm-assistant` (on `quadra-assistants` repo) |
 
-Cadence is the system's immune system — it detects process problems early and enforces limits relentlessly but not annoyingly. It monitors iteration cycles (max 3 review→implement rounds), verification failures (max 2), wall-clock time per slice (max 60 min), and commits without a PR (max 10). Lead with status and blockers, no filler.
+PM Assistant is the system's immune system — it detects process problems early and enforces limits relentlessly but not annoyingly. It monitors iteration cycles (max 3 review→implement rounds), verification failures (max 2), wall-clock time per slice (max 60 min), and commits without a PR (max 10). Lead with status and blockers, no filler.
 
 ---
 
@@ -79,7 +79,7 @@ You're about to jump on a prospect call. `@Roma` in the channel and ask for a br
 A stakeholder asks "what's the NAV reconciliation status for Fund X?" in a channel. `@Dex` (Sleuth) queries the database directly, surfaces anomalies, and replies with a formatted table — no need to open Metabase or write SQL yourself.
 
 **Sprint status and blocker surfacing**
-During standup, `@PM Assistant` (Cadence) can report what shipped, what's blocked, which PRs are stuck in review cycles, and whether any work items have exceeded iteration limits — all inline in the planning channel.
+During standup, `@PM Assistant` can report what shipped, what's blocked, which PRs are stuck in review cycles, and whether any work items have exceeded iteration limits — all inline in the planning channel.
 
 **Shared context, shared answers**
 When a bot answers in a channel, the whole team benefits. Someone else with the same question finds it in the thread history. This turns individual AI interactions into team knowledge.
@@ -96,7 +96,7 @@ Gateway channels can be configured to target specific worktrees with specific to
 DM a bot for conversations you don't need to share. The same agents, same capabilities — just private to you. No @mention required in DMs; every message is automatically routed.
 
 **Multi-agent workflows**
-Ask Roma to research a prospect and pull the deal context, then ask Sleuth to pull the relevant usage data, then ask Cadence to create the roadmap items. Each agent handles its part in its own session with its own tools.
+Ask Roma to research a prospect and pull the deal context, then ask Sleuth to pull the relevant usage data, then ask PM Assistant to create the roadmap items. Each agent handles its part in its own session with its own tools.
 
 ---
 
