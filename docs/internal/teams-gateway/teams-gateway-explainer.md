@@ -30,38 +30,41 @@ Each bot maps to a dedicated agent with its own worktree, system prompt, tools, 
 
 We currently run three AI agent bots, each purpose-built for a different function within Quadra.
 
-### Roma
+### Roma (Go-to-Market Assistant)
 
 | | |
 |---|---|
-| **What it does** | General-purpose AI assistant for the engineering team. Answers questions, helps with research, drafts content, and handles ad-hoc requests that don't fit neatly into another agent's domain. |
-| **Best for** | Quick lookups, brainstorming, writing assistance, general Q&A, exploring ideas. |
+| **What it does** | Quadra's commercial operations agent. Manages the sales pipeline in HubSpot, researches leads and scores them against our ICP, prepares meeting briefing packs, generates legal contracts from SharePoint templates, and monitors pipeline health proactively. |
+| **Best for** | Pipeline and deal management, lead research, meeting prep, contract generation, competitive positioning, document lifecycle management. |
+| **Tools** | HubSpot (CRM via OAuth), SharePoint (document management via Graph API), Word doc tracked-changes tooling. |
 | **How to reach it** | `@Roma` in any Teams channel or DM the Roma bot directly. |
 | **Worktree** | `private-roma` (on `quadra-assistants` repo) |
 
-Roma is the "catch-all" agent. If you're not sure which bot to use, start here.
+Roma is commercially sharp — it leads with insight, not features. Use it for anything GTM: prepping for a prospect call, checking deal status, drafting a proposal, or pulling competitive intel.
 
-### Dex (Data Analyst Assistant)
+### Sleuth (Data Analyst Assistant)
 
 | | |
 |---|---|
-| **What it does** | Specialised in data analysis, reporting, and working with our data stack. Can query databases, interpret results, build visualisations, and help with data-driven decision making. |
-| **Best for** | Data questions, metric lookups, report generation, SQL help, dashboard interpretation, ad-hoc analysis. |
-| **How to reach it** | `@Dex` in any Teams channel or DM the Dex bot directly. |
+| **What it does** | Quadra's data investigation agent. Queries PostgreSQL and MSSQL databases directly, builds and maintains Metabase dashboards, investigates data anomalies and reconciliation issues, and monitors pipeline health in Dagster. Deep domain expertise in investment data — positions, transactions, instruments, portfolios, and NAV. |
+| **Best for** | SQL queries, data anomaly investigation, dashboard creation, pipeline health checks, schema inspection, reconciliation issues, ad-hoc data analysis. |
+| **Tools** | Neon PostgreSQL (MCP), MSSQL/SQL Server (MCP), Metabase dashboards (MCP), Dagster pipeline orchestration (GraphQL). |
+| **How to reach it** | `@Dex` in any Teams channel or DM the Dex bot directly. (Internal name: Sleuth) |
 | **Worktree** | `private-data-analyst-assistant` (on `quadra-assistants` repo) |
 
-Dex is the agent to use when your question involves data. It has access to the tools and context needed to work with our data infrastructure.
+Sleuth is evidence-first — every claim is backed by data. It treats anomalies as signals worth investigating, leads with findings rather than methodology, and defaults to tables over paragraphs. Use it when your question has a data answer.
 
-### PM Assistant
+### Cadence (Program Manager)
 
 | | |
 |---|---|
-| **What it does** | Project management support agent. Helps with task tracking, status updates, sprint planning, writing specs, and keeping projects organised. |
-| **Best for** | Status summaries, spec drafting, task breakdowns, meeting prep, project documentation, process questions. |
-| **How to reach it** | `@PM Assistant` in any Teams channel or DM the PM Assistant bot directly. |
+| **What it does** | Quadra's process enforcement and program management agent. Enforces the CRISPY workflow (iteration limits, wall-clock time, commits-without-PR), tracks cross-repo dependencies, owns the GitHub Projects roadmap, runs sprint planning, maintains board hygiene (cleaning stale sessions, archiving completed work), and generates weekly status reports. |
+| **Best for** | Sprint planning, status reports, dependency tracking, board hygiene, issue triage, roadmap updates, workflow enforcement. |
+| **Tools** | GitHub Projects (roadmap), Agor boards (Alignment + Execution + Roma boards), issue monitoring. |
+| **How to reach it** | `@PM Assistant` in any Teams channel or DM the PM Assistant bot directly. (Internal name: Cadence) |
 | **Worktree** | `private-pm-assistant` (on `quadra-assistants` repo) |
 
-PM Assistant is for project coordination work — anything where you need help managing or communicating about work rather than doing the technical work itself.
+Cadence is the system's immune system — it detects process problems early and enforces limits relentlessly but not annoyingly. It monitors iteration cycles (max 3 review→implement rounds), verification failures (max 2), wall-clock time per slice (max 60 min), and commits without a PR (max 10). Lead with status and blockers, no filler.
 
 ---
 
@@ -69,14 +72,14 @@ PM Assistant is for project coordination work — anything where you need help m
 
 ### Day-to-Day Team Use
 
-**Quick answers without context switching**
-You're in a Teams channel discussing a feature. Instead of opening a separate AI tool, you `@Roma` with your question and get an answer in the same thread. Everyone in the channel sees the answer — no need to copy-paste from a private AI chat.
+**Pipeline and deal prep without leaving Teams**
+You're about to jump on a prospect call. `@Roma` in the channel and ask for a briefing pack — it pulls the deal from HubSpot, researches the company, scores against ICP, and gives you a prep summary. No tab-switching to CRM.
 
-**Data questions in natural language**
-A stakeholder asks "what were our signups last week?" in a channel. `@Dex` can query the data, interpret it, and reply with a formatted answer — no need to open a dashboard or write SQL yourself.
+**Data questions answered with evidence**
+A stakeholder asks "what's the NAV reconciliation status for Fund X?" in a channel. `@Dex` (Sleuth) queries the database directly, surfaces anomalies, and replies with a formatted table — no need to open Metabase or write SQL yourself.
 
-**Sprint planning support**
-During planning, `@PM Assistant` can help break down epics into tasks, draft acceptance criteria, or summarise what shipped last sprint — all inline in the planning channel.
+**Sprint status and blocker surfacing**
+During standup, `@PM Assistant` (Cadence) can report what shipped, what's blocked, which PRs are stuck in review cycles, and whether any work items have exceeded iteration limits — all inline in the planning channel.
 
 **Shared context, shared answers**
 When a bot answers in a channel, the whole team benefits. Someone else with the same question finds it in the thread history. This turns individual AI interactions into team knowledge.
@@ -93,7 +96,7 @@ Gateway channels can be configured to target specific worktrees with specific to
 DM a bot for conversations you don't need to share. The same agents, same capabilities — just private to you. No @mention required in DMs; every message is automatically routed.
 
 **Multi-agent workflows**
-Ask Roma to research something, then ask Dex to pull the relevant data, then ask PM Assistant to draft the spec. Each agent handles its part in its own session with its own tools.
+Ask Roma to research a prospect and pull the deal context, then ask Sleuth to pull the relevant usage data, then ask Cadence to create the roadmap items. Each agent handles its part in its own session with its own tools.
 
 ---
 
