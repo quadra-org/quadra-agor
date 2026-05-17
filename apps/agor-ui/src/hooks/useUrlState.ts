@@ -199,19 +199,17 @@ export function useUrlState(options: UseUrlStateOptions) {
       lastUrlSessionParamRef.current = urlSessionParam;
     }
 
-    // Skip if URL hasn't changed AND we've already resolved everything AND state
-    // still matches the URL. The `stateMatchesUrl` clause is the self-healing
-    // bit: if some upstream effect ever clears `currentBoardId` / `currentSessionId`
-    // (e.g. a stale wipe-on-disconnect regression), we re-resolve and restore
-    // state from the URL on the next data tick instead of letting the state→URL
-    // effect collapse `/b/<id>` to `/`. The `boardChanged`/`sessionChanged`
-    // checks below keep this idempotent on stable state.
+    // Skip if URL hasn't changed AND we've already resolved everything.
+    //
+    // Invariant: URL→State only re-asserts state when the URL itself changes.
+    // State clears (e.g. user closes panel → `selectedSessionId = null`) are
+    // intentional until State→URL catches up — do NOT "self-heal" state from
+    // a stale URL param here, or you'll fight intentional clears and the panel
+    // will reopen itself. Wipe-on-disconnect is prevented at source (App.tsx
+    // passes `client` directly; missing-board fallback is `connected`-gated).
     const fullyResolved =
       urlParamsResolvedRef.current.board && urlParamsResolvedRef.current.session;
-    const stateMatchesUrl =
-      (!urlBoardParam || !!currentBoardIdRef.current) &&
-      (!urlSessionParam || !!currentSessionIdRef.current);
-    if (!urlParamsChanged && fullyResolved && stateMatchesUrl) {
+    if (!urlParamsChanged && fullyResolved) {
       return;
     }
 
