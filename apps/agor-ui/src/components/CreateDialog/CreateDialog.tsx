@@ -59,11 +59,20 @@ export interface CreateDialogProps {
   currentBoardId?: string;
   defaultPosition?: { x: number; y: number };
   defaultTab?: ActiveTab;
-  onCreateBranch: (config: BranchTabConfig) => void;
-  onCreateBoard: (board: Partial<Board>) => void;
+  onCreateBranch: (config: BranchTabConfig) => void | Promise<void>;
+  onCreateBoard: (board: Partial<Board>) => void | Promise<void>;
   onCreateRepo: (data: CreateRepoRequest) => void | Promise<void>;
   onCreateLocalRepo: (data: CreateLocalRepoRequest) => void | Promise<void>;
-  onCreateAssistant: (result: AssistantTabResult) => void;
+  onCreateAssistant: (result: AssistantTabResult) => void | Promise<void>;
+}
+
+/** Fire the parent handler and close the dialog. We don't `await` here
+ *  because the parent may navigate (away from the dialog's host
+ *  component) as part of its work — blocking the close on that would
+ *  delay the modal teardown. Rejections are swallowed: each parent
+ *  handler already surfaces its own errors via toasts. */
+function fireAndForget(result: void | Promise<void>) {
+  Promise.resolve(result).catch(() => {});
 }
 
 export const CreateDialog: React.FC<CreateDialogProps> = ({
@@ -128,7 +137,7 @@ export const CreateDialog: React.FC<CreateDialogProps> = ({
         case 'branch': {
           const config = await branchFormRef.current?.();
           if (config) {
-            onCreateBranch(config);
+            fireAndForget(onCreateBranch(config));
             onClose();
           }
           break;
@@ -136,7 +145,7 @@ export const CreateDialog: React.FC<CreateDialogProps> = ({
         case 'board': {
           const board = await boardFormRef.current?.();
           if (board) {
-            onCreateBoard(board);
+            fireAndForget(onCreateBoard(board));
             onClose();
           }
           break;
@@ -145,12 +154,9 @@ export const CreateDialog: React.FC<CreateDialogProps> = ({
           const result = await repoFormRef.current?.();
           if (result) {
             if (result.mode === 'local' && result.local) {
-              onCreateLocalRepo(result.local);
+              fireAndForget(onCreateLocalRepo(result.local));
             } else if (result.remote) {
-              // Fire-and-forget: handleCreateRepo in App.tsx already surfaces
-              // errors via a toast. Swallow here to avoid unhandled-rejection
-              // noise from its re-throw.
-              Promise.resolve(onCreateRepo(result.remote)).catch(() => {});
+              fireAndForget(onCreateRepo(result.remote));
             }
             onClose();
           }
@@ -159,7 +165,7 @@ export const CreateDialog: React.FC<CreateDialogProps> = ({
         case 'assistant': {
           const result = await assistantFormRef.current?.();
           if (result) {
-            onCreateAssistant(result);
+            fireAndForget(onCreateAssistant(result));
             onClose();
           }
           break;

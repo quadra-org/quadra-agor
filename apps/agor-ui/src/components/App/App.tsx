@@ -110,7 +110,7 @@ export interface AppProps {
   onSendPrompt?: (sessionId: string, prompt: string, permissionMode?: PermissionMode) => void;
   onUpdateSession?: (sessionId: string, updates: Partial<Session>) => void;
   onDeleteSession?: (sessionId: string) => void;
-  onCreateBoard?: (board: Partial<Board>) => void;
+  onCreateBoard?: (board: Partial<Board>) => Promise<Board | null>;
   onUpdateBoard?: (boardId: string, updates: Partial<Board>) => void;
   onDeleteBoard?: (boardId: string) => void;
   onArchiveBoard?: (boardId: string) => void;
@@ -139,6 +139,8 @@ export interface AppProps {
       pullLatest: boolean;
       issue_url?: string;
       pull_request_url?: string;
+      boardId?: string;
+      position?: { x: number; y: number };
       storage_mode?: 'worktree' | 'clone';
       clone_depth?: number;
     }
@@ -519,6 +521,12 @@ export const App: React.FC<AppProps> = ({
   };
 
   const handleCreateBranch = async (config: BranchTabConfig) => {
+    // Thread board placement (boardId + position) through the create
+    // call so it lands atomically. The previous shape did a follow-up
+    // PATCH for board_id and dropped position entirely — the API already
+    // accepts both at create time, so the patch is redundant and the
+    // dropped position made the BranchTab `defaultPosition` plumbing a
+    // no-op.
     const branch = await onCreateBranch?.(config.repoId, {
       name: config.name,
       ref: config.ref,
@@ -528,25 +536,42 @@ export const App: React.FC<AppProps> = ({
       pullLatest: config.pullLatest,
       issue_url: config.issue_url,
       pull_request_url: config.pull_request_url,
+      ...(config.board_id ? { boardId: config.board_id } : {}),
+      ...(config.position ? { position: config.position } : {}),
       ...(config.storage_mode ? { storage_mode: config.storage_mode } : {}),
       ...(config.clone_depth !== undefined ? { clone_depth: config.clone_depth } : {}),
     });
 
-    // If board_id is provided and branch was created, assign it to the board
-    if (branch && config.board_id) {
-      await onUpdateBranch?.(branch.branch_id, {
-        board_id: config.board_id as BoardID,
-      });
-    }
-
     setCreateDialogOpen(false);
+
+    // Mirror handleCreateSession: route through the URL so useUrlState
+    // owns selection. The just-created branch may not be in branchById
+    // yet (socket `created` event still in flight) — goToBranch pushes
+    // `/w/<short>/` unconditionally and useUrlState's URL→state effect
+    // resolves the branch on a subsequent render to switch boards (if
+    // needed) and recenter the canvas.
+    if (branch) {
+      navigation.goToBranch(branch.branch_id);
+    }
+  };
+
+  const handleCreateBoardFromDialog = async (board: Partial<Board>) => {
+    if (!onCreateBoard) return;
+    const created = await onCreateBoard(board);
+    // Boards have their own URL (/b/<slug-or-short>/) — switch to the
+    // new board after creation so the user lands on the empty canvas
+    // they're about to populate. Same intent as goToBranch/goToSession
+    // after their respective creates.
+    if (created?.board_id) {
+      navigation.goToBoard(created.board_id);
+    }
   };
 
   const handleCreateAssistant = async (result: AssistantTabResult) => {
     const repoId = result.repoId;
     if (!repoId || !onCreateBranch || !onUpdateBranch) return;
 
-    await createAssistantBranch(
+    const branch = await createAssistantBranch(
       {
         displayName: result.displayName,
         description: result.description,
@@ -558,6 +583,14 @@ export const App: React.FC<AppProps> = ({
       },
       { client, repoById, onCreateBranch, onUpdateBranch }
     );
+
+    // Assistants are branches under the hood, so the `/w/<short>/` URL
+    // is the canonical deep link. Routing through goToBranch picks up
+    // the cross-board recenter for free when the assistant was created
+    // on a new board.
+    if (branch) {
+      navigation.goToBranch(branch.branch_id);
+    }
   };
 
   // Refs for the data `handleSessionClick` reads. Using refs (vs
@@ -1193,7 +1226,7 @@ export const App: React.FC<AppProps> = ({
               currentBoardId={currentBoardId}
               defaultPosition={newBranchDefaultPosition || undefined}
               onCreateBranch={handleCreateBranch}
-              onCreateBoard={(board) => onCreateBoard?.(board)}
+              onCreateBoard={handleCreateBoardFromDialog}
               onCreateRepo={(data) => onCreateRepo?.(data)}
               onCreateLocalRepo={(data) => onCreateLocalRepo?.(data)}
               onCreateAssistant={handleCreateAssistant}
