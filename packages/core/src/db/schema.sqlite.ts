@@ -16,6 +16,7 @@ import type {
   SandpackConfig,
   Session,
   Task,
+  UserExternalIdentity,
 } from '@agor/core/types';
 import { BRANCH_PERMISSION_LEVELS } from '@agor/core/types';
 import { relations, sql } from 'drizzle-orm';
@@ -835,6 +836,8 @@ export const users = sqliteTable(
       .$type<{
         avatar?: string;
         preferences?: Record<string, unknown>;
+        // Stable external-auth identity mappings used by generic launch-code auth.
+        external_identities?: UserExternalIdentity[];
         // Per-tool credentials and auth-adjacent config.
         //
         // Each entry is keyed by AgenticToolName and holds env-var-named fields
