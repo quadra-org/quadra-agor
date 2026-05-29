@@ -16,9 +16,11 @@ import type {
   SessionID,
   TaskID,
 } from '@agor/core/types';
+import { TaskStatus } from '@agor/core/types';
 import type { ResolvedConfigSlice } from './payload-types.js';
 import { globalPermissionManager } from './permissions/permission-manager.js';
 import { type AgorClient, createFeathersClient } from './services/feathers-client.js';
+import { tryMarkTaskTerminal } from './terminal-task.js';
 
 export interface ExecutorConfig {
   sessionToken: string;
@@ -40,6 +42,19 @@ export class AgorExecutor {
 
   constructor(private config: ExecutorConfig) {
     this.abortController = new AbortController();
+  }
+
+  /**
+   * Bound wrapper around the standalone `tryMarkTaskTerminal` helper for
+   * the four fail-safe paths inside this class. Guards against a missing
+   * client (e.g. when the daemon connection never came up).
+   */
+  private async tryMarkTaskTerminal(
+    status: typeof TaskStatus.FAILED | typeof TaskStatus.STOPPED,
+    errorMessage?: string
+  ): Promise<void> {
+    if (!this.client) return;
+    await tryMarkTaskTerminal(this.client, this.config.taskId, status, errorMessage);
   }
 
   /**
@@ -74,20 +89,10 @@ export class AgorExecutor {
       process.exit(0);
     } catch (error) {
       console.error('[executor] Fatal error:', error);
-
-      // Try to update task status to FAILED
-      if (this.client) {
-        try {
-          await this.client.service('tasks').patch(this.config.taskId, {
-            status: 'failed',
-            completed_at: new Date().toISOString(),
-            error_message: error instanceof Error ? error.message : String(error),
-          });
-        } catch (patchError) {
-          console.error('[executor] Failed to update task status:', patchError);
-        }
-      }
-
+      await this.tryMarkTaskTerminal(
+        TaskStatus.FAILED,
+        error instanceof Error ? error.message : String(error)
+      );
       process.exit(1);
     }
   }
@@ -177,17 +182,10 @@ export class AgorExecutor {
         this.abortController.abort();
       }
 
-      // Update task status to stopped
-      if (this.client) {
-        try {
-          await this.client.service('tasks').patch(this.config.taskId, {
-            status: 'stopped',
-            completed_at: new Date().toISOString(),
-          });
-        } catch (error) {
-          console.error('[executor] Failed to update task status:', error);
-        }
-      }
+      // The daemon's stop route already patches the task to STOPPED before
+      // sending the signal — this fallback only fires if we received an
+      // out-of-band signal and the task is still active.
+      await this.tryMarkTaskTerminal(TaskStatus.STOPPED);
 
       process.exit(0);
     };
@@ -197,39 +195,19 @@ export class AgorExecutor {
 
     process.on('uncaughtException', async (error) => {
       console.error('[executor] Uncaught exception:', error);
-
-      // Try to update task status
-      if (this.client) {
-        try {
-          await this.client.service('tasks').patch(this.config.taskId, {
-            status: 'failed',
-            completed_at: new Date().toISOString(),
-            error_message: `uncaughtException: ${error instanceof Error ? error.message : String(error)}`,
-          });
-        } catch (patchError) {
-          console.error('[executor] Failed to update task status:', patchError);
-        }
-      }
-
+      await this.tryMarkTaskTerminal(
+        TaskStatus.FAILED,
+        `uncaughtException: ${error instanceof Error ? error.message : String(error)}`
+      );
       process.exit(1);
     });
 
     process.on('unhandledRejection', async (reason) => {
       console.error('[executor] Unhandled rejection:', reason);
-
-      // Try to update task status
-      if (this.client) {
-        try {
-          await this.client.service('tasks').patch(this.config.taskId, {
-            status: 'failed',
-            completed_at: new Date().toISOString(),
-            error_message: `unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}`,
-          });
-        } catch (patchError) {
-          console.error('[executor] Failed to update task status:', patchError);
-        }
-      }
-
+      await this.tryMarkTaskTerminal(
+        TaskStatus.FAILED,
+        `unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}`
+      );
       process.exit(1);
     });
   }
