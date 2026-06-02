@@ -12,7 +12,7 @@
     }
   },
   "scripts": {
-    "build": "tsup && node scripts/stamp-build-info.mjs",
+    "build": "tsup && tsc --emitDeclarationOnly --declaration --declarationMap --noEmit false --incremental false && node scripts/stamp-build-info.mjs",
     "dev": "concurrently -k -n core,daemon -c cyan,green \"pnpm --filter @agor/core dev\" \"./node_modules/.bin/tsx watch --clear-screen=false --ignore 'node_modules/**' src/main.ts\"",
     "dev:daemon-only": "tsx watch --clear-screen=false --ignore 'node_modules/**' src/main.ts",
     "start": "node dist/main.js",
@@ -54,7 +54,7 @@
     "glob": "^11.0.3",
     "tsup": "^8.5.1",
     "tsx": "^4.22.3",
-    "typescript": "^5.9.3",
+    "typescript": "^6.0.3",
     "vitest": "^4.1.7",
     "zod": "^4.4.3"
   }

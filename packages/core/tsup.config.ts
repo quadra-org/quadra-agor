@@ -53,8 +53,8 @@ export default defineConfig({
     'yaml/index': 'src/yaml/index.ts', // Browser-safe js-yaml re-export
   },
   format: ['cjs', 'esm'],
-  dts: true,
-  clean: true,
+  dts: false,
+  clean: process.env.TSUP_CLEAN === 'false' ? false : true,
   splitting: false,
   shims: true, // Enable shims for import.meta.url in CJS builds
   // Don't bundle agent SDKs and Node.js-only dependencies
