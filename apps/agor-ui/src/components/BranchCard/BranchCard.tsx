@@ -3,7 +3,6 @@ import { getAssistantConfig, isAssistant } from '@agor-live/client';
 import {
   BranchesOutlined,
   CodeOutlined,
-  DeleteOutlined,
   DragOutlined,
   EditOutlined,
   PushpinFilled,
@@ -15,6 +14,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useConnectionDisabled } from '../../contexts/ConnectionContext';
 import { useLocalStorage } from '../../hooks/useLocalStorage';
 import { ensureColorVisible, isDarkTheme } from '../../utils/theme';
+import { ArchiveActionButton } from '../ArchiveButton';
 import { ArchiveDeleteBranchModal } from '../ArchiveDeleteBranchModal';
 import { EnvironmentPill } from '../EnvironmentPill';
 import { MarkdownRenderer } from '../MarkdownRenderer';
@@ -467,17 +467,10 @@ const BranchCardComponent = ({
               />
             )}
             {!inPopover && !panelMode && onArchiveOrDelete && (
-              <Button
-                type="text"
-                size="small"
-                icon={<DeleteOutlined />}
+              <ArchiveActionButton
+                tooltip="Archive or delete branch"
                 disabled={connectionDisabled}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setArchiveDeleteModalOpen(true);
-                }}
-                title="Archive or delete branch"
-                danger
+                onClick={() => setArchiveDeleteModalOpen(true)}
               />
             )}
           </div>

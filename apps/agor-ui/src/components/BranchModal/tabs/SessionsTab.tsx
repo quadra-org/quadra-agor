@@ -6,7 +6,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useThemedMessage } from '../../../utils/message';
 import { getSessionStatusTone } from '../../../utils/sessionStatus';
 import { getSessionDisplayTitle } from '../../../utils/sessionTitle';
-import { ArchiveToggleButton } from '../../ArchiveToggleButton';
+import { ArchiveToggleButton } from '../../ArchiveButton';
 import { TaskStatusIcon } from '../../TaskStatusIcon';
 import { ToolIcon } from '../../ToolIcon/ToolIcon';
 
@@ -337,7 +337,7 @@ const SessionsTabInner: React.FC<SessionsTabProps> = ({
         <ArchiveToggleButton
           archived={session.archived}
           loading={archivingIds.has(session.session_id)}
-          tooltip={session.archived ? 'Archived • Click to unarchive' : 'Click to archive'}
+          tooltip={session.archived ? 'Archived • Click to unarchive' : 'Archive session'}
           onToggle={(nextArchived) =>
             handleArchiveToggle(session.session_id as SessionID, nextArchived)
           }

@@ -1,8 +1,9 @@
 import type { Board, Branch, MCPServer, Repo, Session } from '@agor-live/client';
 import { isAssistant } from '@agor-live/client';
-import { DeleteOutlined, FolderOutlined, LinkOutlined } from '@ant-design/icons';
-import { Button, Descriptions, Form, Input, Select, Space, Tooltip, Typography } from 'antd';
+import { FolderOutlined, LinkOutlined } from '@ant-design/icons';
+import { Descriptions, Form, Input, Select, Space, Tooltip, Typography } from 'antd';
 import { useState } from 'react';
+import { ArchiveActionButton } from '../../ArchiveButton';
 import { ArchiveDeleteBranchModal } from '../../ArchiveDeleteBranchModal';
 import { MCPServerSelect } from '../../MCPServerSelect';
 import { Tag } from '../../Tag';
@@ -214,14 +215,14 @@ export const GeneralTab: React.FC<GeneralTabProps> = ({
         {/* Out-of-band destructive action: archive/delete is not part of the
             modal's Save flow because it tears the branch down entirely. */}
         <Space>
-          <Button
-            danger
-            icon={<DeleteOutlined />}
+          <ArchiveActionButton
+            tooltip=""
+            size="middle"
             onClick={() => setArchiveDeleteModalOpen(true)}
             disabled={!canEdit}
           >
-            Archive/Delete Branch
-          </Button>
+            Archive or Delete Branch
+          </ArchiveActionButton>
         </Space>
         <ArchiveDeleteBranchModal
           open={archiveDeleteModalOpen}

@@ -23,7 +23,6 @@ import {
   BranchesOutlined,
   CloseOutlined,
   CodeOutlined,
-  DeleteOutlined,
   ForkOutlined,
   QuestionCircleOutlined,
   SendOutlined,
@@ -37,11 +36,13 @@ import { useAppActions } from '../../contexts/AppActionsContext';
 import { useAppMcpData, useAppUserData } from '../../contexts/AppDataContext';
 import { useRecenterMap } from '../../contexts/CanvasNavigationContext';
 import { useConnectionDisabled } from '../../contexts/ConnectionContext';
+import { useSessionActions } from '../../hooks/useSessionActions';
 import { useSharedReactiveSession } from '../../hooks/useSharedReactiveSession';
 import { getContextWindowGradient } from '../../utils/contextWindow';
 import { mcpServerNeedsAuth } from '../../utils/mcpAuth';
 import { useThemedMessage } from '../../utils/message';
 import { getSessionDisplayTitle, getSessionTitleStyles } from '../../utils/sessionTitle';
+import { ArchiveActionButton } from '../ArchiveButton';
 import { AutocompleteTextarea } from '../AutocompleteTextarea';
 import { CallbackToggleButton } from '../CallbackToggleButton';
 import { EffortSelector } from '../EffortSelector';
@@ -242,15 +243,10 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
   const { mcpServerById, userAuthenticatedMcpServerIds } = useAppMcpData();
 
   // Get actions from context
-  const {
-    onSendPrompt,
-    onFork,
-    onBtwFork,
-    onOpenSettings,
-    onUpdateSession,
-    onDeleteSession: onDelete,
-    onOpenTerminal,
-  } = useAppActions();
+  const { onSendPrompt, onFork, onBtwFork, onOpenSettings, onUpdateSession, onOpenTerminal } =
+    useAppActions();
+
+  const { archiveSession } = useSessionActions(client);
 
   // Tool capabilities — drives which buttons are shown
   const toolCaps = session?.agentic_tool
@@ -513,16 +509,25 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
     return null;
   }
 
-  const handleDelete = () => {
+  const handleArchive = () => {
+    if (!client || connectionDisabled) {
+      showError('Cannot archive while disconnected from the daemon.');
+      return;
+    }
+
     modal.confirm({
-      title: 'Delete Session',
-      content: 'Are you sure you want to delete this session? This action cannot be undone.',
-      okText: 'Delete',
-      okType: 'danger',
+      title: 'Archive session?',
+      content: 'Are you sure you want to archive this session?',
+      okText: 'Archive',
       cancelText: 'Cancel',
-      onOk: () => {
-        onDelete?.(session.session_id);
-        onClose();
+      onOk: async () => {
+        const archived = await archiveSession(session.session_id);
+        if (archived) {
+          showSuccess('Session archived');
+          onClose();
+        } else {
+          showError('Failed to archive session');
+        }
       },
     });
   };
@@ -1020,11 +1025,12 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
                 />
               </Tooltip>
             )}
-            {onDelete && (
-              <Tooltip title="Delete Session">
-                <Button type="text" danger icon={<DeleteOutlined />} onClick={handleDelete} />
-              </Tooltip>
-            )}
+            <ArchiveActionButton
+              tooltip={connectionDisabled ? 'Disconnected from daemon' : 'Archive session'}
+              size="middle"
+              disabled={connectionDisabled || !client}
+              onClick={handleArchive}
+            />
             <Tooltip title="Close Panel">
               <Button
                 type="text"

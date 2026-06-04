@@ -6,7 +6,6 @@ import {
 import {
   ClockCircleOutlined,
   EyeOutlined,
-  InboxOutlined,
   MessageOutlined,
   PlusOutlined,
   SettingOutlined,
@@ -41,6 +40,7 @@ import {
   sortSessions,
 } from '../../utils/sessionSearch';
 import { getSessionDisplayTitle, getSessionTitleStyles } from '../../utils/sessionTitle';
+import { ArchiveActionButton } from '../ArchiveButton';
 import { type ForkSpawnAction, ForkSpawnModal } from '../ForkSpawnModal';
 import { HighlightMatch } from '../HighlightMatch';
 import { ChannelPill } from '../Pill';
@@ -155,16 +155,12 @@ const SessionItemWithActions: React.FC<{
             />
           </Tooltip>
         )}
-        <Tooltip title="Archive session">
-          <Button
-            type="text"
-            size="small"
-            icon={<InboxOutlined />}
-            loading={isArchiving}
-            onClick={(e) => onArchive(sessionId, e)}
-            style={buttonStyle}
-          />
-        </Tooltip>
+        <ArchiveActionButton
+          tooltip="Archive session"
+          loading={isArchiving}
+          onClick={(e) => onArchive(sessionId, e)}
+          style={buttonStyle}
+        />
       </div>
     </div>
   );
@@ -238,7 +234,7 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
       e.stopPropagation();
 
       modal.confirm({
-        title: 'Archive Session',
+        title: 'Archive session?',
         content: 'Are you sure you want to archive this session?',
         okText: 'Archive',
         cancelText: 'Cancel',
