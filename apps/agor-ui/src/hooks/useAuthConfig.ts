@@ -5,6 +5,7 @@
  * Used on app startup to determine if login page should be shown and display instance label.
  */
 
+import type { ManagedEnvExecutionMode } from '@agor/core/environment/webhook';
 import type { DaemonServicesConfig } from '@agor-live/client';
 import { useEffect, useState } from 'react';
 import { getDaemonUrl } from '../config/daemon';
@@ -51,6 +52,11 @@ interface FeaturesConfig {
    * services/branches.ts is the source of truth. Defaults to 'member'.
    */
   managedEnvsMinimumRole?: 'none' | 'viewer' | 'member' | 'admin' | 'superadmin';
+  /**
+   * How managed environment lifecycle fields are handled by this instance.
+   * Defaults to 'hybrid': shell commands and URL webhooks are both supported.
+   */
+  managedEnvsExecutionMode?: ManagedEnvExecutionMode;
   /**
    * True when the daemon runs in a multi-user Unix isolation mode
    * (insulated/strict). The UI uses this to hide "trust everyone on this

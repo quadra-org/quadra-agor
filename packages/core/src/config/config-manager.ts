@@ -180,6 +180,17 @@ function validateConfig(config: AgorConfig): void {
     );
   }
 
+  const managedEnvExecutionMode = config.execution?.managed_envs_execution_mode;
+  if (
+    managedEnvExecutionMode !== undefined &&
+    managedEnvExecutionMode !== 'hybrid' &&
+    managedEnvExecutionMode !== 'webhook-only'
+  ) {
+    throw new Error(
+      `Config error: execution.managed_envs_execution_mode must be one of: hybrid, webhook-only`
+    );
+  }
+
   validateOptionalHttpUrl(
     config.external_launch as Record<string, unknown> | undefined,
     'login_redirect_url',

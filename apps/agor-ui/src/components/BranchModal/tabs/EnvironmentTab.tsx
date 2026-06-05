@@ -15,6 +15,12 @@
  */
 
 import {
+  MANAGED_ENV_EXECUTION_MODE_DEFAULT,
+  type ManagedEnvExecutionMode,
+  validateManagedEnvLifecyclePolicy,
+  validateRepoEnvironmentLifecyclePolicy,
+} from '@agor/core/environment/webhook';
+import {
   type AgorClient,
   type Branch,
   type Repo,
@@ -112,6 +118,9 @@ export const EnvironmentTab: React.FC<EnvironmentTabProps> = ({
 
   // ----- Permission gating -----
   const managedEnvsMinimumRole = featuresConfig?.managedEnvsMinimumRole ?? 'member';
+  const managedEnvsExecutionMode: ManagedEnvExecutionMode =
+    featuresConfig?.managedEnvsExecutionMode ?? MANAGED_ENV_EXECUTION_MODE_DEFAULT;
+  const isWebhookMode = managedEnvsExecutionMode === 'webhook-only';
   const canTriggerEnv =
     managedEnvsMinimumRole !== 'none' &&
     hasRole(managedEnvsMinimumRole as Exclude<typeof managedEnvsMinimumRole, 'none'>);
@@ -120,6 +129,12 @@ export const EnvironmentTab: React.FC<EnvironmentTabProps> = ({
     : managedEnvsMinimumRole === 'none'
       ? 'Managed environments are disabled on this instance'
       : `Requires ${managedEnvsMinimumRole} role or higher`;
+  const lifecycleFieldHelp = isWebhookMode
+    ? 'This instance uses webhook-managed environments. Use public http(s) URLs for start, stop, nuke, and logs.'
+    : 'This instance supports shell commands and URL webhooks for start, stop, nuke, and logs.';
+  const repoPlaceholder = isWebhookMode
+    ? 'version: 2\ndefault: remote\nvariants:\n  remote:\n    start: https://env.example.com/start?branch={{branch.name}}\n    stop: https://env.example.com/stop?branch={{branch.name}}\n    health: https://apps.example.com/{{branch.name}}/health\n    app: https://apps.example.com/{{branch.name}}\n'
+    : 'version: 2\ndefault: lean\nvariants:\n  lean:\n    start: docker compose up -d\n    stop: docker compose down\n';
 
   // ----- Repo-level editor state (YAML representation of repo.environment) -----
   const [isEditingRepo, setIsEditingRepo] = useState(false);
@@ -342,6 +357,14 @@ export const EnvironmentTab: React.FC<EnvironmentTabProps> = ({
     }
     try {
       const validated = validateRepoEnvironment(parsed);
+      if (isWebhookMode) {
+        try {
+          validateRepoEnvironmentLifecyclePolicy(validated, managedEnvsExecutionMode);
+        } catch (err) {
+          setRepoYamlError(err instanceof Error ? err.message : 'Invalid webhook lifecycle URL');
+          return null;
+        }
+      }
       setRepoYamlError(null);
       return validated;
     } catch (err) {
@@ -389,6 +412,23 @@ export const EnvironmentTab: React.FC<EnvironmentTabProps> = ({
     if (!obj.stop || typeof obj.stop !== 'string') {
       setSnapshotYamlError('`stop` is required and must be a string');
       return null;
+    }
+    if (isWebhookMode) {
+      try {
+        validateManagedEnvLifecyclePolicy(
+          {
+            start: obj.start,
+            stop: obj.stop,
+            nuke: obj.nuke,
+            logs: obj.logs,
+          },
+          managedEnvsExecutionMode,
+          'branch environment'
+        );
+      } catch (err) {
+        setSnapshotYamlError(err instanceof Error ? err.message : 'Invalid webhook lifecycle URL');
+        return null;
+      }
     }
     setSnapshotYamlError(null);
     return obj;
@@ -794,6 +834,13 @@ export const EnvironmentTab: React.FC<EnvironmentTabProps> = ({
           }
         >
           <Space orientation="vertical" size="small" style={{ width: '100%' }}>
+            <Alert
+              type="info"
+              showIcon
+              message={isWebhookMode ? 'Webhook-managed environments' : 'Managed environments'}
+              description={lifecycleFieldHelp}
+              style={{ fontSize: 12 }}
+            />
             <Typography.Text type="secondary" style={{ fontSize: 11 }}>
               YAML representation of <code>repo.environment</code>. Includes <code>version</code>,{' '}
               <code>default</code>, <code>variants</code>, and optional{' '}
@@ -806,11 +853,7 @@ export const EnvironmentTab: React.FC<EnvironmentTabProps> = ({
                 if (repoYamlError) setRepoYamlError(null);
               }}
               language="yaml"
-              placeholder={
-                noVariantsConfigured && isAdmin
-                  ? 'version: 2\ndefault: lean\nvariants:\n  lean:\n    start: docker compose up -d\n    stop: docker compose down\n'
-                  : ''
-              }
+              placeholder={noVariantsConfigured && isAdmin ? repoPlaceholder : ''}
               readOnly={!isEditingRepo}
               rows={10}
               maxHeight="480px"
@@ -916,7 +959,8 @@ export const EnvironmentTab: React.FC<EnvironmentTabProps> = ({
             <Typography.Text type="secondary" style={{ fontSize: 11 }}>
               Rendered snapshot persisted on this branch (fields: <code>start</code>,{' '}
               <code>stop</code>, <code>nuke</code>, <code>logs</code>, <code>health</code>,{' '}
-              <code>app</code>). Click Render above to regenerate from the variant.
+              <code>app</code>). {lifecycleFieldHelp} Click Render above to regenerate from the
+              variant.
             </Typography.Text>
             <CodeEditor
               value={snapshotYamlText}

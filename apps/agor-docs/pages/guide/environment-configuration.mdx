@@ -127,6 +127,11 @@ environment:
       app:    "<url template>"             # optional
 ```
 
+`start`, `stop`, `nuke`, and `logs` are rendered lifecycle fields. In the
+default `hybrid` mode they can be shell commands or explicit `http://` /
+`https://` webhooks. Webhooks are invoked with HTTP GET. `health` and `app` are
+always URL templates, not shell commands.
+
 ### Required fields
 
 - `version: 2` at the top level.
@@ -350,6 +355,52 @@ Restating the callout from above because it's the single most common mistake:
 - Values get **baked into shell strings** at render time — anyone who can read the branch snapshot sees them.
 - Use it for IPs, hostnames, registries, profile names. **Not** for API keys, tokens, or passwords.
 - For secrets, use the per-session env-var system. Scope is per-session, access is limited to the session owner, and values never land in a rendered command.
+
+### 3. Managed environment execution mode {/* #webhook-only-mode */}
+
+Agor instances choose how lifecycle fields are handled. The default is
+`hybrid`:
+
+```yaml
+# ~/.agor/config.yaml
+execution:
+  managed_envs_execution_mode: hybrid
+```
+
+In `hybrid` mode, lifecycle fields can be shell commands or explicit
+`http://` / `https://` webhooks. URL-shaped fields use webhook execution, so a
+repo can use webhooks for one action and commands for another.
+
+Some instances are configured for webhook-managed environments:
+
+```yaml
+# ~/.agor/config.yaml
+execution:
+  managed_envs_execution_mode: webhook-only
+```
+
+In `webhook-only` mode, rendered `start`, `stop`, `nuke`, and `logs` fields
+must render to explicit `http://` or `https://` URLs. Agor sends a GET request
+to the URL.
+
+```yaml
+environment:
+  default: remote
+  variants:
+    remote:
+      start: "https://orchestrator.example.com/agor/start?branch={{branch.name}}"
+      stop:  "https://orchestrator.example.com/agor/stop?branch={{branch.name}}"
+      logs:  "https://orchestrator.example.com/agor/logs?branch={{branch.name}}"
+      health: "https://apps.example.com/{{branch.name}}/health"
+      app:    "https://apps.example.com/{{branch.name}}"
+```
+
+V1 webhooks are intentionally simple: GET only, no custom headers, no request
+body, no signing, and redirects are not followed. V1 webhook targets must be
+public HTTP(S) destinations; localhost, private/link-local ranges, and URL
+credentials are rejected. Use a trusted orchestration service, and avoid secrets
+in query strings because rendered branch snapshots and infrastructure logs may
+expose them.
 
 ---
 

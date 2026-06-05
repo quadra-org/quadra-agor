@@ -2,9 +2,13 @@
  * Agor Configuration Types
  */
 
+import type { ManagedEnvExecutionMode } from '../environment/webhook';
 import type { BranchPermissionLevel } from '../types/branch';
 import type { DaemonResourcesConfig } from '../types/config-resources';
 import type { UserRole } from '../types/user';
+
+export type { ManagedEnvExecutionMode };
+export type ManagedEnvsExecutionMode = ManagedEnvExecutionMode;
 
 /**
  * Minimum role allowed to trigger managed environment commands
@@ -519,6 +523,23 @@ export interface AgorExecutionSettings {
    * of this flag when `branch_rbac: true`.
    */
   managed_envs_minimum_role?: ManagedEnvsMinimumRole;
+
+  /**
+   * Managed environment lifecycle execution policy.
+   *
+   * - `'hybrid'` — default/backwards-compatible mode. Rendered lifecycle
+   *   fields run as shell commands, except fields that are explicit `http://`
+   *   or `https://` URLs are invoked as GET webhooks.
+   * - `'webhook-only'` — lockdown mode for deployments that must not let
+   *   `.agor.yml` run arbitrary shell/Docker/Kubernetes commands through Agor.
+   *   `start`, `stop`, `nuke`, and `logs` must render to HTTP(S) URLs.
+   *
+   * Server policy wins over repo-authored `.agor.yml`: a repo cannot opt out
+   * of webhook-only mode.
+   *
+   * Default: `'hybrid'`.
+   */
+  managed_envs_execution_mode?: ManagedEnvsExecutionMode;
 
   /**
    * Branch storage configuration — operator gate for which storage modes a
