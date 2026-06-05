@@ -38,8 +38,9 @@ import {
   Typography,
   theme,
 } from 'antd';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { DEFAULT_AUDIO_PREFERENCES } from '../../utils/audio';
+import { searchableSelectProps, toGroupSelectOption } from '../../utils/selectSearch';
 import {
   AgenticToolConfigForm,
   buildConfigFromFormValues,
@@ -109,6 +110,11 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
   const [userGroupIds, setUserGroupIds] = useState<string[]>([]);
   const [loadingGroups, setLoadingGroups] = useState(false);
   const [groupsLoaded, setGroupsLoaded] = useState(false);
+  const groupSelectOptions = useMemo(
+    () =>
+      [...availableGroups].sort((a, b) => a.name.localeCompare(b.name)).map(toGroupSelectOption),
+    [availableGroups]
+  );
 
   // Saving state for agentic tool tabs
   const [savingAgenticConfig, setSavingAgenticConfig] = useState<Record<AgenticToolName, boolean>>({
@@ -698,9 +704,8 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
                   loading={loadingGroups}
                   disabled={!groupsLoaded && !loadingGroups}
                   placeholder="Select groups..."
-                  options={[...availableGroups]
-                    .sort((a, b) => a.name.localeCompare(b.name))
-                    .map((group) => ({ value: group.group_id, label: group.name }))}
+                  options={groupSelectOptions}
+                  {...searchableSelectProps}
                 />
               </Form.Item>
             )}
@@ -764,9 +769,8 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
                   loading={loadingGroups}
                   disabled={!groupsLoaded && !loadingGroups}
                   placeholder="Select groups..."
-                  options={[...availableGroups]
-                    .sort((a, b) => a.name.localeCompare(b.name))
-                    .map((group) => ({ value: group.group_id, label: group.name }))}
+                  options={groupSelectOptions}
+                  {...searchableSelectProps}
                 />
               </Form.Item>
             </Form>

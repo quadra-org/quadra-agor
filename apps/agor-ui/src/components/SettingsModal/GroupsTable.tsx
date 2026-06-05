@@ -16,6 +16,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { mapToSortedArray } from '@/utils/mapHelpers';
 import { slugify } from '@/utils/repoSlug';
+import { searchableSelectProps, toUserSelectOption } from '@/utils/selectSearch';
 import { useThemedMessage } from '../../utils/message';
 import { syncGroupMembersForGroup } from './groupMembershipSync';
 
@@ -153,10 +154,7 @@ export const GroupsTable: React.FC<GroupsTableProps> = ({ client, currentUser, u
   }
 
   const userOptions = mapToSortedArray(userById, (a, b) => a.email.localeCompare(b.email)).map(
-    (u) => ({
-      value: u.user_id,
-      label: u.email,
-    })
+    toUserSelectOption
   );
   return (
     <div>
@@ -193,6 +191,7 @@ export const GroupsTable: React.FC<GroupsTableProps> = ({ client, currentUser, u
                 style={{ minWidth: 320 }}
                 value={membershipsByGroup.get(group.group_id) || []}
                 options={userOptions}
+                {...searchableSelectProps}
                 onChange={(ids) => setGroupMembers(group, ids)}
               />
             ),
@@ -260,6 +259,7 @@ export const GroupsTable: React.FC<GroupsTableProps> = ({ client, currentUser, u
               style={{ width: '100%' }}
               value={editingMemberIds}
               options={userOptions}
+              {...searchableSelectProps}
               onChange={setEditingMemberIds}
               placeholder="Select users..."
             />
