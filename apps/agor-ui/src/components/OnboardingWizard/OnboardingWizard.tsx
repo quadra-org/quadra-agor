@@ -1,9 +1,8 @@
 /**
  * OnboardingWizard - Multi-step wizard for new user onboarding
  *
- * Two paths:
+ * Assistant-first path:
  * - Assistant: identity -> API keys -> clone assistant framework repo -> create board -> create branch/session
- * - Own Repo: API keys -> add repo -> create board -> create branch/session
  *
  * Replaces GettingStartedPopover entirely.
  */
@@ -28,18 +27,19 @@ import {
   TOOL_API_KEY_NAMES,
 } from '@agor-live/client';
 import {
+  ApiOutlined,
+  ArrowRightOutlined,
+  BranchesOutlined,
   CheckCircleOutlined,
-  CloudDownloadOutlined,
-  ExperimentOutlined,
   FolderOpenOutlined,
   KeyOutlined,
   RobotOutlined,
-  ThunderboltOutlined,
 } from '@ant-design/icons';
 import {
   Alert,
   Button,
   Card,
+  Checkbox,
   Form,
   Input,
   Modal,
@@ -48,7 +48,6 @@ import {
   Select,
   Space,
   Spin,
-  Steps,
   Tag,
   Typography,
   theme,
@@ -65,6 +64,7 @@ import { extractSlugFromPath, slugify } from '../../utils/repoSlug';
 import { startAssistantBootstrapSession } from '../../utils/startAssistantBootstrapSession';
 import { EmojiPickerInput } from '../EmojiPickerInput/EmojiPickerInput';
 import type { NewSessionConfig } from '../NewSessionModal/NewSessionModal';
+import { ToolIcon } from '../ToolIcon';
 
 const { Text, Title, Paragraph } = Typography;
 const { useToken } = theme;
@@ -239,6 +239,34 @@ function findMatchingRepoId(
   return null;
 }
 
+const RECOMMENDED_AGENT_OPTIONS: Array<{
+  value: AgenticToolName;
+  title: string;
+  eyebrow: string;
+}> = [
+  {
+    value: 'claude-code',
+    title: 'Claude Code',
+    eyebrow: 'Recommended',
+  },
+  {
+    value: 'codex',
+    title: 'Codex',
+    eyebrow: 'Recommended',
+  },
+];
+
+const OTHER_AGENT_OPTIONS: Array<{ value: AgenticToolName; label: string }> = [
+  { value: 'gemini', label: 'Gemini' },
+  { value: 'copilot', label: 'GitHub Copilot' },
+  { value: 'opencode', label: 'OpenCode' },
+  { value: 'cursor', label: 'Cursor SDK (Beta)' },
+];
+
+const RECOMMENDED_AGENT_VALUES = new Set<AgenticToolName>(
+  RECOMMENDED_AGENT_OPTIONS.map((option) => option.value)
+);
+
 const AGENT_KEY_CONSOLES: Record<AgenticToolName, { label: string; url: string } | null> = {
   'claude-code': { label: 'console.anthropic.com', url: 'https://console.anthropic.com/' },
   // Claude Code CLI uses the same Anthropic credentials.
@@ -304,6 +332,8 @@ export function OnboardingWizard({
   const [assistantEmoji, setAssistantEmoji] = useState('🤖');
   const [apiKey, setApiKey] = useState('');
   const [selectedAgent, setSelectedAgent] = useState<AgenticToolName>('claude-code');
+  const [lastRecommendedAgent, setLastRecommendedAgent] = useState<AgenticToolName>('claude-code');
+  const [useDifferentProvider, setUseDifferentProvider] = useState(false);
   const [testAuthLoading, setTestAuthLoading] = useState(false);
   // Inline feedback from the user clicking "Test Connection" on a typed key.
   // Never flips the panel, never advances, never saves. Wiped on agent
@@ -353,6 +383,7 @@ export function OnboardingWizard({
   const codexFields = user?.agentic_tools?.codex;
   const geminiFields = user?.agentic_tools?.gemini;
   const copilotFields = user?.agentic_tools?.copilot;
+  const cursorFields = user?.agentic_tools?.cursor;
   const hasAnthropicKey = !!(
     claudeFields?.ANTHROPIC_API_KEY ||
     claudeFields?.CLAUDE_CODE_OAUTH_TOKEN ||
@@ -363,6 +394,7 @@ export function OnboardingWizard({
   const hasCopilotToken = !!(
     copilotFields?.COPILOT_GITHUB_TOKEN || user?.env_vars?.COPILOT_GITHUB_TOKEN
   );
+  const hasCursorKey = !!(cursorFields?.CURSOR_API_KEY || user?.env_vars?.CURSOR_API_KEY);
 
   const hasKeyForAgent = (agent: AgenticToolName): boolean => {
     switch (agent) {
@@ -374,12 +406,33 @@ export function OnboardingWizard({
         return hasGeminiKey;
       case 'copilot':
         return hasCopilotToken;
+      case 'cursor':
+        return hasCursorKey;
       case 'opencode':
         return hasAnthropicKey || hasOpenAIKey || hasGeminiKey;
       default:
         return false;
     }
   };
+
+  const resetProviderAuthState = useCallback(() => {
+    setApiKey('');
+    setError(null);
+    setManualTestResult(null);
+    setOverrideDetectedAuth(false);
+  }, []);
+
+  const selectAgent = useCallback(
+    (agent: AgenticToolName, options: { useDifferentProvider?: boolean } = {}) => {
+      setSelectedAgent(agent);
+      if (RECOMMENDED_AGENT_VALUES.has(agent)) {
+        setLastRecommendedAgent(agent);
+      }
+      setUseDifferentProvider(options.useDifferentProvider ?? !RECOMMENDED_AGENT_VALUES.has(agent));
+      resetProviderAuthState();
+    },
+    [resetProviderAuthState]
+  );
 
   // ─── Resume from prior onboarding state ──────────
   //
@@ -410,6 +463,12 @@ export function OnboardingWizard({
       return;
     }
 
+    // Only the assistant path remains an active onboarding route. Legacy saved
+    // non-assistant path preferences are allowed to keep their data shape, but
+    // they resume at the assistant flow instead of exposing the old path.
+    const savedPath = onboarding.path === 'persisted-agent' ? 'assistant' : onboarding.path;
+    const canResumeAssistantResources = savedPath === 'assistant';
+
     // Resource-ownership validation. The resume-step decisions below jump the
     // wizard past the api-keys / board / repo creation steps based on IDs
     // stored in user.preferences. If those IDs ever point at resources NOT
@@ -421,11 +480,15 @@ export function OnboardingWizard({
     // check is treated as if the preference were unset; the fallback chain
     // then routes the user to the right step (typically api-keys).
     const validBranchId =
-      onboarding.branchId && branchById.get(onboarding.branchId)?.created_by === user.user_id
+      canResumeAssistantResources &&
+      onboarding.branchId &&
+      branchById.get(onboarding.branchId)?.created_by === user.user_id
         ? onboarding.branchId
         : undefined;
     const validBoardId =
-      mainBoardId && boardById.get(mainBoardId)?.created_by === user.user_id
+      canResumeAssistantResources &&
+      mainBoardId &&
+      boardById.get(mainBoardId)?.created_by === user.user_id
         ? mainBoardId
         : undefined;
     // Repos are SHARED resources (no created_by attribution). We require a
@@ -435,7 +498,9 @@ export function OnboardingWizard({
     // as that would let a new user inherit any framework repo cloned by a
     // prior user and skip the clone step.
     const validRepoId =
-      onboarding.repoId && repoById.has(onboarding.repoId) ? onboarding.repoId : undefined;
+      canResumeAssistantResources && onboarding.repoId && repoById.has(onboarding.repoId)
+        ? onboarding.repoId
+        : undefined;
 
     if (
       onboarding.branchId !== validBranchId ||
@@ -449,9 +514,9 @@ export function OnboardingWizard({
       });
     }
 
-    // Map legacy 'persisted-agent' to 'assistant'
-    const resumedPath: WizardPath =
-      onboarding.path === 'persisted-agent' ? 'assistant' : (onboarding.path as WizardPath);
+    // Map every saved onboarding path to the assistant flow. 'persisted-agent'
+    // is the old assistant path name; 'own-repo' is no longer an onboarding path.
+    const resumedPath: WizardPath = 'assistant';
     setPath(resumedPath);
 
     if (resumedPath === 'assistant') {
@@ -1146,118 +1211,64 @@ export function OnboardingWizard({
     }
   }, [stepIndex, steps, setCurrentStep]);
 
-  // Dev-only: reset the wizard back to the welcome screen so the flows can be
-  // re-tested without DB surgery. Clears persisted onboarding state but leaves
-  // any repos / boards / branches the user already created intact — those
-  // are easy to clean up manually if needed.
-  const handleReset = useCallback(async () => {
-    if (cloneTimeoutRef.current) {
-      clearTimeout(cloneTimeoutRef.current);
-      cloneTimeoutRef.current = null;
-    }
-    if (cloneIntervalRef.current) {
-      clearInterval(cloneIntervalRef.current);
-      cloneIntervalRef.current = null;
-    }
-    setPath(null);
-    setCurrentStep('welcome');
-    setError(null);
-    setLoading(false);
-    setRepoUrl('');
-    setRepoSlug('');
-    setLocalRepoPath('');
-    setRepoMode('remote');
-    setBranchName('');
-    setAssistantDisplayName('My Assistant');
-    setAssistantEmoji('🤖');
-    setApiKey('');
-    setSelectedAgent('claude-code');
-    setTestAuthLoading(false);
-    setManualTestResult(null);
-    setOverrideDetectedAuth(false);
-    setCreatedRepoId(null);
-    setCreatedBoardId(null);
-    setCreatedBranchId(null);
-    setCloneElapsedSeconds(0);
-    // Do not allow the resume effect to re-run against the still-stale
-    // user.preferences snapshot before the PATCH clearing onboarding state
-    // comes back over the socket. Otherwise Reset(dev) can appear to need
-    // two clicks: first local reset, then stale prefs immediately resume it.
-    resumedRef.current = true;
-    branchNameInitRef.current = false;
-    knownFailedRepoIdsRef.current = new Set();
-
-    if (user) {
-      const prefs = { ...(user.preferences || {}) } as Record<string, unknown>;
-      delete prefs.onboarding;
-      delete prefs.mainBoardId;
-      await onUpdateUser(user.user_id, { preferences: prefs as UserPreferences });
-    }
-  }, [user, onUpdateUser, setCurrentStep]);
-
   // ─── Render Helpers ───────────────────────────────
 
   const renderWelcome = () => (
     <div style={{ padding: '8px 0' }}>
-      <Title level={3} style={{ marginBottom: 6 }}>
-        Welcome to Agor
+      <Title level={3} style={{ marginBottom: 8 }}>
+        Welcome to Agor ✨
       </Title>
-      <Paragraph type="secondary" style={{ marginBottom: 24, fontSize: 15 }}>
-        Let's get you set up with your first AI session.
+      <Paragraph style={{ marginBottom: 14, fontSize: 15 }}>
+        Start by creating your{' '}
+        <Typography.Link
+          strong
+          href="https://agor.live/guide/assistants"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          Agor assistant
+        </Typography.Link>
+        : a persistent agent that can help you set up the workspace and keep things moving.
       </Paragraph>
 
-      <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-        <Card
-          hoverable
-          onClick={() => handleSelectPath('assistant')}
-          style={{ cursor: 'pointer', borderColor: token.colorPrimary }}
-        >
-          <Space align="start" size="middle">
-            <ThunderboltOutlined
-              style={{ fontSize: 24, color: token.colorPrimary, marginTop: 2, flexShrink: 0 }}
-            />
-            <div>
-              <Space style={{ marginBottom: 6 }} align="center">
-                <Text strong style={{ fontSize: 15 }}>
-                  Set up your AI assistant
-                </Text>
-                <Tag color="blue">Recommended</Tag>
-              </Space>
-              <Paragraph type="secondary" style={{ marginBottom: 6 }}>
-                Get a persistent AI assistant with memory, task management, and pre-configured
-                workflows.
-              </Paragraph>
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                Identity → API key → Clone assistant framework → Board → Branch/session
-              </Text>
-            </div>
-          </Space>
-        </Card>
+      <div
+        style={{
+          background: token.colorPrimaryBg,
+          border: `1px solid ${token.colorPrimaryBorder}`,
+          borderRadius: 8,
+          padding: '14px 16px',
+          marginBottom: 16,
+        }}
+      >
+        <Text strong>Your assistant can help:</Text>
+        <ul style={{ margin: '10px 0 0', paddingLeft: 20, color: token.colorTextSecondary }}>
+          <li>🧰 Connect tools and credentials</li>
+          <li>🗺️ Set up your board and workflow</li>
+          <li>🤝 Coordinate other agents and sessions</li>
+          <li>💬 Show you around and answer questions</li>
+        </ul>
+      </div>
 
-        <Card hoverable onClick={() => handleSelectPath('own-repo')} style={{ cursor: 'pointer' }}>
-          <Space align="start" size="middle">
-            <FolderOpenOutlined
-              style={{
-                fontSize: 24,
-                color: token.colorTextSecondary,
-                marginTop: 2,
-                flexShrink: 0,
-              }}
-            />
-            <div>
-              <Text strong style={{ fontSize: 15 }}>
-                Bring your own repository
-              </Text>
-              <Paragraph type="secondary" style={{ marginBottom: 6, marginTop: 4 }}>
-                Connect an existing Git repository and start coding with AI agents.
-              </Paragraph>
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                API key → Add repository → Board → Branch/session
-              </Text>
-            </div>
-          </Space>
-        </Card>
-      </Space>
+      <Paragraph type="secondary" style={{ marginBottom: 24, fontSize: 14 }}>
+        Want the bigger picture first? Read the{' '}
+        <Typography.Link
+          href="https://agor.live/guide/getting-started"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          getting started guide
+        </Typography.Link>
+        .
+      </Paragraph>
+
+      <Button
+        type="primary"
+        size="large"
+        icon={<RobotOutlined />}
+        onClick={() => handleSelectPath('assistant')}
+      >
+        Create your assistant
+      </Button>
     </div>
   );
 
@@ -1461,15 +1472,7 @@ export function OnboardingWizard({
 
   const renderBoard = () => (
     <div style={{ textAlign: 'center', padding: '32px 0' }}>
-      <Title level={4}>Create Your Personal Board</Title>
-      <Paragraph type="secondary">
-        Boards are spatial canvases where you organize branches, sessions, and AI agents. We'll
-        create a personal board for you.
-      </Paragraph>
-
-      {loading ? (
-        <Spin size="large" />
-      ) : error ? (
+      {error ? (
         <>
           <Alert
             type="error"
@@ -1481,25 +1484,18 @@ export function OnboardingWizard({
             Retry
           </Button>
         </>
-      ) : createdBoardId ? (
-        <>
-          <Result
-            icon={<CheckCircleOutlined style={{ color: token.colorSuccess }} />}
-            title="Board Created"
-          />
-          <Button type="primary" onClick={() => setCurrentStep('branch')}>
-            Continue
-          </Button>
-        </>
       ) : (
-        <Button
-          type="primary"
-          size="large"
-          icon={<ExperimentOutlined />}
-          onClick={handleCreateBoard}
-        >
-          Create Board
-        </Button>
+        <>
+          <Spin size="large" />
+          <Title level={4} style={{ marginTop: 16 }}>
+            {path === 'assistant' ? "Setting up your assistant's board" : 'Creating your board'}
+          </Title>
+          <Paragraph type="secondary" style={{ marginBottom: 0 }}>
+            {path === 'assistant'
+              ? 'Agor is creating a board where your assistant can organize its work.'
+              : 'Agor is creating a personal board for your work.'}
+          </Paragraph>
+        </>
       )}
     </div>
   );
@@ -1513,8 +1509,12 @@ export function OnboardingWizard({
         <div style={{ textAlign: 'center', padding: '24px 0' }}>
           <Result
             icon={<CheckCircleOutlined style={{ color: token.colorSuccess }} />}
-            title="Branch Created"
-            subTitle="The branch is ready. Create the first session to finish onboarding."
+            title={path === 'assistant' ? 'Assistant Branch Ready' : 'Branch Created'}
+            subTitle={
+              path === 'assistant'
+                ? 'Start your assistant to finish onboarding.'
+                : 'The branch is ready. Create the first session to finish onboarding.'
+            }
           />
           {error && (
             <Alert
@@ -1530,7 +1530,7 @@ export function OnboardingWizard({
             onClick={() => launchSessionForBranch(createdBranchId, createdBoardId)}
             loading={loading}
           >
-            Create First Session
+            {path === 'assistant' ? 'Start Assistant' : 'Create First Session'}
           </Button>
         </div>
       );
@@ -1538,22 +1538,25 @@ export function OnboardingWizard({
 
     return (
       <div style={{ padding: '16px 0' }}>
-        <Title level={4}>Create Your Branch</Title>
+        <Title level={4}>
+          {path === 'assistant' ? 'Name Your Assistant Branch' : 'Create Your Branch'}
+        </Title>
         <Paragraph type="secondary">
-          A branch is an isolated workspace backed by its own git branch.
           {path === 'assistant'
-            ? " We'll set up a branch for your assistant and create its first session."
-            : ' Name it whatever you like. We’ll create the first session after the branch is ready.'}
+            ? 'Your assistant works from its own branch: a safe place to use tools and keep setup context.'
+            : 'A branch is an isolated workspace backed by its own git branch. Name it whatever you like. We’ll create the first session after the branch is ready.'}
         </Paragraph>
 
         <Form layout="vertical">
           <Form.Item
             label="Branch name"
             extra={
-              <>
-                Used as both the directory name and the new branch name. Forked from{' '}
-                <Text code>{sourceBranch}</Text>.
-              </>
+              path === 'assistant' ? undefined : (
+                <>
+                  Used as both the directory name and the new branch name. Forked from{' '}
+                  <Text code>{sourceBranch}</Text>.
+                </>
+              )
             }
           >
             <Input
@@ -1572,7 +1575,9 @@ export function OnboardingWizard({
           loading={loading}
           disabled={!branchName.trim()}
         >
-          Create Branch & First Session
+          {path === 'assistant'
+            ? 'Create Branch & Start Assistant'
+            : 'Create Branch & First Session'}
         </Button>
       </div>
     );
@@ -1601,8 +1606,8 @@ export function OnboardingWizard({
         // Bash/MCP). Users can flip to bypass per-session in Session Settings.
         return (
           <Paragraph type="secondary" style={{ marginBottom: 16 }}>
-            Paste an <Text code>ANTHROPIC_API_KEY</Text>, run <Text code>claude auth login</Text>,
-            or set up a Pro/Max token in <Text strong>User Settings → Claude Code</Text>.
+            Paste an <Text code>ANTHROPIC_API_KEY</Text>, or run <Text code>claude auth login</Text>{' '}
+            on the host.
           </Paragraph>
         );
       }
@@ -1643,31 +1648,91 @@ export function OnboardingWizard({
 
     return (
       <div style={{ padding: '16px 0' }}>
-        <Title level={4}>Configure Your Agent</Title>
+        <Title level={4}>Choose an LLM Provider</Title>
+        <Paragraph type="secondary" style={{ marginBottom: 16 }}>
+          Pick what powers your assistant. You can change this later.
+        </Paragraph>
 
-        <Form layout="vertical">
-          <Form.Item label="Agent">
-            <Select
-              value={selectedAgent}
-              onChange={(value) => {
-                setSelectedAgent(value);
-                setApiKey('');
-                setError(null);
-                setManualTestResult(null);
-                setOverrideDetectedAuth(false);
-              }}
-              options={[
-                { value: 'claude-code', label: 'Claude Code (Recommended)' },
-                { value: 'codex', label: 'Codex (OpenAI)' },
-                { value: 'gemini', label: 'Gemini' },
-                { value: 'copilot', label: 'GitHub Copilot' },
-                { value: 'opencode', label: 'OpenCode' },
-                { value: 'cursor', label: 'Cursor SDK (Beta)' },
-              ]}
-              style={{ width: '100%' }}
-            />
-          </Form.Item>
-        </Form>
+        <Space direction="vertical" size="middle" style={{ width: '100%', marginBottom: 16 }}>
+          <div
+            role="radiogroup"
+            aria-label="Recommended LLM providers"
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+              gap: 12,
+            }}
+          >
+            {RECOMMENDED_AGENT_OPTIONS.map((option) => {
+              const selected = selectedAgent === option.value;
+              return (
+                <Card
+                  key={option.value}
+                  size="small"
+                  style={{
+                    borderColor: selected ? token.colorPrimary : token.colorBorder,
+                    background: selected ? token.colorPrimaryBg : undefined,
+                  }}
+                  styles={{ body: { padding: 0 } }}
+                >
+                  <label
+                    style={{
+                      display: 'block',
+                      width: '100%',
+                      cursor: 'pointer',
+                      padding: 14,
+                    }}
+                  >
+                    <Space align="center" size={10} style={{ width: '100%' }}>
+                      <ToolIcon tool={option.value} size={32} />
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div>
+                          <Text strong>{option.title}</Text>
+                        </div>
+                        <div>
+                          <Tag color={selected ? 'blue' : 'default'}>{option.eyebrow}</Tag>
+                        </div>
+                      </div>
+                      <input
+                        type="radio"
+                        name="recommended-agent"
+                        value={option.value}
+                        checked={selected}
+                        onChange={() => selectAgent(option.value, { useDifferentProvider: false })}
+                        style={{ accentColor: token.colorPrimary }}
+                      />
+                    </Space>
+                  </label>
+                </Card>
+              );
+            })}
+          </div>
+
+          <Checkbox
+            checked={useDifferentProvider}
+            onChange={(event) => {
+              const checked = event.target.checked;
+              selectAgent(checked ? OTHER_AGENT_OPTIONS[0].value : lastRecommendedAgent, {
+                useDifferentProvider: checked,
+              });
+            }}
+          >
+            Use a different provider
+          </Checkbox>
+
+          {useDifferentProvider && (
+            <Form layout="vertical">
+              <Form.Item label="Other LLM providers" style={{ marginBottom: 0 }}>
+                <Select
+                  value={RECOMMENDED_AGENT_VALUES.has(selectedAgent) ? undefined : selectedAgent}
+                  onChange={(value) => selectAgent(value, { useDifferentProvider: true })}
+                  options={OTHER_AGENT_OPTIONS}
+                  style={{ width: '100%' }}
+                />
+              </Form.Item>
+            </Form>
+          )}
+        </Space>
 
         {isAuthenticated && !overrideDetectedAuth ? (
           <div style={{ textAlign: 'center', padding: '8px 0' }}>
@@ -1795,59 +1860,109 @@ export function OnboardingWizard({
     }
   };
 
-  // ─── Steps display config ────────────────────────
+  // ─── Progress display config ─────────────────────
 
-  const stepsItems = useMemo(() => {
-    if (!path) return [];
+  const progressItems = useMemo(() => {
+    if (path === 'assistant') {
+      return [
+        { key: 'identity' as const, title: 'Assistant', icon: <RobotOutlined /> },
+        { key: 'api-keys' as const, title: 'LLM Provider', icon: <ApiOutlined /> },
+        { key: 'branch' as const, title: 'Workspace', icon: <BranchesOutlined /> },
+      ];
+    }
 
-    const allSteps = getStepsForPath(path);
-    // Don't include 'welcome' in the steps indicator. For own-repo, also hide
-    // 'clone' since it's visually merged with 'add-repo' (both labelled "Repo").
-    // For assistant there's no 'add-repo' step, so keep 'clone' visible —
-    // otherwise the indicator jumps straight to "Board" while the framework
-    // is still cloning.
-    const displaySteps = allSteps.filter(
-      (s) => s !== 'welcome' && !(path === 'own-repo' && s === 'clone')
-    );
+    if (path === 'own-repo') {
+      return [
+        { key: 'api-keys' as const, title: 'LLM Provider', icon: <ApiOutlined /> },
+        { key: 'add-repo' as const, title: 'Repo', icon: <FolderOpenOutlined /> },
+        { key: 'branch' as const, title: 'Workspace', icon: <BranchesOutlined /> },
+      ];
+    }
 
-    const labelMap: Record<WizardStep, string> = {
-      welcome: 'Welcome',
-      identity: 'Identity',
-      'add-repo': 'Repo',
-      clone: path === 'own-repo' ? 'Repo' : 'Clone',
-      board: 'Board',
-      branch: 'Branch',
-      'api-keys': 'Keys',
-    };
-
-    const iconMap: Record<WizardStep, React.ReactNode> = {
-      welcome: null,
-      identity: <RobotOutlined />,
-      'add-repo': <FolderOpenOutlined />,
-      clone: <CloudDownloadOutlined />,
-      board: <ExperimentOutlined />,
-      branch: <FolderOpenOutlined />,
-      'api-keys': <KeyOutlined />,
-    };
-
-    return displaySteps.map((step) => ({
-      key: step,
-      title: labelMap[step],
-      icon: iconMap[step],
-    }));
+    return [];
   }, [path]);
 
-  const currentStepDisplay = useMemo(() => {
+  const currentProgressIndex = useMemo(() => {
     if (!path || currentStep === 'welcome') return -1;
-    // Mirror the filter used by stepsItems: hide 'clone' only for own-repo,
-    // where it's merged into 'add-repo'. Assistant keeps its 'clone' step.
-    const displaySteps = getStepsForPath(path).filter(
-      (s) => s !== 'welcome' && !(path === 'own-repo' && s === 'clone')
-    );
-    // For own-repo, map the internal 'clone' state onto the merged 'add-repo' index.
-    const mappedStep = currentStep === 'clone' && path === 'own-repo' ? 'add-repo' : currentStep;
-    return displaySteps.indexOf(mappedStep);
+    if (path === 'assistant') {
+      if (currentStep === 'identity') return 0;
+      if (currentStep === 'api-keys') return 1;
+      return 2;
+    }
+    if (currentStep === 'api-keys') return 0;
+    if (currentStep === 'add-repo' || currentStep === 'clone') return 1;
+    return 2;
   }, [path, currentStep]);
+
+  const renderProgressIndicator = () => {
+    if (!path || currentStep === 'welcome' || progressItems.length === 0) return null;
+
+    return (
+      <ol
+        aria-label="Onboarding progress"
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: 10,
+          marginBottom: 24,
+          padding: 0,
+          listStyle: 'none',
+        }}
+      >
+        {progressItems.map((item, index) => {
+          const isActive = index === currentProgressIndex;
+          const color = isActive ? token.colorPrimary : token.colorTextDisabled;
+          return (
+            <li
+              key={item.key}
+              aria-current={isActive ? 'step' : undefined}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 10,
+                color,
+              }}
+            >
+              <Space direction="vertical" size={4} align="center">
+                <div
+                  style={{
+                    width: 34,
+                    height: 34,
+                    borderRadius: 999,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    color,
+                    background: isActive ? token.colorPrimaryBg : token.colorFillTertiary,
+                    border: `1px solid ${isActive ? token.colorPrimary : token.colorBorder}`,
+                    opacity: isActive ? 1 : 0.55,
+                  }}
+                >
+                  {item.icon}
+                </div>
+                <Text
+                  style={{
+                    color,
+                    fontSize: 12,
+                    fontWeight: isActive ? 600 : undefined,
+                    opacity: isActive ? 1 : 0.65,
+                  }}
+                >
+                  {item.title}
+                </Text>
+              </Space>
+              {index < progressItems.length - 1 && (
+                <ArrowRightOutlined
+                  style={{ color: token.colorTextDisabled, opacity: 0.55, fontSize: 12 }}
+                />
+              )}
+            </li>
+          );
+        })}
+      </ol>
+    );
+  };
 
   // ─── Auto-trigger steps that should auto-start ────
   useEffect(() => {
@@ -1893,26 +2008,8 @@ export function OnboardingWizard({
         </Typography.Link>
       </Space>
 
-      {/* Right: Dev reset + Skip */}
+      {/* Right: Skip */}
       <Space size="small">
-        {import.meta.env.DEV && (
-          <Popconfirm
-            title="Reset wizard?"
-            description={
-              <div style={{ maxWidth: 280 }}>
-                Clears local state and onboarding progress in your user preferences. Repos, boards,
-                and branches you created stay put.
-              </div>
-            }
-            okText="Reset"
-            cancelText="Cancel"
-            onConfirm={handleReset}
-          >
-            <Button type="text" size="small" style={{ color: token.colorTextTertiary }}>
-              Reset (dev)
-            </Button>
-          </Popconfirm>
-        )}
         <Popconfirm
           title="Skip setup?"
           description={
@@ -1954,15 +2051,8 @@ export function OnboardingWizard({
         },
       }}
     >
-      {/* Steps indicator (only when path is chosen) */}
-      {path && currentStep !== 'welcome' && (
-        <Steps
-          current={currentStepDisplay}
-          size="small"
-          items={stepsItems}
-          style={{ marginBottom: 24 }}
-        />
-      )}
+      {/* Progress indicator (only when path is chosen) */}
+      {renderProgressIndicator()}
 
       {/* Step content */}
       {renderStepContent()}
