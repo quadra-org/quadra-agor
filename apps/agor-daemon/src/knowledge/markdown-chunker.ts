@@ -42,7 +42,7 @@ const DEFAULTS: Required<MarkdownChunkerOptions> = {
   minTokens: 80,
   includeHeadingPath: true,
   includeDocumentTitle: true,
-  chunkerVersion: 'agor-markdown-remark-v1',
+  chunkerVersion: 'agor-markdown-remark-v2',
 };
 
 function estimateTokens(text: string): number {
@@ -53,6 +53,50 @@ function estimateTokens(text: string): number {
 
 function md5(text: string): string {
   return createHash('md5').update(text).digest('hex');
+}
+
+export function normalizeKnowledgeChunkForHash(text: string): string {
+  const lines = text.replace(/\r\n?/g, '\n').split('\n');
+  const normalized: string[] = [];
+  let inFence: { marker: '`' | '~'; length: number } | null = null;
+  let pendingBlankLines = 0;
+
+  const flushOutsideBlankLines = () => {
+    if (pendingBlankLines === 0) return;
+    normalized.push(...Array.from({ length: Math.min(pendingBlankLines, 2) }, () => ''));
+    pendingBlankLines = 0;
+  };
+
+  for (const line of lines) {
+    if (inFence) {
+      normalized.push(line);
+      const close = line.match(/^ {0,3}([`~]{3,})\s*$/);
+      if (close?.[1]?.startsWith(inFence.marker) && close[1].length >= inFence.length) {
+        inFence = null;
+      }
+      continue;
+    }
+
+    const trimmedLine = line.replace(/[\t ]+$/g, '');
+    const open = trimmedLine.match(/^ {0,3}([`~]{3,})/);
+    if (open?.[1]) {
+      flushOutsideBlankLines();
+      normalized.push(trimmedLine);
+      inFence = { marker: open[1][0] as '`' | '~', length: open[1].length };
+      continue;
+    }
+
+    if (trimmedLine.length === 0) {
+      pendingBlankLines += 1;
+      continue;
+    }
+
+    flushOutsideBlankLines();
+    normalized.push(trimmedLine);
+  }
+
+  flushOutsideBlankLines();
+  return normalized.join('\n').trim();
 }
 
 function slugify(value: string): string {
@@ -267,7 +311,12 @@ export function chunkMarkdownForKnowledge(
       if (!content) continue;
       rawChunks.push({
         kind: bodies.length > 1 ? 'auto_split' : 'section',
-        path_anchor: section.headingPath.length > 0 ? slugify(section.headingPath.join('-')) : null,
+        path_anchor:
+          section.headingPath.length > 0
+            ? [slugify(section.headingPath.join('-')), bodies.length > 1 ? `part-${index + 1}` : '']
+                .filter(Boolean)
+                .join('-')
+            : null,
         heading_path: section.headingPath.length > 0 ? section.headingPath.join(' > ') : null,
         content_text: content,
         start_offset: section.startOffset,
@@ -275,6 +324,7 @@ export function chunkMarkdownForKnowledge(
         metadata: {
           chunker_version: opts.chunkerVersion,
           estimated_tokens: estimateTokens(content),
+          hash_normalization: 'markdown-fence-aware-v1',
           split_index: index,
           split_count: bodies.length,
         },
@@ -288,6 +338,7 @@ export function chunkMarkdownForKnowledge(
     const prior = merged[merged.length - 1];
     const canMerge =
       prior &&
+      prior.heading_path === chunk.heading_path &&
       estimateTokens(chunk.content_text) < opts.minTokens &&
       estimateTokens(`${prior.content_text}\n\n${chunk.content_text}`) <= opts.maxTokens;
     if (canMerge) {
@@ -297,16 +348,27 @@ export function chunkMarkdownForKnowledge(
         ...prior.metadata,
         merged: true,
         estimated_tokens: estimateTokens(prior.content_text),
+        hash_normalization: 'markdown-fence-aware-v1',
       };
     } else {
       merged.push({ ...chunk });
     }
   }
 
-  return merged.map((chunk, ordinal) => ({
-    ...chunk,
-    ordinal,
-    path_anchor: chunk.path_anchor ? `${chunk.path_anchor}-${ordinal + 1}` : null,
-    content_md5: md5(chunk.content_text),
-  }));
+  const anchorCounts = new Map<string, number>();
+  return merged.map((chunk, ordinal) => {
+    const anchorBase = chunk.path_anchor;
+    const occurrence = anchorBase ? (anchorCounts.get(anchorBase) ?? 0) + 1 : 0;
+    if (anchorBase) anchorCounts.set(anchorBase, occurrence);
+    return {
+      ...chunk,
+      ordinal,
+      path_anchor: anchorBase
+        ? occurrence > 1
+          ? `${anchorBase}-${occurrence}`
+          : anchorBase
+        : null,
+      content_md5: md5(normalizeKnowledgeChunkForHash(chunk.content_text)),
+    };
+  });
 }
