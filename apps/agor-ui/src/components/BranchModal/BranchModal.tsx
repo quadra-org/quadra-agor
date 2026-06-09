@@ -17,6 +17,7 @@ import { AssistantTab } from './tabs/AssistantTab';
 import { EnvironmentTab } from './tabs/EnvironmentTab';
 import { FilesTab } from './tabs/FilesTab';
 import { GeneralTab } from './tabs/GeneralTab';
+import { KnowledgeTab } from './tabs/KnowledgeTab';
 import { PermissionsTab } from './tabs/PermissionsTab';
 import { ScheduleTab } from './tabs/ScheduleTab';
 import { SessionsTab } from './tabs/SessionsTab';
@@ -25,6 +26,7 @@ import { type BranchUpdate, useBranchModalForm } from './useBranchModalForm';
 export type BranchModalTab =
   | 'general'
   | 'assistant'
+  | 'knowledge'
   | 'sessions'
   | 'environment'
   | 'files'
@@ -252,6 +254,19 @@ export const BranchModal: React.FC<BranchModalProps> = ({
         />
       ),
     },
+    // Knowledge is assistant-only and intentionally last for now: it is
+    // configuration-adjacent but less central than the primary branch/session tabs.
+    ...(isAnAssistant
+      ? [
+          {
+            key: 'knowledge',
+            label: 'Knowledge',
+            children: (
+              <KnowledgeTab branch={branch} client={client} canEdit={form.canEditGeneral} />
+            ),
+          },
+        ]
+      : []),
   ];
 
   // Modal-level footer: one Save action for all form-contributing tabs
