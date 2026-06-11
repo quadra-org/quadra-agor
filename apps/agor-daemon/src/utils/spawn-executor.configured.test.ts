@@ -50,6 +50,11 @@ describe('configured executor spawning', () => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
 
+    const unix = await import('@agor/core/unix');
+    vi.mocked(unix.buildSpawnArgs).mockReturnValue({ cmd: 'node', args: ['executor', '--stdin'] });
+    vi.mocked(unix.isSecretEnvKey).mockReturnValue(false);
+    vi.mocked(unix.attachEnvFileCleanup).mockImplementation(() => {});
+
     const { configureExecutor } = await import('./spawn-executor');
     configureExecutor(null);
   });
@@ -73,7 +78,7 @@ describe('configured executor spawning', () => {
         '-c',
         expect.stringMatching(/^kubectl run executor-[0-9a-f]{8} --user agor-exec -- prompt$/),
       ],
-      { stdio: ['pipe', 'pipe', 'pipe'] }
+      expect.objectContaining({ stdio: ['pipe', 'pipe', 'pipe'] })
     );
     expect(JSON.parse(proc.written)).toMatchObject({
       command: 'prompt',
@@ -99,9 +104,11 @@ describe('configured executor spawning', () => {
       }
     );
 
-    expect(spawnMock).toHaveBeenCalledWith('sh', ['-c', 'explicit explicit-user git.clone'], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    expect(spawnMock).toHaveBeenCalledWith(
+      'sh',
+      ['-c', 'explicit explicit-user git.clone'],
+      expect.objectContaining({ stdio: ['pipe', 'pipe', 'pipe'] })
+    );
   });
 
   it('calls onExit for templated spawns', async () => {
@@ -134,8 +141,85 @@ describe('configured executor spawning', () => {
 
     injectedSpawner({ command: 'prompt' });
 
-    expect(spawnMock).toHaveBeenCalledWith('sh', ['-c', 'injected injected-user prompt'], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    expect(spawnMock).toHaveBeenCalledWith(
+      'sh',
+      ['-c', 'injected injected-user prompt'],
+      expect.objectContaining({ stdio: ['pipe', 'pipe', 'pipe'] })
+    );
+  });
+
+  it('passes LOG_LEVEL to templated executor processes and exposes a template variable', async () => {
+    const proc = createMockProcess();
+    spawnMock.mockReturnValue(proc);
+    const { spawnExecutor } = await import('./spawn-executor');
+
+    spawnExecutor(
+      { command: 'prompt' },
+      {
+        executorCommandTemplate: 'run --log-level={log_level} -- {command}',
+        env: { LOG_LEVEL: 'warn' },
+      }
+    );
+
+    expect(spawnMock).toHaveBeenCalledWith(
+      'sh',
+      ['-c', 'run --log-level=warn -- prompt'],
+      expect.objectContaining({
+        env: expect.objectContaining({ LOG_LEVEL: 'warn' }),
+      })
+    );
+  });
+
+  it('propagates an explicit LOG_LEVEL to local executor processes at startup', async () => {
+    const proc = createMockProcess();
+    spawnMock.mockReturnValue(proc);
+    const { spawnExecutor } = await import('./spawn-executor');
+
+    spawnExecutor(
+      { command: 'prompt' },
+      {
+        env: { PATH: '/usr/bin', LOG_LEVEL: 'warn' },
+      }
+    );
+
+    expect(spawnMock).toHaveBeenCalledWith(
+      'node',
+      ['executor', '--stdin'],
+      expect.objectContaining({
+        env: expect.objectContaining({
+          DAEMON_URL: expect.any(String),
+          LOG_LEVEL: 'warn',
+        }),
+      })
+    );
+  });
+
+  it('derives LOG_LEVEL for executor processes when only NODE_ENV is set', async () => {
+    const proc = createMockProcess();
+    spawnMock.mockReturnValue(proc);
+    const previousNodeEnv = process.env.NODE_ENV;
+    const previousLogLevel = process.env.LOG_LEVEL;
+    process.env.NODE_ENV = 'production';
+    delete process.env.LOG_LEVEL;
+
+    try {
+      const { spawnExecutor } = await import('./spawn-executor');
+      spawnExecutor({ command: 'prompt' }, { env: { PATH: '/usr/bin' } });
+    } finally {
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousNodeEnv;
+      if (previousLogLevel === undefined) delete process.env.LOG_LEVEL;
+      else process.env.LOG_LEVEL = previousLogLevel;
+    }
+
+    expect(spawnMock).toHaveBeenCalledWith(
+      'node',
+      ['executor', '--stdin'],
+      expect.objectContaining({
+        env: expect.objectContaining({
+          LOG_LEVEL: 'info',
+        }),
+      })
+    );
   });
 });

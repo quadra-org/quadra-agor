@@ -32,11 +32,27 @@ import {
   isSecretEnvKey,
   prepareImpersonationEnv,
 } from '@agor/core/unix';
+import { getCurrentLogLevel } from '@agor/core/utils/logger';
 import type { SignOptions } from 'jsonwebtoken';
 import { issueRuntimeToken } from '../auth/runtime-tokens.js';
 import { withResolvedConfig } from './build-resolved-config-slice.js';
 
 let configuredDaemonUrl: string | null = null;
+
+function resolveExecutorLogLevel(env: Record<string, string>): string {
+  return env.LOG_LEVEL || getCurrentLogLevel();
+}
+
+function withDaemonExecutorEnv(
+  env: Record<string, string>,
+  daemonUrl: string
+): Record<string, string> {
+  return {
+    ...env,
+    DAEMON_URL: daemonUrl,
+    LOG_LEVEL: resolveExecutorLogLevel(env),
+  };
+}
 
 /** Set the daemon URL for executor payloads. Call once at daemon startup. */
 export function configureDaemonUrl(url: string): void {
@@ -73,6 +89,7 @@ export interface ExecutorTemplateVariables {
   unix_user_gid?: number;
   session_id?: string;
   branch_id?: string;
+  log_level?: string;
 }
 
 export interface SpawnExecutorOptions {
@@ -133,6 +150,7 @@ export function substituteTemplateVariables(
     unix_user_gid: variables.unix_user_gid,
     session_id: variables.session_id,
     branch_id: variables.branch_id,
+    log_level: variables.log_level,
   };
 
   for (const [key, value] of Object.entries(substitutions)) {
@@ -217,6 +235,7 @@ export function spawnExecutor(
         command: payloadWithConfig.command as string,
         task_id: generateTaskId(),
         unix_user: asUser,
+        log_level: resolveExecutorLogLevel(options.env ?? (process.env as Record<string, string>)),
         ...templateVariables,
       },
       logPrefix,
@@ -252,28 +271,31 @@ function spawnExecutorLocal(payload: Record<string, unknown>, options: SpawnExec
   const daemonUrl = getDaemonUrl();
 
   const envWithDaemonUrl: Record<string, string> = preparedEnv
-    ? { DAEMON_URL: daemonUrl, ...preparedEnv }
+    ? withDaemonExecutorEnv(preparedEnv, daemonUrl)
     : asUser
-      ? Object.fromEntries(
-          Object.entries({
-            DAEMON_URL: daemonUrl,
-            PATH: env.PATH || '/usr/local/bin:/usr/bin:/bin',
-            NODE_ENV: env.NODE_ENV,
-            // HOME: not set - sudo will set it to the target user's home directory
-            ANTHROPIC_API_KEY: env.ANTHROPIC_API_KEY,
-            ANTHROPIC_AUTH_TOKEN: env.ANTHROPIC_AUTH_TOKEN,
-            ANTHROPIC_BASE_URL: env.ANTHROPIC_BASE_URL,
-            CLAUDE_CODE_OAUTH_TOKEN: env.CLAUDE_CODE_OAUTH_TOKEN,
-            OPENAI_API_KEY: env.OPENAI_API_KEY,
-            OPENAI_BASE_URL: env.OPENAI_BASE_URL,
-            GEMINI_API_KEY: env.GEMINI_API_KEY,
-            GOOGLE_API_KEY: env.GOOGLE_API_KEY,
-            // Forward git hardening pairs across the sudo boundary (sudoers
-            // env_keep is the belt; this is the suspenders for this path).
-            GIT_CONFIG_PARAMETERS: env.GIT_CONFIG_PARAMETERS,
-          }).filter(([_, v]) => v !== undefined)
+      ? withDaemonExecutorEnv(
+          Object.fromEntries(
+            Object.entries({
+              PATH: env.PATH || '/usr/local/bin:/usr/bin:/bin',
+              NODE_ENV: env.NODE_ENV,
+              LOG_LEVEL: env.LOG_LEVEL,
+              // HOME: not set - sudo will set it to the target user's home directory
+              ANTHROPIC_API_KEY: env.ANTHROPIC_API_KEY,
+              ANTHROPIC_AUTH_TOKEN: env.ANTHROPIC_AUTH_TOKEN,
+              ANTHROPIC_BASE_URL: env.ANTHROPIC_BASE_URL,
+              CLAUDE_CODE_OAUTH_TOKEN: env.CLAUDE_CODE_OAUTH_TOKEN,
+              OPENAI_API_KEY: env.OPENAI_API_KEY,
+              OPENAI_BASE_URL: env.OPENAI_BASE_URL,
+              GEMINI_API_KEY: env.GEMINI_API_KEY,
+              GOOGLE_API_KEY: env.GOOGLE_API_KEY,
+              // Forward git hardening pairs across the sudo boundary (sudoers
+              // env_keep is the belt; this is the suspenders for this path).
+              GIT_CONFIG_PARAMETERS: env.GIT_CONFIG_PARAMETERS,
+            }).filter(([_, v]) => v !== undefined)
+          ),
+          daemonUrl
         )
-      : { ...env, DAEMON_URL: daemonUrl };
+      : withDaemonExecutorEnv(env as Record<string, string>, daemonUrl);
 
   const prepared = asUser
     ? preparedEnvFilePath
@@ -368,6 +390,7 @@ function spawnExecutorWithTemplate(
   }
 ): void {
   const { executorCommandTemplate, templateVariables, logPrefix = '[Executor]' } = options;
+  const logLevel = templateVariables.log_level ?? getCurrentLogLevel();
 
   const command = substituteTemplateVariables(executorCommandTemplate, templateVariables);
 
@@ -377,6 +400,7 @@ function spawnExecutorWithTemplate(
   console.log(`${logPrefix} Template command (first 200 chars): ${command.slice(0, 200)}...`);
 
   const executorProcess = spawn('sh', ['-c', command], {
+    env: { ...process.env, LOG_LEVEL: logLevel },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 
@@ -487,6 +511,7 @@ export async function runExecutorCommand(
         command: payloadWithConfig.command as string,
         task_id: generateTaskId(),
         unix_user: asUser,
+        log_level: resolveExecutorLogLevel(options.env ?? (process.env as Record<string, string>)),
         ...templateVariables,
       },
       logPrefix,
@@ -526,25 +551,28 @@ function runExecutorCommandLocal(
 
   const daemonUrl = getDaemonUrl();
   const envWithDaemonUrl: Record<string, string> = preparedEnv
-    ? { DAEMON_URL: daemonUrl, ...preparedEnv }
+    ? withDaemonExecutorEnv(preparedEnv, daemonUrl)
     : asUser
-      ? Object.fromEntries(
-          Object.entries({
-            DAEMON_URL: daemonUrl,
-            PATH: env.PATH || '/usr/local/bin:/usr/bin:/bin',
-            NODE_ENV: env.NODE_ENV,
-            ANTHROPIC_API_KEY: env.ANTHROPIC_API_KEY,
-            ANTHROPIC_AUTH_TOKEN: env.ANTHROPIC_AUTH_TOKEN,
-            ANTHROPIC_BASE_URL: env.ANTHROPIC_BASE_URL,
-            CLAUDE_CODE_OAUTH_TOKEN: env.CLAUDE_CODE_OAUTH_TOKEN,
-            OPENAI_API_KEY: env.OPENAI_API_KEY,
-            OPENAI_BASE_URL: env.OPENAI_BASE_URL,
-            GEMINI_API_KEY: env.GEMINI_API_KEY,
-            GOOGLE_API_KEY: env.GOOGLE_API_KEY,
-            GIT_CONFIG_PARAMETERS: env.GIT_CONFIG_PARAMETERS,
-          }).filter(([_, v]) => v !== undefined)
+      ? withDaemonExecutorEnv(
+          Object.fromEntries(
+            Object.entries({
+              PATH: env.PATH || '/usr/local/bin:/usr/bin:/bin',
+              NODE_ENV: env.NODE_ENV,
+              LOG_LEVEL: env.LOG_LEVEL,
+              ANTHROPIC_API_KEY: env.ANTHROPIC_API_KEY,
+              ANTHROPIC_AUTH_TOKEN: env.ANTHROPIC_AUTH_TOKEN,
+              ANTHROPIC_BASE_URL: env.ANTHROPIC_BASE_URL,
+              CLAUDE_CODE_OAUTH_TOKEN: env.CLAUDE_CODE_OAUTH_TOKEN,
+              OPENAI_API_KEY: env.OPENAI_API_KEY,
+              OPENAI_BASE_URL: env.OPENAI_BASE_URL,
+              GEMINI_API_KEY: env.GEMINI_API_KEY,
+              GOOGLE_API_KEY: env.GOOGLE_API_KEY,
+              GIT_CONFIG_PARAMETERS: env.GIT_CONFIG_PARAMETERS,
+            }).filter(([_, v]) => v !== undefined)
+          ),
+          daemonUrl
         )
-      : { ...env, DAEMON_URL: daemonUrl };
+      : withDaemonExecutorEnv(env as Record<string, string>, daemonUrl);
 
   const prepared = asUser
     ? preparedEnvFilePath
@@ -660,6 +688,7 @@ function runExecutorCommandWithTemplate(
     logPrefix = '[Executor]',
     timeoutMs = 60_000,
   } = options;
+  const logLevel = templateVariables.log_level ?? getCurrentLogLevel();
   const command = substituteTemplateVariables(executorCommandTemplate, templateVariables);
 
   console.log(`${logPrefix} Running templated executor command: ${payload.command ?? '?'}`);
@@ -670,6 +699,7 @@ function runExecutorCommandWithTemplate(
     let settled = false;
 
     const child = spawn('sh', ['-c', command], {
+      env: { ...process.env, LOG_LEVEL: logLevel },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
