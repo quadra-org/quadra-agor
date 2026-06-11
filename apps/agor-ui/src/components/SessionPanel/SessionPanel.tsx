@@ -45,15 +45,16 @@ import { getSessionDisplayTitle, getSessionTitleStyles } from '../../utils/sessi
 import { ArchiveActionButton } from '../ArchiveButton';
 import { AutocompleteTextarea } from '../AutocompleteTextarea';
 import { CallbackToggleButton } from '../CallbackToggleButton';
-import { EffortSelector } from '../EffortSelector';
 import { FileUpload, FileUploadButton } from '../FileUpload';
 import { MCPServerPill } from '../MCPServer';
+import type { ModelConfig } from '../ModelSelector';
 import { CreatedByTag } from '../metadata';
-import { PermissionModeSelector } from '../PermissionModeSelector';
-import { ContextWindowPill, ModelPill, TimerPill, TokenCountPill } from '../Pill';
+import { ContextWindowPill, TimerPill, TokenCountPill } from '../Pill';
 import { SessionIdsButton } from '../SessionIds';
 import { ToolIcon } from '../ToolIcon';
+import { SessionMcpFooterControl } from './SessionMcpFooterControl';
 import { SessionPanelContent } from './SessionPanelContent';
+import { SessionRunSettingsPopover } from './SessionRunSettingsPopover';
 
 // Re-export PermissionMode from SDK for convenience
 export type { PermissionMode };
@@ -207,6 +208,8 @@ const PromptInput = React.forwardRef<PromptInputHandle, PromptInputProps>(
 );
 
 PromptInput.displayName = 'PromptInput';
+
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 
@@ -683,6 +686,20 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
     }
   };
 
+  const handleModelConfigChange = (newConfig: ModelConfig) => {
+    if (session && onUpdateSession) {
+      onUpdateSession(session.session_id, {
+        model_config: {
+          ...session.model_config,
+          mode: newConfig.mode,
+          model: newConfig.model,
+          ...(newConfig.provider ? { provider: newConfig.provider } : {}),
+          updated_at: new Date().toISOString(),
+        },
+      });
+    }
+  };
+
   const getStatusColor = () => {
     switch (session.status) {
       case 'running':
@@ -697,6 +714,20 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
         return 'default';
     }
   };
+
+  const modelLabel =
+    session.model_config?.model &&
+    session.agentic_tool === 'opencode' &&
+    session.model_config.provider
+      ? `${session.model_config.provider}/${session.model_config.model}`
+      : session.model_config?.model;
+  const modelConfig: ModelConfig | undefined = session.model_config?.model
+    ? {
+        mode: session.model_config.mode || 'alias',
+        model: session.model_config.model,
+        provider: session.model_config.provider,
+      }
+    : undefined;
 
   // Footer controls
   const footerControls = (
@@ -747,7 +778,7 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
                 not authenticated — click to sign in.
               </span>
             }
-            style={{ marginBottom: 0 }}
+            style={{ marginBottom: 0, borderRadius: token.borderRadius }}
             banner
           />
         )}
@@ -792,6 +823,14 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
           }}
         >
           <Space size={4} wrap>
+            <SessionMcpFooterControl
+              client={client}
+              sessionId={session.session_id}
+              sessionMcpServerIds={sessionMcpServerIds}
+              mcpServerById={mcpServerById}
+              userAuthenticatedMcpServerIds={userAuthenticatedMcpServerIds}
+              onOpenSessionSettings={onOpenSettings}
+            />
             {footerTimerTask && (
               <TimerPill
                 status={footerTimerTask.status}
@@ -806,17 +845,6 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
               />
             )}
             <SessionIdsButton session={session} />
-            {session.model_config?.model && (
-              <ModelPill
-                model={
-                  session.agentic_tool === 'opencode' &&
-                  session.model_config.provider &&
-                  session.model_config.model
-                    ? `${session.model_config.provider}/${session.model_config.model}`
-                    : session.model_config.model
-                }
-              />
-            )}
             {tokenBreakdown.total > 0 && (
               <TokenCountPill
                 count={tokenBreakdown.total}
@@ -836,27 +864,22 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
             )}
           </Space>
           <Space size={4} wrap style={{ marginLeft: 'auto' }}>
-            {session.agentic_tool === 'claude-code' && (
-              <EffortSelector
-                value={effortLevel}
-                onChange={handleEffortChange}
-                size="small"
-                compact
-              />
-            )}
-            <PermissionModeSelector
-              value={permissionMode}
-              onChange={handlePermissionModeChange}
-              agentic_tool={session.agentic_tool}
-              codexSandboxMode={codexSandboxMode}
-              codexApprovalPolicy={codexApprovalPolicy}
-              onCodexChange={handleCodexPermissionChange}
-              compact
-              iconOnly
-              size="small"
-            />
             {isRunning && <Spin size="small" />}
             <CallbackToggleButton session={session} />
+            <SessionRunSettingsPopover
+              client={client}
+              session={session}
+              modelLabel={modelLabel}
+              modelConfig={modelConfig}
+              onModelConfigChange={handleModelConfigChange}
+              effortLevel={effortLevel}
+              onEffortChange={handleEffortChange}
+              permissionMode={permissionMode}
+              onPermissionModeChange={handlePermissionModeChange}
+              codexSandboxMode={codexSandboxMode}
+              codexApprovalPolicy={codexApprovalPolicy}
+              onCodexPermissionChange={handleCodexPermissionChange}
+            />
             <Space.Compact>
               <Tooltip
                 title={
