@@ -22,6 +22,8 @@ import { type OpenCodeModelConfig, OpenCodeModelSelector } from './OpenCodeModel
 export interface ModelConfig {
   mode: 'alias' | 'exact';
   model: string;
+  // Claude Code-specific: server-side advisor tool model.
+  advisorModel?: string;
   // OpenCode-specific: provider + model
   provider?: string;
 }
@@ -99,6 +101,7 @@ const CURSOR_MODEL_OPTIONS = [
     description: CURSOR_MODEL_METADATA[DEFAULT_CURSOR_MODEL].description,
   },
 ];
+
 function preferDefaultModel<T extends { id: string }>(models: T[], defaultModel: string): T[] {
   const defaultIndex = models.findIndex((model) => model.id === defaultModel);
   if (defaultIndex <= 0) return models;
@@ -276,6 +279,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
       // When switching modes, provide the same effective default the daemon
       // applies if the form is submitted without a model_config.
       onChange({
+        ...value,
         mode: newMode,
         model: value?.model || fallbackModel,
       });
@@ -285,8 +289,20 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
   const handleModelChange = (newModel: string) => {
     if (onChange) {
       onChange({
+        ...value,
         mode,
         model: newModel,
+      });
+    }
+  };
+
+  const handleAdvisorModelChange = (advisorModel: string | undefined) => {
+    if (onChange) {
+      onChange({
+        ...value,
+        mode,
+        model: value?.model || fallbackModel,
+        advisorModel,
       });
     }
   };
@@ -307,6 +323,8 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
           {mode === 'alias' && (
             <div style={{ marginLeft: 24, marginTop: 8 }}>
               <Select
+                showSearch
+                optionFilterProp="label"
                 value={value?.model || fallbackModel}
                 onChange={handleModelChange}
                 style={{ width: '100%', minWidth: 400 }}
@@ -400,6 +418,30 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
           )}
         </Space>
       </Radio.Group>
+
+      {(effectiveTool === 'claude-code' || effectiveTool === 'claude-code-cli') && (
+        <div>
+          <Space size={4}>
+            <span>Advisor model</span>
+            <Tooltip title="Optional Claude Code advisor tool model. Leave unset to use existing Claude settings or disable session-level override.">
+              <InfoCircleOutlined />
+            </Tooltip>
+          </Space>
+          <Select
+            allowClear
+            showSearch
+            optionFilterProp="label"
+            placeholder="Not set"
+            value={value?.advisorModel}
+            onChange={handleAdvisorModelChange}
+            style={{ width: '100%', minWidth: 400, marginTop: 8 }}
+            options={AVAILABLE_CLAUDE_MODEL_ALIASES.map((model) => ({
+              value: model.id,
+              label: model.id,
+            }))}
+          />
+        </div>
+      )}
     </Space>
   );
 };

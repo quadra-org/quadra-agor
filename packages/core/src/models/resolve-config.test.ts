@@ -40,6 +40,14 @@ describe('resolveModelConfig', () => {
     expect(withoutEffort).not.toHaveProperty('effort');
   });
 
+  it('includes advisorModel only when defined (omits the key otherwise)', () => {
+    const withAdvisor = resolveModelConfig({ model: 'x', advisorModel: 'opus' }, { now });
+    expect(withAdvisor).toHaveProperty('advisorModel', 'opus');
+
+    const withoutAdvisor = resolveModelConfig({ model: 'x' }, { now });
+    expect(withoutAdvisor).not.toHaveProperty('advisorModel');
+  });
+
   it('includes provider only when defined (omits the key otherwise)', () => {
     const withProvider = resolveModelConfig(
       { model: 'claude-sonnet-4-6', provider: 'anthropic' },
@@ -148,6 +156,52 @@ describe('resolveModelConfigWithFallback', () => {
       mode: 'alias',
       model: 'claude-sonnet-4-6',
       effort: 'max',
+      updated_at: '2026-04-23T00:00:00.000Z',
+    });
+  });
+
+  it('merges advisor-only input onto the tool fallback when no source has a model', () => {
+    const result = resolveModelConfigWithFallback('claude-code', [{ advisorModel: 'opus' }], {
+      now,
+    });
+    expect(result).toEqual({
+      mode: 'alias',
+      model: 'claude-sonnet-4-6',
+      advisorModel: 'opus',
+      updated_at: '2026-04-23T00:00:00.000Z',
+    });
+  });
+
+  it('accumulates split model-less overrides onto the tool fallback', () => {
+    const result = resolveModelConfigWithFallback(
+      'claude-code',
+      [{ advisorModel: 'opus' }, { effort: 'max' }],
+      { now }
+    );
+    expect(result).toEqual({
+      mode: 'alias',
+      model: 'claude-sonnet-4-6',
+      effort: 'max',
+      advisorModel: 'opus',
+      updated_at: '2026-04-23T00:00:00.000Z',
+    });
+  });
+
+  it('preserves higher-priority model-less overrides when accumulating', () => {
+    const result = resolveModelConfigWithFallback(
+      'claude-code',
+      [
+        { advisorModel: 'opus' },
+        { advisorModel: 'sonnet', effort: 'medium' },
+        { model: 'claude-haiku-4-5' },
+      ],
+      { now }
+    );
+    expect(result).toEqual({
+      mode: 'alias',
+      model: 'claude-haiku-4-5',
+      effort: 'medium',
+      advisorModel: 'opus',
       updated_at: '2026-04-23T00:00:00.000Z',
     });
   });

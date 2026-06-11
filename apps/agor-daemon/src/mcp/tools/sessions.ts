@@ -51,7 +51,8 @@ import { listAttachedMcpServers } from './mcp-servers.js';
  * Shared Zod schema for specifying a model override at session-create / spawn /
  * subsession time. Mirrors Session['model_config']: `model` is required (the
  * whole point of this object is to pin a specific model), while `mode`,
- * `effort`, and `provider` are optional and fall back to sensible defaults.
+ * `effort`, `advisorModel`, and `provider` are optional and fall back to
+ * sensible defaults.
  * Wired through to `session.model_config` so the executor actually spawns on
  * the requested model (see query-builder.ts).
  *
@@ -61,8 +62,8 @@ import { listAttachedMcpServers } from './mcp-servers.js';
  *     want to pin a model — forcing them to construct the full object is
  *     hostile UX (and several MCP clients silently drop nested objects in
  *     tool args, see PR #1056 background).
- *   - Full object: `{ mode, model, effort, provider }` for callers that need
- *     to override `mode`/`effort`/`provider`.
+ *   - Full object: `{ mode, model, effort, advisorModel, provider }` for
+ *     callers that need to override `mode`/`effort`/`advisorModel`/`provider`.
  *
  * IMPORTANT — no `.transform()` here. Zod's JSON-Schema converter
  * (`zod/v4-mini`'s `toJSONSchema`, used in `mcp/server.ts` to populate the
@@ -87,6 +88,10 @@ const modelConfigObjectSchema = z.object({
     .enum(['low', 'medium', 'high', 'max'])
     .optional()
     .describe('Reasoning effort level (default: high)'),
+  advisorModel: mcpOptionalString(
+    'modelConfig.advisorModel',
+    "Claude Code advisor model override (e.g. 'opus', 'sonnet', 'fable', or a full model ID)."
+  ),
   provider: mcpOptionalString(
     'modelConfig.provider',
     "Provider ID (OpenCode only, e.g. 'anthropic')"
@@ -103,7 +108,7 @@ const modelConfigInputSchema = z
   ])
   .optional()
   .describe(
-    "Model override for this session. Pass either a model ID string (e.g. 'claude-opus-4-6') or a full { mode, model, effort, provider } object. Overrides the user default model_config and is threaded through to the spawned agent process. Call agor_models_list to discover valid model IDs per agenticTool."
+    "Model override for this session. Pass either a model ID string (e.g. 'claude-opus-4-6') or a full { mode, model, effort, advisorModel, provider } object. Overrides the user default model_config and is threaded through to the spawned agent process. Call agor_models_list to discover valid model IDs per agenticTool."
   );
 
 /**
@@ -408,6 +413,7 @@ export function registerSessionTools(server: McpServer, ctx: McpContext): void {
         title: session.title,
         model: session.model_config?.model || null,
         effort: session.model_config?.effort || null,
+        advisorModel: session.model_config?.advisorModel || null,
 
         // User (who is authenticated / who is prompting)
         user_name: user.name,
@@ -807,7 +813,7 @@ export function registerSessionTools(server: McpServer, ctx: McpContext): void {
     'agor_sessions_create',
     {
       description:
-        'Create a new session in an existing branch. Use for starting fresh work on a new task in the same codebase (e.g., new feature branch, separate investigation). Unlike spawn, this creates an independent session with no parent-child relationship. MCP servers are inherited from the branch (if configured) or user defaults, or can be overridden via `mcpServerIds`. Model selection falls back to user defaults and can be overridden via `modelConfig` (accepts either a model ID string like "claude-opus-4-6" or a full {mode, model, effort, provider} object — call `agor_models_list` to discover valid model IDs per agenticTool). Supports optional callbacks to notify the creating session when the new session completes.',
+        'Create a new session in an existing branch. Use for starting fresh work on a new task in the same codebase (e.g., new feature branch, separate investigation). Unlike spawn, this creates an independent session with no parent-child relationship. MCP servers are inherited from the branch (if configured) or user defaults, or can be overridden via `mcpServerIds`. Model selection falls back to user defaults and can be overridden via `modelConfig` (accepts either a model ID string like "claude-opus-4-6" or a full {mode, model, effort, advisorModel, provider} object — call `agor_models_list` to discover valid model IDs per agenticTool). Supports optional callbacks to notify the creating session when the new session completes.',
       inputSchema: z.object({
         branchId: mcpRequiredId(
           'branchId',

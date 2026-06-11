@@ -13,6 +13,7 @@
  *   --model <alias>                e.g. claude-opus-4-8. Stripped of [1m] suffix.
  *   --betas <flag>                 e.g. context-1m-2025-08-07 (only with [1m] models).
  *   --effort <level>               low | medium | high | xhigh | max
+ *   --advisor <model>              Claude Code server-side advisor model.
  *   --permission-mode <mode>       default|acceptEdits|bypassPermissions|plan|dontAsk|auto.
  *                                  Mutually exclusive with --dangerously-skip-permissions.
  *   --dangerously-skip-permissions Distinct argv per Anthropic's flag design — same
@@ -92,6 +93,9 @@ export interface ClaudeCliSpawnConfig {
 
   /** Reasoning effort. */
   effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+  /** Claude Code advisor model (e.g., 'opus', 'sonnet', 'fable', or full model ID). */
+  advisorModel?: string;
 
   /** Permission handling at spawn. See type comment. */
   permissionMode?: ClaudeCliPermissionMode;
@@ -174,6 +178,14 @@ export function permissionModeForCli(
  */
 export function buildClaudeCliSpawn(cfg: ClaudeCliSpawnConfig): BuiltSpawn {
   const args: string[] = [];
+  const emittedBetas = new Set<string>();
+  const pushBetas = (betas: string[]) => {
+    for (const beta of betas) {
+      if (emittedBetas.has(beta)) continue;
+      emittedBetas.add(beta);
+      args.push('--betas', beta);
+    }
+  };
 
   if (cfg.resumeSessionId) {
     args.push('--resume', cfg.resumeSessionId);
@@ -189,13 +201,17 @@ export function buildClaudeCliSpawn(cfg: ClaudeCliSpawnConfig): BuiltSpawn {
   if (cfg.model) {
     const { model, betas } = parseModelWithBetas(cfg.model);
     args.push('--model', model);
-    for (const beta of betas) {
-      args.push('--betas', beta);
-    }
+    pushBetas(betas);
   }
 
   if (cfg.effort) {
     args.push('--effort', cfg.effort);
+  }
+
+  if (cfg.advisorModel) {
+    const { model, betas } = parseModelWithBetas(cfg.advisorModel);
+    args.push('--advisor', model);
+    pushBetas(betas);
   }
 
   if (cfg.permissionMode) {
