@@ -1,11 +1,12 @@
-import Handlebars from 'handlebars';
-
 /**
- * Default template for child session completion callback
+ * Child-session completion callback template.
+ *
  * Variables available:
- * - childSessionId: Short ID of completed child session
+ * - childSessionId: Short ID of completed child session (canonical
+ *   `SHORT_ID_LENGTH` chars via `shortId(id)`; collision-safe even when
+ *   parents fan out children in the same millisecond)
  * - childSessionFullId: Full UUIDv7 of child session
- * - childTaskId: Short ID of completed task
+ * - childTaskId: Short ID of completed task (same shape)
  * - childTaskFullId: Full UUIDv7 of task
  * - parentSessionId: Short ID of callback target session (alias: callbackSessionId)
  * - spawnPrompt: Original prompt given to child
@@ -14,10 +15,21 @@ import Handlebars from 'handlebars';
  * - messageCount: Number of messages in completed task
  * - toolUseCount: Number of tools used
  * - lastAssistantMessage: Child's final assistant message content (optional)
+ *
+ * Renders via the shared `renderTemplate` helper in
+ * `@agor/core/templates/handlebars-helpers` — no separate Handlebars
+ * instance, no per-module helper registration. The `eq` helper is part of
+ * the shared registry.
  */
+
+import { renderTemplate } from '../templates/handlebars-helpers';
+
 const DEFAULT_TEMPLATE = `[Agor] Child session {{childSessionId}} has {{#if (eq status "completed")}}completed{{else}}failed{{/if}}.
 
-{{#if spawnPrompt}}**Task:** {{spawnPrompt}}
+{{#if spawnPrompt}}## Original Prompt
+
+{{spawnPrompt}}
+
 {{/if}}**Status:** {{status}}
 **Stats:** {{messageCount}} messages, {{toolUseCount}} tool uses
 
@@ -29,13 +41,13 @@ const DEFAULT_TEMPLATE = `[Agor] Child session {{childSessionId}} has {{#if (eq 
 Review what went wrong and decide whether to retry or take a different approach.{{/if}}`;
 
 export interface ChildCompletionContext {
-  childSessionId: string; // Short ID (first 8 chars)
+  childSessionId: string; // Canonical short ID (shortId(childSession.session_id))
   childSessionFullId: string; // Full UUIDv7
-  childTaskId: string; // Short ID of completed task
+  childTaskId: string; // Canonical short ID
   childTaskFullId: string; // Full UUIDv7 of task
-  parentSessionId: string; // Short ID of callback target (kept for backward compat)
-  callbackSessionId: string; // Alias: Short ID of callback target session
-  spawnPrompt?: string; // Original prompt from spawn (truncated to 120 chars, optional based on include_original_prompt)
+  parentSessionId: string; // Canonical short ID of callback target (kept for backward compat)
+  callbackSessionId: string; // Alias: Canonical short ID of callback target session
+  spawnPrompt?: string; // Original prompt from spawn (optional based on include_original_prompt)
   status: string; // Task status (COMPLETED, FAILED, etc.)
   completedAt: string; // ISO timestamp
   messageCount: number;
@@ -44,29 +56,20 @@ export interface ChildCompletionContext {
 }
 
 /**
- * Register custom Handlebars helpers for templates
- * Note: Check if 'eq' helper already exists in packages/core/src/templates/handlebars-helpers.ts
- */
-// biome-ignore lint/suspicious/noExplicitAny: Handlebars helper accepts any comparable value
-Handlebars.registerHelper('eq', (a: any, b: any) => a === b);
-
-/**
- * Render callback message for parent session
+ * Render callback message for parent session.
+ *
+ * If `customTemplate` is supplied and renders to empty (e.g. helper error),
+ * falls back to the default template so the callback never sends an empty
+ * message.
  */
 export function renderChildCompletionCallback(
   context: ChildCompletionContext,
   customTemplate?: string
 ): string {
-  try {
-    const template = Handlebars.compile(customTemplate || DEFAULT_TEMPLATE);
-    return template(context);
-  } catch (error) {
-    console.error('❌ Template rendering failed, using default:', error);
-    // Fallback to default template if custom template fails
-    if (customTemplate) {
-      const defaultTemplate = Handlebars.compile(DEFAULT_TEMPLATE);
-      return defaultTemplate(context);
-    }
-    throw error;
+  const ctx = context as unknown as Record<string, unknown>;
+  if (customTemplate) {
+    const rendered = renderTemplate(customTemplate, ctx);
+    if (rendered) return rendered;
   }
+  return renderTemplate(DEFAULT_TEMPLATE, ctx);
 }

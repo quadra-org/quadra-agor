@@ -11,6 +11,7 @@ import {
   getEnvVarBlockReason,
   isEnvVarAllowed,
   normalizeStoredEnvMap,
+  resolveUserEnvironment,
   type StoredEnvVar,
   validateEnvVar,
 } from '@agor/core/config';
@@ -27,17 +28,133 @@ import {
   update,
   users,
 } from '@agor/core/db';
+import { Forbidden, NotAuthenticated } from '@agor/core/feathers';
 import { isLikelyGitToken } from '@agor/core/git';
 import type {
+  AgenticToolName,
+  AgenticToolsConfig,
+  AgenticToolsUpdate,
+  AuthenticatedParams,
   EnvVarMetadata,
   EnvVarScope,
   Paginated,
   Params,
+  StoredAgenticTools,
   User,
   UserID,
   UserRole,
 } from '@agor/core/types';
-import { normalizeRole, ROLES } from '@agor/core/types';
+import {
+  extractAgenticToolsPublicValues,
+  hasMinimumRole,
+  normalizeRole,
+  ROLES,
+  toAgenticToolsStatus,
+} from '@agor/core/types';
+
+function optionalNonNegativeInteger(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const numeric = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) return undefined;
+  return Math.floor(numeric);
+}
+
+function queryString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+export const LOCAL_AUTH_LOOKUP_PARAM = Symbol('agor.users.local-auth-lookup');
+
+export interface LocalAuthenticationLookupParams extends Params {
+  [LOCAL_AUTH_LOOKUP_PARAM]?: true;
+}
+
+export function markLocalAuthenticationLookup(params: Params): void {
+  (params as LocalAuthenticationLookupParams)[LOCAL_AUTH_LOOKUP_PARAM] = true;
+}
+
+export function isLocalAuthenticationLookup(params: Params | undefined): boolean {
+  return (
+    (params as LocalAuthenticationLookupParams | undefined)?.[LOCAL_AUTH_LOOKUP_PARAM] === true
+  );
+}
+
+function isServiceAccount(params: Params | undefined): boolean {
+  return !!(params as AuthenticatedParams | undefined)?.user?._isServiceAccount;
+}
+
+function isAdmin(params: Params | undefined): boolean {
+  return hasMinimumRole((params as AuthenticatedParams | undefined)?.user?.role, ROLES.ADMIN);
+}
+
+function isSelfEmailLookup(params: Params | undefined, email: string): boolean {
+  const requesterEmail = (params as AuthenticatedParams | undefined)?.user?.email;
+  return !!requesterEmail && requesterEmail.toLowerCase() === email.toLowerCase();
+}
+
+function ensureCanExactEmailLookup(params: Params | undefined, email: string): void {
+  // Internal service calls are trusted and may perform exact-email lookups for
+  // auth/session bootstrap paths. External callers need an authenticated admin,
+  // service account, or a self lookup. The Feathers local strategy is the lone
+  // unauthenticated external path; it receives the password hash only inside the
+  // authentication pipeline and must never be exposed by /users responses.
+  if (!params?.provider || isLocalAuthenticationLookup(params)) return;
+
+  if (!(params as AuthenticatedParams | undefined)?.user) {
+    throw new NotAuthenticated('Authentication required');
+  }
+
+  if (isServiceAccount(params) || isAdmin(params) || isSelfEmailLookup(params, email)) {
+    return;
+  }
+
+  throw new Forbidden('Exact email user lookup is restricted');
+}
+
+/**
+ * Apply a per-tool credential patch to the encrypted-at-rest blob.
+ *
+ * Patch semantics (mirror UpdateUserInput.agentic_tools):
+ *   - `string` value → encrypt and set the field
+ *   - `null` value   → delete the field
+ *   - omitted field  → untouched
+ *   - if a tool's bucket becomes empty post-patch, the bucket is removed
+ *
+ * Returns the next stored shape (caller writes it back to `data.agentic_tools`).
+ */
+function applyAgenticToolsPatch(
+  current: StoredAgenticTools,
+  patch: AgenticToolsUpdate
+): StoredAgenticTools {
+  const next: StoredAgenticTools = { ...current };
+  for (const [tool, fields] of Object.entries(patch) as Array<
+    [AgenticToolName, Record<string, string | null> | undefined]
+  >) {
+    if (!fields) continue;
+    const bucket: Record<string, string> = { ...((next[tool] as Record<string, string>) ?? {}) };
+    for (const [field, value] of Object.entries(fields)) {
+      if (value === null || value === undefined) {
+        delete bucket[field];
+      } else {
+        try {
+          bucket[field] = encryptApiKey(value);
+          console.log(`🔐 Encrypted user agentic_tools.${tool}.${field}`);
+        } catch (err) {
+          console.error(`Failed to encrypt agentic_tools.${tool}.${field}:`, err);
+          throw new Error(`Failed to encrypt agentic_tools.${tool}.${field}`);
+        }
+      }
+    }
+    if (Object.keys(bucket).length > 0) {
+      (next as Record<string, Record<string, string>>)[tool] = bucket;
+    } else {
+      delete next[tool];
+    }
+  }
+  return next;
+}
 
 /**
  * Create user input
@@ -66,11 +183,12 @@ interface UpdateUserData {
   avatar?: string;
   preferences?: Record<string, unknown>;
   onboarding_completed?: boolean;
-  api_keys?: {
-    ANTHROPIC_API_KEY?: string | null;
-    OPENAI_API_KEY?: string | null;
-    GEMINI_API_KEY?: string | null;
-  };
+  /**
+   * Per-tool credential patch. Each tool's sub-object is a partial patch —
+   * `string` sets and encrypts, `null` clears, omitted fields are untouched.
+   * Field names are env var names exported into the SDK CLI environment.
+   */
+  agentic_tools?: AgenticToolsUpdate;
   // Environment variables for update (accepts plaintext, encrypted before storage)
   env_vars?: Record<string, string | null>; // { "GITHUB_TOKEN": "ghp_...", "NPM_TOKEN": null }
   // Per-var scope updates (v0.5: 'global' | 'session'). Applied after env_vars
@@ -87,16 +205,30 @@ export class UsersService {
   constructor(protected db: Database) {}
 
   /**
-   * Find all users (supports filtering by email for authentication)
+   * Find all users.
+   *
+   * Supports:
+   * - `email` exact lookup for authorized callers; password is included only
+   *   for the internal local-authentication lookup marker
+   * - `search` / `query` / `q` case-insensitive substring lookup across
+   *   name, email, and unix_username
+   * - Feathers-style `$limit` / `$skip`, plus plain `limit` / `skip` /
+   *   `offset` for MCP/client ergonomics
    */
   async find(params?: Params): Promise<Paginated<User>> {
+    const rawQuery = (params?.query ?? {}) as Record<string, unknown>;
+
     // Check if filtering by email (for authentication)
-    const email = params?.query?.email as string | undefined;
-    const includePassword = !!email; // Include password when looking up by email (for authentication)
+    const email = queryString(rawQuery.email);
+    const includePassword = !!email && isLocalAuthenticationLookup(params);
+    const requesterId = (params as AuthenticatedParams | undefined)?.user?.user_id as
+      | UserID
+      | undefined;
 
     let rows: (typeof users.$inferSelect)[];
     if (email) {
-      // Find by email (for LocalStrategy)
+      ensureCanExactEmailLookup(params, email);
+      // Find by email (for LocalStrategy / authorized exact lookup)
       const row = await select(this.db).from(users).where(eq(users.email, email)).one();
       rows = row ? [row] : [];
     } else {
@@ -104,12 +236,39 @@ export class UsersService {
       rows = await select(this.db).from(users).all();
     }
 
-    const results = rows.map((row) => this.rowToUser(row, includePassword));
+    rows = rows.sort(
+      (a, b) => a.email.localeCompare(b.email) || a.user_id.localeCompare(b.user_id)
+    );
+
+    const search =
+      queryString(rawQuery.search) ?? queryString(rawQuery.query) ?? queryString(rawQuery.q);
+
+    if (search) {
+      const needle = search.toLowerCase();
+      rows = rows.filter((row) =>
+        [row.name, row.email, row.unix_username].some((value) =>
+          (value ?? '').toLowerCase().includes(needle)
+        )
+      );
+    }
+
+    const total = rows.length;
+    const skip =
+      optionalNonNegativeInteger(rawQuery.$skip) ??
+      optionalNonNegativeInteger(rawQuery.skip) ??
+      optionalNonNegativeInteger(rawQuery.offset) ??
+      0;
+    const limit =
+      optionalNonNegativeInteger(rawQuery.$limit) ?? optionalNonNegativeInteger(rawQuery.limit);
+    const pageRows =
+      limit === undefined ? rows.slice(skip) : rows.slice(skip, skip + Math.max(limit, 0));
+
+    const results = pageRows.map((row) => this.rowToUser(row, includePassword, requesterId));
 
     return {
-      total: results.length,
-      limit: results.length,
-      skip: 0,
+      total,
+      limit: limit ?? results.length,
+      skip,
       data: results,
     };
   }
@@ -117,14 +276,17 @@ export class UsersService {
   /**
    * Get user by ID
    */
-  async get(id: UserID, _params?: Params): Promise<User> {
+  async get(id: UserID, params?: Params): Promise<User> {
     const row = await select(this.db).from(users).where(eq(users.user_id, id)).one();
 
     if (!row) {
       throw new Error(`User not found: ${id}`);
     }
 
-    return this.rowToUser(row);
+    const requesterId = (params as AuthenticatedParams | undefined)?.user?.user_id as
+      | UserID
+      | undefined;
+    return this.rowToUser(row, false, requesterId);
   }
 
   /**
@@ -173,7 +335,7 @@ export class UsersService {
   /**
    * Update user
    */
-  async patch(id: UserID, data: UpdateUserData, _params?: Params): Promise<User> {
+  async patch(id: UserID, data: UpdateUserData, params?: Params): Promise<User> {
     const now = new Date();
     const updates: Record<string, unknown> = { updated_at: now };
 
@@ -202,7 +364,7 @@ export class UsersService {
     if (
       data.avatar ||
       data.preferences ||
-      data.api_keys ||
+      data.agentic_tools ||
       data.env_vars ||
       data.env_var_scopes ||
       data.default_agentic_config
@@ -212,30 +374,15 @@ export class UsersService {
       const currentData = currentRow?.data as {
         avatar?: string;
         preferences?: Record<string, unknown>;
-        api_keys?: Record<string, string>;
+        agentic_tools?: StoredAgenticTools;
         env_vars?: Record<string, string | StoredEnvVar>;
         default_agentic_config?: import('@agor/core/types').DefaultAgenticConfig;
       };
 
-      // Handle API keys (encrypt before storage)
-      const encryptedKeys = currentData?.api_keys || {};
-      if (data.api_keys) {
-        for (const [key, value] of Object.entries(data.api_keys)) {
-          if (value === null || value === undefined) {
-            // Clear key
-            delete encryptedKeys[key];
-          } else {
-            // Encrypt and store
-            try {
-              encryptedKeys[key] = encryptApiKey(value);
-              console.log(`🔐 Encrypted user API key: ${key}`);
-            } catch (err) {
-              console.error(`Failed to encrypt ${key}:`, err);
-              throw new Error(`Failed to encrypt ${key}`);
-            }
-          }
-        }
-      }
+      // Handle per-tool credential patches (encrypt-on-write, drop-on-null).
+      const nextAgenticTools: StoredAgenticTools = data.agentic_tools
+        ? applyAgenticToolsPatch(currentData?.agentic_tools ?? {}, data.agentic_tools)
+        : (currentData?.agentic_tools ?? {});
 
       // Handle env vars (encrypt before storage).
       //
@@ -317,7 +464,7 @@ export class UsersService {
       updates.data = {
         avatar: data.avatar ?? current.avatar,
         preferences: data.preferences ?? current.preferences,
-        api_keys: Object.keys(encryptedKeys).length > 0 ? encryptedKeys : undefined,
+        agentic_tools: Object.keys(nextAgenticTools).length > 0 ? nextAgenticTools : undefined,
         env_vars: Object.keys(nextEnvVars).length > 0 ? nextEnvVars : undefined,
         default_agentic_config: data.default_agentic_config ?? current.default_agentic_config,
       };
@@ -333,7 +480,10 @@ export class UsersService {
       throw new Error(`User not found: ${id}`);
     }
 
-    return this.rowToUser(row);
+    const requesterId = (params as AuthenticatedParams | undefined)?.user?.user_id as
+      | UserID
+      | undefined;
+    return this.rowToUser(row, false, requesterId);
   }
 
   /**
@@ -369,28 +519,59 @@ export class UsersService {
   }
 
   /**
-   * Get decrypted API key for a user
-   * Used by key resolution service
+   * Get a single decrypted credential field scoped to a specific agentic tool.
+   *
+   * Replaces the legacy flat-namespace `getApiKey(userId, 'ANTHROPIC_API_KEY')`
+   * call site with `(userId, 'claude-code', 'ANTHROPIC_API_KEY')` so an
+   * Anthropic key stored on the user can no longer leak into a Codex spawn.
    */
-  async getApiKey(
+  async getToolConfigField<T extends AgenticToolName>(
     userId: UserID,
-    keyName: 'ANTHROPIC_API_KEY' | 'OPENAI_API_KEY' | 'GEMINI_API_KEY'
+    tool: T,
+    field: keyof AgenticToolsConfig[T] & string
   ): Promise<string | undefined> {
     const row = await select(this.db).from(users).where(eq(users.user_id, userId)).one();
-
     if (!row) return undefined;
 
-    const data = row.data as { api_keys?: Record<string, string> };
-    const encryptedKey = data.api_keys?.[keyName];
-
-    if (!encryptedKey) return undefined;
+    const data = row.data as { agentic_tools?: StoredAgenticTools };
+    const encrypted = data.agentic_tools?.[tool]?.[field];
+    if (!encrypted) return undefined;
 
     try {
-      return decryptApiKey(encryptedKey);
+      return decryptApiKey(encrypted);
     } catch (err) {
-      console.error(`Failed to decrypt ${keyName} for user ${userId}:`, err);
+      console.error(`Failed to decrypt agentic_tools.${tool}.${field} for user ${userId}:`, err);
       return undefined;
     }
+  }
+
+  /**
+   * Get the full decrypted credential bag for one tool. Used when spawning an
+   * SDK so the executor environment receives only that tool's env vars.
+   * Returns `null` if the user has no stored config for the tool.
+   */
+  async getToolConfig<T extends AgenticToolName>(
+    userId: UserID,
+    tool: T
+  ): Promise<AgenticToolsConfig[T] | null> {
+    const row = await select(this.db).from(users).where(eq(users.user_id, userId)).one();
+    if (!row) return null;
+
+    const data = row.data as { agentic_tools?: StoredAgenticTools };
+    const fields = data.agentic_tools?.[tool];
+    if (!fields || Object.keys(fields).length === 0) return null;
+
+    const out: Record<string, string> = {};
+    for (const [field, encrypted] of Object.entries(fields)) {
+      if (!encrypted) continue;
+      try {
+        out[field] = decryptApiKey(encrypted);
+      } catch (err) {
+        console.error(`Failed to decrypt agentic_tools.${tool}.${field} for user ${userId}:`, err);
+      }
+    }
+
+    return Object.keys(out).length > 0 ? (out as AgenticToolsConfig[T]) : null;
   }
 
   /**
@@ -422,19 +603,59 @@ export class UsersService {
   }
 
   /**
+   * Get the full resolved git environment for a user.
+   *
+   * Returns all user env vars (global scope) post-filterEnv, suitable for
+   * passing to git operations via `options.env`. The executor calls this via
+   * Feathers RPC so per-user credentials flow through the daemon's auth
+   * boundary instead of being baked into spawn payloads.
+   *
+   * Auth: service-account JWTs may fetch any user's env (executor is trusted).
+   * User JWTs may only fetch their own env.
+   */
+  async getGitEnvironment(
+    data: { userId: string },
+    params?: Params
+  ): Promise<Record<string, string>> {
+    const userId = data.userId as UserID;
+    const caller = (params as AuthenticatedParams | undefined)?.user;
+
+    // Auth check: service accounts can fetch any user's env;
+    // regular users can only fetch their own.
+    if (params?.provider) {
+      if (!caller) {
+        throw new NotAuthenticated('Authentication required');
+      }
+      const isService = !!(caller as { _isServiceAccount?: boolean })._isServiceAccount;
+      if (!isService && caller.user_id !== userId) {
+        throw new Forbidden("Cannot access another user's git environment");
+      }
+    }
+
+    return resolveUserEnvironment(userId, this.db);
+  }
+
+  /**
    * Convert database row to User type
    *
    * @param row - Database row
    * @param includePassword - Include password field (for authentication only)
+   * @param requesterId - Authenticated user making the request. When equal to
+   *   the row's `user_id`, the returned DTO includes `agentic_tools_public_values`
+   *   (decrypted plaintext for the whitelisted non-secret fields like
+   *   `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL`). For any other requester —
+   *   including admins viewing someone else's profile — public values are
+   *   omitted, since base URLs can leak internal hostnames.
    */
   private rowToUser(
     row: typeof users.$inferSelect,
-    includePassword = false
+    includePassword = false,
+    requesterId?: UserID
   ): User & { password?: string } {
     const data = row.data as {
       avatar?: string;
       preferences?: Record<string, unknown>;
-      api_keys?: Record<string, string>; // Encrypted keys
+      agentic_tools?: StoredAgenticTools; // Encrypted per-tool credential blobs
       env_vars?: Record<string, string | StoredEnvVar>; // Encrypted env vars (legacy + v0.5 shape)
       default_agentic_config?: import('@agor/core/types').DefaultAgenticConfig;
     };
@@ -463,14 +684,15 @@ export class UsersService {
       must_change_password: !!row.must_change_password,
       created_at: row.created_at,
       updated_at: row.updated_at ?? undefined,
-      // Return key status (boolean), NOT actual keys
-      api_keys: data.api_keys
-        ? {
-            ANTHROPIC_API_KEY: !!data.api_keys.ANTHROPIC_API_KEY,
-            OPENAI_API_KEY: !!data.api_keys.OPENAI_API_KEY,
-            GEMINI_API_KEY: !!data.api_keys.GEMINI_API_KEY,
-          }
-        : undefined,
+      // Per-tool credential presence (boolean only — never expose decrypted values).
+      agentic_tools: toAgenticToolsStatus(data.agentic_tools),
+      // Self-only: return plaintext for whitelisted non-secret fields
+      // (base URLs) so the UI can render the saved value back. Field-level
+      // secrets are NEVER on the whitelist; see `AGENTIC_TOOLS_PUBLIC_FIELDS`.
+      agentic_tools_public_values:
+        requesterId === row.user_id
+          ? extractAgenticToolsPublicValues(data.agentic_tools, decryptApiKey)
+          : undefined,
       // Return env var metadata (presence + scope), NOT actual values
       env_vars: envVarMetadata,
       // Return default agentic config
@@ -512,7 +734,7 @@ class UsersServiceWithAuth extends UsersService {
     const data = row.data as {
       avatar?: string;
       preferences?: Record<string, unknown>;
-      api_keys?: Record<string, string>;
+      agentic_tools?: StoredAgenticTools;
       env_vars?: Record<string, string | StoredEnvVar>;
     };
 
@@ -540,13 +762,7 @@ class UsersServiceWithAuth extends UsersService {
       must_change_password: !!row.must_change_password,
       created_at: row.created_at,
       updated_at: row.updated_at ?? undefined,
-      api_keys: data.api_keys
-        ? {
-            ANTHROPIC_API_KEY: !!data.api_keys.ANTHROPIC_API_KEY,
-            OPENAI_API_KEY: !!data.api_keys.OPENAI_API_KEY,
-            GEMINI_API_KEY: !!data.api_keys.GEMINI_API_KEY,
-          }
-        : undefined,
+      agentic_tools: toAgenticToolsStatus(data.agentic_tools),
       env_vars: envVarMetadata,
     };
   }

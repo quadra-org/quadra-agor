@@ -1,22 +1,33 @@
 /**
  * Users Repository
  *
- * Type-safe CRUD operations for users with encrypted API key management.
+ * Type-safe CRUD operations for users with encrypted per-tool credential management.
+ * Credentials live under `data.agentic_tools[toolName][envVarName]`, encrypted at rest;
+ * the public DTO (User.agentic_tools) exposes boolean presence flags only.
  */
 
-import type { EnvVarMetadata, User, UUID } from '@agor/core/types';
+import type {
+  AgenticToolName,
+  AgenticToolsConfig,
+  EnvVarMetadata,
+  StoredAgenticTools,
+  User,
+  UUID,
+} from '@agor/core/types';
+import { toAgenticToolsStatus } from '@agor/core/types';
 import { eq, like } from 'drizzle-orm';
 import { normalizeStoredEnvMap, type RawStoredEnvVar } from '../../config/env-vars';
-import { generateId } from '../../lib/ids';
+import { generateId, shortId } from '../../lib/ids';
 import type { Database } from '../client';
 import { deleteFrom, insert, select, update } from '../database-wrapper';
 import { decryptApiKey, encryptApiKey } from '../encryption';
 import { type UserInsert as SchemaUserInsert, type UserRow, users } from '../schema';
 import {
-  AmbiguousIdError,
   type BaseRepository,
   EntityNotFoundError,
+  RESOLVE_SHORT_ID_FETCH_LIMIT,
   RepositoryError,
+  resolveByShortIdPrefix,
 } from './base';
 
 /**
@@ -26,8 +37,9 @@ export class UsersRepository implements BaseRepository<User, Partial<User>> {
   constructor(private db: Database) {}
 
   /**
-   * Convert database row to User type
-   * Note: Converts encrypted API keys (strings) to boolean flags for API exposure
+   * Convert database row to User type.
+   * Converts the encrypted `agentic_tools` blob to a boolean presence DTO so
+   * decrypted credentials never leave this repository.
    */
   private rowToUser(row: UserRow): User {
     return {
@@ -43,15 +55,8 @@ export class UsersRepository implements BaseRepository<User, Partial<User>> {
       must_change_password: row.must_change_password,
       avatar: row.data.avatar,
       preferences: row.data.preferences as User['preferences'],
-      // Convert encrypted keys to boolean flags (true = key exists, false/undefined = no key)
-      api_keys: row.data.api_keys
-        ? {
-            ANTHROPIC_API_KEY: !!row.data.api_keys.ANTHROPIC_API_KEY,
-            OPENAI_API_KEY: !!row.data.api_keys.OPENAI_API_KEY,
-            GEMINI_API_KEY: !!row.data.api_keys.GEMINI_API_KEY,
-            COPILOT_GITHUB_TOKEN: !!row.data.api_keys.COPILOT_GITHUB_TOKEN,
-          }
-        : undefined,
+      // Convert encrypted per-tool credential blobs into boolean presence flags.
+      agentic_tools: toAgenticToolsStatus(row.data.agentic_tools as StoredAgenticTools | undefined),
       // Convert stored env vars to presence + scope metadata (never exposes secrets).
       // Handles both legacy string form and v0.5 object form via normalizeStoredEnvMap.
       // The schema stores `scope` as a generic string (no SQL CHECK constraint); the
@@ -76,7 +81,11 @@ export class UsersRepository implements BaseRepository<User, Partial<User>> {
    * For updates, this accepts the current user data from the database row
    */
   private userToInsert(
-    user: Partial<User> & { password?: string; api_keys_raw?: Record<string, string> }
+    user: Partial<User> & {
+      password?: string;
+      agentic_tools_raw?: StoredAgenticTools;
+      env_vars_raw?: SchemaUserInsert['data']['env_vars'];
+    }
   ): SchemaUserInsert {
     const now = new Date();
     const userId = user.user_id ?? generateId();
@@ -99,42 +108,34 @@ export class UsersRepository implements BaseRepository<User, Partial<User>> {
       data: {
         avatar: user.avatar,
         preferences: user.preferences,
-        // Use raw API keys if provided (for internal operations like setApiKey)
-        api_keys: user.api_keys_raw,
-        env_vars: undefined, // Not implemented yet
+        // Encrypted per-tool credentials. Only forwarded when caller passes the
+        // raw shape (internal credential mutators); regular updates leave it undefined,
+        // letting the merge in `update()` reuse the existing on-disk blob.
+        // Cast: schema declares `opencode: Record<string, never>` (no fields by
+        // contract); StoredAgenticTools widens that to string values for shape
+        // uniformity. Runtime never writes opencode, so the cast is safe.
+        agentic_tools: user.agentic_tools_raw as SchemaUserInsert['data']['agentic_tools'],
+        // Same pass-through as agentic_tools: env_vars are encrypted blobs
+        // not represented on the public DTO. `update()` threads the raw value
+        // from the existing row so a generic field update doesn't wipe them.
+        env_vars: user.env_vars_raw,
         default_agentic_config: user.default_agentic_config,
       },
     };
   }
 
   /**
-   * Resolve short ID to full ID
+   * Resolve short ID to full ID via the centralized helper.
    */
   private async resolveId(id: string): Promise<string> {
-    // If already a full UUID, return as-is
-    if (id.length === 36 && id.includes('-')) {
-      return id;
-    }
-
-    // Short ID - need to resolve
-    const normalized = id.replace(/-/g, '').toLowerCase();
-    const pattern = `${normalized}%`;
-
-    const results = await select(this.db).from(users).where(like(users.user_id, pattern)).all();
-
-    if (results.length === 0) {
-      throw new EntityNotFoundError('User', id);
-    }
-
-    if (results.length > 1) {
-      throw new AmbiguousIdError(
-        'User',
-        id,
-        results.map((r: UserRow) => r.user_id)
-      );
-    }
-
-    return results[0].user_id;
+    return resolveByShortIdPrefix(id, 'User', async (pattern) => {
+      const rows = await select(this.db)
+        .from(users)
+        .where(like(users.user_id, pattern))
+        .limit(RESOLVE_SHORT_ID_FETCH_LIMIT)
+        .all();
+      return rows.map((r: UserRow) => r.user_id);
+    });
   }
 
   /**
@@ -257,8 +258,21 @@ export class UsersRepository implements BaseRepository<User, Partial<User>> {
       }
     }
 
-    // Merge updates
-    const merged = { ...current, ...updates };
+    // Merge updates. Preserve the encrypted agentic_tools and env_vars blobs
+    // from the raw row so a generic field update (name, preferences, etc.)
+    // doesn't nuke stored credentials — the boolean projection on `current`
+    // can't round-trip back to encrypted bytes.
+    const rawRow = await this.getRawRow(fullId);
+    const merged = { ...current, ...updates } as Partial<User> & {
+      agentic_tools_raw?: StoredAgenticTools;
+      env_vars_raw?: SchemaUserInsert['data']['env_vars'];
+    };
+    if (rawRow?.data.agentic_tools) {
+      merged.agentic_tools_raw = rawRow.data.agentic_tools as StoredAgenticTools;
+    }
+    if (rawRow?.data.env_vars) {
+      merged.env_vars_raw = rawRow.data.env_vars;
+    }
     const insertData = this.userToInsert(merged);
 
     // Update database
@@ -307,53 +321,84 @@ export class UsersRepository implements BaseRepository<User, Partial<User>> {
   }
 
   /**
-   * Get decrypted API key for a user and service
+   * Get the full decrypted credential bag for a single agentic tool.
    *
-   * @param userId - User ID
-   * @param service - Service name ('anthropic', 'openai', 'gemini')
-   * @returns Decrypted API key or null if not found
+   * Returns `null` when the user has no stored config for that tool.
+   * Fields that fail to decrypt are dropped from the returned object and
+   * logged — callers see "missing field" rather than a thrown error so a
+   * single corrupt value doesn't poison an entire SDK spawn.
    */
-  async getApiKey(
+  async getToolConfig<T extends AgenticToolName>(
     userId: string,
-    service: 'anthropic' | 'openai' | 'gemini' | 'copilot'
+    tool: T
+  ): Promise<AgenticToolsConfig[T] | null> {
+    const row = await this.getRawRow(userId);
+    if (!row) return null;
+
+    const stored = row.data.agentic_tools as StoredAgenticTools | undefined;
+    const fields = stored?.[tool];
+    if (!fields || Object.keys(fields).length === 0) return null;
+
+    const out: Record<string, string> = {};
+    for (const [field, encrypted] of Object.entries(fields)) {
+      if (!encrypted) continue;
+      try {
+        out[field] = decryptApiKey(encrypted);
+      } catch (error) {
+        console.error(
+          `[users] Failed to decrypt ${tool}.${field} for user ${shortId(userId)}: ${
+            (error as Error).message
+          }`
+        );
+      }
+    }
+
+    return Object.keys(out).length > 0 ? (out as AgenticToolsConfig[T]) : null;
+  }
+
+  /**
+   * Get a single decrypted credential field for a tool.
+   *
+   * Returns `null` when the field is unset OR when decryption fails (logged).
+   * Throws only on storage-layer errors, not on missing/corrupt values.
+   */
+  async getToolConfigField<T extends AgenticToolName>(
+    userId: string,
+    tool: T,
+    field: keyof NonNullable<AgenticToolsConfig[T]> & string
   ): Promise<string | null> {
     const row = await this.getRawRow(userId);
-    if (!row || !row.data.api_keys) {
-      return null;
-    }
+    if (!row) return null;
 
-    // Map service name to env var name
-    const keyMap = {
-      anthropic: 'ANTHROPIC_API_KEY',
-      openai: 'OPENAI_API_KEY',
-      gemini: 'GEMINI_API_KEY',
-      copilot: 'COPILOT_GITHUB_TOKEN',
-    } as const;
+    const stored = row.data.agentic_tools as StoredAgenticTools | undefined;
+    const encrypted = stored?.[tool]?.[field];
+    if (!encrypted) return null;
 
-    const encryptedKey = row.data.api_keys[keyMap[service]];
-    if (!encryptedKey) {
-      return null;
-    }
-
-    // Decrypt the API key
     try {
-      return decryptApiKey(encryptedKey);
+      return decryptApiKey(encrypted);
     } catch (error) {
-      throw new RepositoryError(`Failed to decrypt API key for service ${service}`, error);
+      console.error(
+        `[users] Failed to decrypt ${tool}.${field} for user ${shortId(userId)}: ${
+          (error as Error).message
+        }`
+      );
+      return null;
     }
   }
 
   /**
-   * Set encrypted API key for a user and service
+   * Set (encrypt + persist) a single credential field for a tool.
    *
-   * @param userId - User ID
-   * @param service - Service name ('anthropic', 'openai', 'gemini')
-   * @param apiKey - Plaintext API key to encrypt and store
+   * Field names are env-var-shaped (e.g. ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL)
+   * and are stored encrypted regardless of whether the value is a secret —
+   * keeping the on-disk shape uniform avoids decrypt-vs-plain branching at
+   * read time. UI controls own the text-vs-password rendering distinction.
    */
-  async setApiKey(
+  async setToolConfigField<T extends AgenticToolName>(
     userId: string,
-    service: 'anthropic' | 'openai' | 'gemini' | 'copilot',
-    apiKey: string
+    tool: T,
+    field: keyof NonNullable<AgenticToolsConfig[T]> & string,
+    value: string
   ): Promise<void> {
     const fullId = await this.resolveId(userId);
     const row = await this.getRawRow(fullId);
@@ -362,35 +407,23 @@ export class UsersRepository implements BaseRepository<User, Partial<User>> {
       throw new EntityNotFoundError('User', userId);
     }
 
-    // Map service name to env var name
-    const keyMap = {
-      anthropic: 'ANTHROPIC_API_KEY',
-      openai: 'OPENAI_API_KEY',
-      gemini: 'GEMINI_API_KEY',
-      copilot: 'COPILOT_GITHUB_TOKEN',
-    } as const;
-
-    // Encrypt the API key
-    const encryptedKey = encryptApiKey(apiKey);
-
-    // Update user's api_keys in database
-    const updatedApiKeys = {
-      ...(row.data.api_keys || {}),
-      [keyMap[service]]: encryptedKey,
+    const stored = (row.data.agentic_tools as StoredAgenticTools | undefined) ?? {};
+    const next: StoredAgenticTools = {
+      ...stored,
+      [tool]: {
+        ...(stored[tool] ?? {}),
+        [field]: encryptApiKey(value),
+      },
     };
 
-    // Build update object with raw encrypted keys
-    const user = this.rowToUser(row);
-    const updateData = {
-      ...user,
-      api_keys_raw: updatedApiKeys,
-    };
-
-    const insertData = this.userToInsert(updateData);
-
+    // Patch ONLY the agentic_tools sub-blob — preserve siblings (env_vars,
+    // preferences, default_agentic_config, etc.). Routing through
+    // userToInsert would lose any data subfield it doesn't explicitly
+    // forward (e.g. env_vars), which is how a credential write would
+    // otherwise nuke unrelated user state.
     await update(this.db, users)
       .set({
-        ...insertData,
+        data: { ...row.data, agentic_tools: next },
         updated_at: new Date(),
       })
       .where(eq(users.user_id, fullId))
@@ -398,14 +431,15 @@ export class UsersRepository implements BaseRepository<User, Partial<User>> {
   }
 
   /**
-   * Delete API key for a user and service
+   * Delete a single credential field for a tool.
    *
-   * @param userId - User ID
-   * @param service - Service name ('anthropic', 'openai', 'gemini')
+   * If the tool's bucket becomes empty after the delete, the bucket itself is
+   * removed so `data.agentic_tools` doesn't accumulate empty objects.
    */
-  async deleteApiKey(
+  async deleteToolConfigField<T extends AgenticToolName>(
     userId: string,
-    service: 'anthropic' | 'openai' | 'gemini' | 'copilot'
+    tool: T,
+    field: keyof NonNullable<AgenticToolsConfig[T]> & string
   ): Promise<void> {
     const fullId = await this.resolveId(userId);
     const row = await this.getRawRow(fullId);
@@ -414,30 +448,21 @@ export class UsersRepository implements BaseRepository<User, Partial<User>> {
       throw new EntityNotFoundError('User', userId);
     }
 
-    // Map service name to env var name
-    const keyMap = {
-      anthropic: 'ANTHROPIC_API_KEY',
-      openai: 'OPENAI_API_KEY',
-      gemini: 'GEMINI_API_KEY',
-      copilot: 'COPILOT_GITHUB_TOKEN',
-    } as const;
+    const stored = (row.data.agentic_tools as StoredAgenticTools | undefined) ?? {};
+    const toolFields = { ...(stored[tool] ?? {}) } as Record<string, string>;
+    delete toolFields[field];
 
-    // Remove the key
-    const updatedApiKeys = { ...(row.data.api_keys || {}) };
-    delete updatedApiKeys[keyMap[service]];
+    const next: StoredAgenticTools = { ...stored };
+    if (Object.keys(toolFields).length > 0) {
+      next[tool] = toolFields;
+    } else {
+      delete next[tool];
+    }
 
-    // Build update object with raw encrypted keys
-    const user = this.rowToUser(row);
-    const updateData = {
-      ...user,
-      api_keys_raw: updatedApiKeys,
-    };
-
-    const insertData = this.userToInsert(updateData);
-
+    // Patch only agentic_tools — see setToolConfigField for rationale.
     await update(this.db, users)
       .set({
-        ...insertData,
+        data: { ...row.data, agentic_tools: next },
         updated_at: new Date(),
       })
       .where(eq(users.user_id, fullId))

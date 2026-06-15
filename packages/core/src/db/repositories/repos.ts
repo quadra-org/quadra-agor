@@ -7,7 +7,8 @@
 import type { Repo, RepoEnvironment, RepoEnvironmentConfigV1, UUID } from '@agor/core/types';
 import { eq, like, sql } from 'drizzle-orm';
 import { resolveVariant, wrapV1AsV2 } from '../../config/variant-resolver.js';
-import { formatShortId, generateId } from '../../lib/ids';
+import { generateId } from '../../lib/ids';
+import { httpUrlHasUserinfo, stripHttpUrlUserinfo } from '../../utils/url';
 import type { Database } from '../client';
 import { deleteFrom, insert, lockRowForUpdate, select, txAsDb, update } from '../database-wrapper';
 import { type RepoInsert, type RepoRow, repos } from '../schema';
@@ -15,7 +16,9 @@ import {
   AmbiguousIdError,
   type BaseRepository,
   EntityNotFoundError,
+  RESOLVE_SHORT_ID_FETCH_LIMIT,
   RepositoryError,
+  resolveByShortIdPrefix,
 } from './base';
 import { deepMerge } from './merge-utils';
 
@@ -46,6 +49,11 @@ function deriveV1FromV2(env: RepoEnvironment | undefined): RepoEnvironmentConfig
   return v1;
 }
 
+export interface RepoRemoteUrlCredentialFinding {
+  repo_id: UUID;
+  slug: string;
+}
+
 /**
  * Repo repository implementation
  */
@@ -68,6 +76,9 @@ export class RepoRepository implements BaseRepository<Repo, Partial<Repo>> {
     };
     const environment = data.environment ?? wrapV1AsV2(data.environment_config);
     const environment_config = data.environment_config ?? deriveV1FromV2(environment);
+    const remote_url =
+      typeof data.remote_url === 'string' ? stripHttpUrlUserinfo(data.remote_url) : data.remote_url;
+
     return {
       repo_id: row.repo_id as UUID,
       slug: row.slug,
@@ -78,8 +89,11 @@ export class RepoRepository implements BaseRepository<Repo, Partial<Repo>> {
         ? new Date(row.updated_at).toISOString()
         : new Date(row.created_at).toISOString(),
       ...data,
+      remote_url,
       environment,
       environment_config,
+      clone_status: data.clone_status,
+      clone_error: data.clone_error,
     };
   }
 
@@ -123,43 +137,33 @@ export class RepoRepository implements BaseRepository<Repo, Partial<Repo>> {
       unix_group: repo.unix_group ?? null,
       data: {
         name: repo.name ?? repo.slug,
-        remote_url: repo.remote_url || undefined,
+        remote_url: repo.remote_url ? stripHttpUrlUserinfo(repo.remote_url) : undefined,
         local_path: repo.local_path,
         default_branch: repo.default_branch,
         environment,
         environment_config,
+        clone_status: repo.clone_status,
+        // `|| undefined` (not `??`) — deepMerge writes explicit `null` to
+        // clear `clone_error` on the success patch from the executor; we
+        // coerce that to `undefined` here so the stored value matches the
+        // `clone_error?: RepoCloneError` invariant (set only when failed).
+        clone_error: repo.clone_error || undefined,
       },
     };
   }
 
   /**
-   * Resolve short ID to full ID
+   * Resolve short ID to full ID via the centralized helper.
    */
   private async resolveId(id: string): Promise<string> {
-    // If already a full UUID, return as-is
-    if (id.length === 36 && id.includes('-')) {
-      return id;
-    }
-
-    // Short ID - need to resolve
-    const normalized = id.replace(/-/g, '').toLowerCase();
-    const pattern = `${normalized}%`;
-
-    const results = await select(this.db).from(repos).where(like(repos.repo_id, pattern)).all();
-
-    if (results.length === 0) {
-      throw new EntityNotFoundError('Repo', id);
-    }
-
-    if (results.length > 1) {
-      throw new AmbiguousIdError(
-        'Repo',
-        id,
-        results.map((r: { repo_id: string }) => formatShortId(r.repo_id as UUID))
-      );
-    }
-
-    return results[0].repo_id as UUID;
+    return resolveByShortIdPrefix(id, 'Repo', async (pattern) => {
+      const rows = await select(this.db)
+        .from(repos)
+        .where(like(repos.repo_id, pattern))
+        .limit(RESOLVE_SHORT_ID_FETCH_LIMIT)
+        .all();
+      return rows.map((r: { repo_id: string }) => r.repo_id);
+    });
   }
 
   /**
@@ -249,6 +253,82 @@ export class RepoRepository implements BaseRepository<Repo, Partial<Repo>> {
   }
 
   /**
+   * Find persisted repo.remote_url rows that still contain HTTP(S) userinfo.
+   *
+   * This intentionally reads raw rows rather than `rowToRepo()` because reads
+   * sanitize `remote_url` before returning repo objects.
+   */
+  async scanRemoteUrls(): Promise<{ checked: number; findings: RepoRemoteUrlCredentialFinding[] }> {
+    try {
+      const rows = (await select(this.db).from(repos).all()) as RepoRow[];
+      const findings = rows.flatMap((row) => {
+        const data = row.data as typeof row.data & { remote_url?: unknown };
+        if (typeof data.remote_url !== 'string' || !httpUrlHasUserinfo(data.remote_url)) {
+          return [];
+        }
+        return [{ repo_id: row.repo_id as UUID, slug: row.slug }];
+      });
+
+      return { checked: rows.length, findings };
+    } catch (error) {
+      throw new RepositoryError(
+        `Failed to scan repo remote URLs: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Remove HTTP(S) userinfo from persisted repo.remote_url values.
+   *
+   * `rowToRepo()` sanitizes reads so legacy credential-bearing values are not
+   * returned through APIs or reused by daemon/executor code, but this method
+   * repairs the stored rows as a startup/admin hygiene pass.
+   */
+  async scrubRemoteUrls(): Promise<{ checked: number; changed: number }> {
+    try {
+      const scan = await this.scanRemoteUrls();
+      let changed = 0;
+
+      for (const finding of scan.findings) {
+        await this.db.transaction(async (tx) => {
+          await lockRowForUpdate(txAsDb(tx), this.db, repos, eq(repos.repo_id, finding.repo_id));
+
+          const currentRow = await select(txAsDb(tx))
+            .from(repos)
+            .where(eq(repos.repo_id, finding.repo_id))
+            .one();
+          if (!currentRow) return;
+
+          const data = currentRow.data as typeof currentRow.data & { remote_url?: unknown };
+          if (typeof data.remote_url !== 'string' || !httpUrlHasUserinfo(data.remote_url)) {
+            return;
+          }
+
+          await update(txAsDb(tx), repos)
+            .set({
+              updated_at: new Date(),
+              data: {
+                ...data,
+                remote_url: stripHttpUrlUserinfo(data.remote_url),
+              },
+            })
+            .where(eq(repos.repo_id, finding.repo_id))
+            .run();
+          changed += 1;
+        });
+      }
+
+      return { checked: scan.checked, changed };
+    } catch (error) {
+      throw new RepositoryError(
+        `Failed to scrub repo remote URLs: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
    * Update repo by ID (atomic with database-level transaction)
    *
    * Uses a transaction to ensure read-merge-write is atomic, preventing race conditions
@@ -295,7 +375,13 @@ export class RepoRepository implements BaseRepository<Repo, Partial<Repo>> {
           .where(eq(repos.repo_id, fullId))
           .run();
 
-        // Return merged repo with refreshed timestamp (no need to re-fetch)
+        // Sync re-derived fields back onto `merged` so the returned object
+        // matches what was actually persisted. `repoToInsert` coerces
+        // explicit-clear sentinels (e.g. `clone_error: null` from deepMerge)
+        // to `undefined`; without this sync the caller sees the un-coerced
+        // null and the type invariant lies.
+        merged.clone_error = insertData.data.clone_error;
+        merged.remote_url = insertData.data.remote_url;
         merged.last_updated = newUpdatedAt.toISOString();
         return merged;
       });
@@ -363,6 +449,7 @@ export class RepoRepository implements BaseRepository<Repo, Partial<Repo>> {
         // field we explicitly undefined'd in `patch`.
         next.environment = insertData.data.environment;
         next.environment_config = insertData.data.environment_config;
+        next.remote_url = insertData.data.remote_url;
         next.last_updated = newUpdatedAt.toISOString();
         return next;
       });
@@ -421,19 +508,19 @@ export class RepoRepository implements BaseRepository<Repo, Partial<Repo>> {
   }
 
   /**
-   * @deprecated Worktrees are now first-class entities in their own table.
-   * Use WorktreeRepository instead.
+   * @deprecated Branches are now first-class entities in their own table.
+   * Use BranchRepository instead.
    */
-  async addWorktree(): Promise<never> {
-    throw new Error('addWorktree is deprecated. Use WorktreeRepository.create() instead.');
+  async addBranch(): Promise<never> {
+    throw new Error('addBranch is deprecated. Use BranchRepository.create() instead.');
   }
 
   /**
-   * @deprecated Worktrees are now first-class entities in their own table.
-   * Use WorktreeRepository instead.
+   * @deprecated Branches are now first-class entities in their own table.
+   * Use BranchRepository instead.
    */
-  async removeWorktree(): Promise<never> {
-    throw new Error('removeWorktree is deprecated. Use WorktreeRepository.delete() instead.');
+  async removeBranch(): Promise<never> {
+    throw new Error('removeBranch is deprecated. Use BranchRepository.delete() instead.');
   }
 
   /**

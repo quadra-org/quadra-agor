@@ -1,6 +1,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { resolveRepoId, resolveUserId, resolveWorktreeId } from '../resolve-ids.js';
+import { resolveBranchId, resolveRepoId, resolveUserId } from '../resolve-ids.js';
+import { mcpLimit, mcpOffset, mcpOptionalId, mcpOptionalString } from '../schema.js';
 import type { McpContext } from '../server.js';
 import { textResult } from '../server.js';
 
@@ -8,30 +9,28 @@ export function registerAnalyticsTools(server: McpServer, ctx: McpContext): void
   // Tool 1: agor_analytics_leaderboard
   //
   // groupBy accepts a comma-separated combination of the supported dimensions:
-  //   user | worktree | repo | model | tool
+  //   user | branch | repo | model | tool
   // The service itself owns the list of valid dimensions; we keep the schema
   // loose (a string) so new dimensions flow through without a second edit here.
   server.registerTool(
     'agor_analytics_leaderboard',
     {
       description:
-        'Get usage analytics leaderboard showing token, cost, session, and duration breakdown. Supports dynamic grouping by user, worktree, repo, model, and/or tool (freely combined), plus optional time bucketing (hour/day/week/month) for time-series reports.',
+        'Get usage analytics leaderboard showing token, cost, session, and duration breakdown. Supports dynamic grouping by user, branch, repo, model, and/or tool (freely combined), plus optional time bucketing (hour/day/week/month) for time-series reports.',
       annotations: { readOnlyHint: true },
-      inputSchema: z.object({
-        userId: z.string().optional().describe('Filter by user ID (optional)'),
-        worktreeId: z.string().optional().describe('Filter by worktree ID (optional)'),
-        repoId: z.string().optional().describe('Filter by repository ID (optional)'),
-        startDate: z
-          .string()
-          .optional()
-          .describe('Filter by start date (ISO 8601 format, optional)'),
-        endDate: z.string().optional().describe('Filter by end date (ISO 8601 format, optional)'),
-        groupBy: z
-          .string()
-          .optional()
-          .describe(
-            'Comma-separated list of dimensions to group by. Supported: user, worktree, repo, model, tool. Examples: "user", "user,model", "tool,worktree". Default: "user,worktree,repo".'
-          ),
+      inputSchema: z.strictObject({
+        userId: mcpOptionalId('userId', 'User', 'Filter by user ID (optional)'),
+        branchId: mcpOptionalId('branchId', 'Branch', 'Filter by branch ID (optional)'),
+        repoId: mcpOptionalId('repoId', 'Repository', 'Filter by repository ID (optional)'),
+        startDate: mcpOptionalString(
+          'startDate',
+          'Filter by start date (ISO 8601 format, optional)'
+        ),
+        endDate: mcpOptionalString('endDate', 'Filter by end date (ISO 8601 format, optional)'),
+        groupBy: mcpOptionalString(
+          'groupBy',
+          'Comma-separated list of dimensions to group by. Supported: user, branch, repo, model, tool. Examples: "user", "user,model", "tool,branch". Default: "user,branch,repo".'
+        ),
         bucket: z
           .enum(['hour', 'day', 'week', 'month'])
           .optional()
@@ -46,17 +45,14 @@ export function registerAnalyticsTools(server: McpServer, ctx: McpContext): void
           .enum(['asc', 'desc'])
           .optional()
           .describe('Sort order ascending or descending (default: desc)'),
-        limit: z.number().optional().describe('Maximum number of results (default: 50)'),
-        offset: z
-          .number()
-          .optional()
-          .describe('Number of results to skip for pagination (default: 0)'),
+        limit: mcpLimit(50),
+        offset: mcpOffset(0).describe('Number of results to skip for pagination (default: 0)'),
       }),
     },
     async (args) => {
       const query: Record<string, unknown> = {};
       if (args.userId) query.userId = await resolveUserId(ctx, args.userId);
-      if (args.worktreeId) query.worktreeId = await resolveWorktreeId(ctx, args.worktreeId);
+      if (args.branchId) query.branchId = await resolveBranchId(ctx, args.branchId);
       if (args.repoId) query.repoId = await resolveRepoId(ctx, args.repoId);
       if (args.startDate) query.startDate = args.startDate;
       if (args.endDate) query.endDate = args.endDate;

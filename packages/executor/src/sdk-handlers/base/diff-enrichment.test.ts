@@ -4,9 +4,12 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  clearEditFilesTurnBaseline,
   clearToolInvocationState,
   enrichContentBlocks,
   enrichToolResults,
+  refreshEditFilesTurnBaseline,
+  registerEditFilesTurnBaseline,
   registerToolInvocationStart,
   registerToolUses,
 } from './diff-enrichment.js';
@@ -68,6 +71,12 @@ describe('diff enrichment', () => {
     fs.writeFileSync(filePath, 'const value = "old";\n', 'utf-8');
     execSync('git add .', { cwd: repoDir, stdio: 'ignore' });
     execSync('git commit -m "initial"', { cwd: repoDir, stdio: 'ignore' });
+    registerToolInvocationStart(
+      'tool-codex-edit-files-1',
+      'edit_files',
+      { changes: [{ path: 'src/example.ts', kind: 'update' }] },
+      { workingDirectory: repoDir }
+    );
     fs.writeFileSync(filePath, 'const value = "new";\n', 'utf-8');
 
     const contentBlocks: TestContentBlock[] = [
@@ -112,6 +121,12 @@ describe('diff enrichment', () => {
     fs.writeFileSync(realFilePath, 'const value = "old";\n', 'utf-8');
     execSync('git add .', { cwd: repoDir, stdio: 'ignore' });
     execSync('git commit -m "initial"', { cwd: repoDir, stdio: 'ignore' });
+    registerToolInvocationStart(
+      'tool-codex-edit-files-symlink-path-1',
+      'edit_files',
+      { changes: [{ path: aliasFilePath, kind: 'update' }] },
+      { workingDirectory: repoDir }
+    );
     fs.writeFileSync(aliasFilePath, 'const value = "new";\n', 'utf-8');
 
     const contentBlocks: TestContentBlock[] = [
@@ -149,6 +164,12 @@ describe('diff enrichment', () => {
     fs.writeFileSync(filePath, 'const removed = true;\n', 'utf-8');
     execSync('git add .', { cwd: repoDir, stdio: 'ignore' });
     execSync('git commit -m "initial"', { cwd: repoDir, stdio: 'ignore' });
+    registerToolInvocationStart(
+      'tool-codex-edit-files-delete-1',
+      'edit_files',
+      { changes: [{ path: 'src/delete-me.ts', kind: 'delete' }] },
+      { workingDirectory: repoDir }
+    );
     fs.rmSync(filePath);
 
     const contentBlocks: TestContentBlock[] = [
@@ -174,6 +195,244 @@ describe('diff enrichment', () => {
     expect(toolResult.diff?.files?.[0]?.kind).toBe('delete');
     const lines = toolResult.diff?.files?.[0]?.structuredPatch?.[0]?.lines ?? [];
     expect(lines.some((line) => line.includes('-const removed = true;'))).toBe(true);
+  });
+
+  it('does not render dirty untracked edit_files updates as full-file additions without snapshots', () => {
+    const repoDir = createTempGitRepo();
+    fs.writeFileSync(path.join(repoDir, 'README.md'), '# test\n', 'utf-8');
+    execSync('git add .', { cwd: repoDir, stdio: 'ignore' });
+    execSync('git commit -m "initial"', { cwd: repoDir, stdio: 'ignore' });
+
+    const dirtyPath = path.join(repoDir, 'src', 'dirty.ts');
+    fs.mkdirSync(path.dirname(dirtyPath), { recursive: true });
+    fs.writeFileSync(dirtyPath, 'export const value = "pre";\n', 'utf-8');
+    fs.writeFileSync(dirtyPath, 'export const value = "post";\n', 'utf-8');
+
+    const contentBlocks: TestContentBlock[] = [
+      {
+        type: 'tool_use',
+        id: 'tool-codex-edit-files-dirty-untracked-1',
+        name: 'edit_files',
+        input: {
+          changes: [{ path: 'src/dirty.ts', kind: 'update' }],
+        },
+      },
+      {
+        type: 'tool_result',
+        tool_use_id: 'tool-codex-edit-files-dirty-untracked-1',
+        content: '[completed]',
+      },
+    ];
+
+    enrichContentBlocks(contentBlocks, { workingDirectory: repoDir });
+
+    expect(contentBlocks[1].diff).toBeUndefined();
+  });
+
+  it('uses the Codex turn baseline when file_change has no start-time paths', async () => {
+    const repoDir = createTempGitRepo();
+    const filePath = path.join(repoDir, 'src', 'baseline.ts');
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, 'export const value = "before";\n', 'utf-8');
+    execSync('git add .', { cwd: repoDir, stdio: 'ignore' });
+    execSync('git commit -m "initial"', { cwd: repoDir, stdio: 'ignore' });
+
+    await registerEditFilesTurnBaseline({
+      workingDirectory: repoDir,
+      snapshotScope: 'turn-baseline',
+    });
+    fs.writeFileSync(filePath, 'export const value = "after";\n', 'utf-8');
+
+    const contentBlocks: TestContentBlock[] = [
+      {
+        type: 'tool_use',
+        id: 'tool-codex-edit-files-baseline-1',
+        name: 'edit_files',
+        input: { changes: [{ path: 'src/baseline.ts', kind: 'update' }] },
+      },
+      {
+        type: 'tool_result',
+        tool_use_id: 'tool-codex-edit-files-baseline-1',
+        content: '[completed]',
+      },
+    ];
+
+    enrichContentBlocks(contentBlocks, {
+      workingDirectory: repoDir,
+      snapshotScope: 'turn-baseline',
+    });
+    clearEditFilesTurnBaseline({ snapshotScope: 'turn-baseline' });
+
+    const fileDiff = contentBlocks[1].diff?.files?.[0];
+    expect(fileDiff?.path).toBe('src/baseline.ts');
+    expect(fileDiff?.kind).toBe('update');
+    const lines = fileDiff?.structuredPatch?.[0]?.lines ?? [];
+    expect(lines.some((line) => line.includes('-export const value = "before";'))).toBe(true);
+    expect(lines.some((line) => line.includes('+export const value = "after";'))).toBe(true);
+  });
+
+  it('refreshes the Codex turn baseline after each edit_files result', async () => {
+    const repoDir = createTempGitRepo();
+    const filePath = path.join(repoDir, 'src', 'twice.ts');
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, 'export const value = "one";\n', 'utf-8');
+    execSync('git add .', { cwd: repoDir, stdio: 'ignore' });
+    execSync('git commit -m "initial"', { cwd: repoDir, stdio: 'ignore' });
+
+    const context = { workingDirectory: repoDir, snapshotScope: 'turn-refresh' };
+    await registerEditFilesTurnBaseline(context);
+
+    fs.writeFileSync(filePath, 'export const value = "two";\n', 'utf-8');
+    const firstBlocks: TestContentBlock[] = [
+      {
+        type: 'tool_use',
+        id: 'tool-codex-edit-files-refresh-1',
+        name: 'edit_files',
+        input: { changes: [{ path: 'src/twice.ts', kind: 'update' }] },
+      },
+      {
+        type: 'tool_result',
+        tool_use_id: 'tool-codex-edit-files-refresh-1',
+        content: '[completed]',
+      },
+    ];
+    enrichContentBlocks(firstBlocks, context);
+
+    fs.writeFileSync(filePath, 'export const value = "three";\n', 'utf-8');
+    const secondBlocks: TestContentBlock[] = [
+      {
+        type: 'tool_use',
+        id: 'tool-codex-edit-files-refresh-2',
+        name: 'edit_files',
+        input: { changes: [{ path: 'src/twice.ts', kind: 'update' }] },
+      },
+      {
+        type: 'tool_result',
+        tool_use_id: 'tool-codex-edit-files-refresh-2',
+        content: '[completed]',
+      },
+    ];
+    enrichContentBlocks(secondBlocks, context);
+    clearEditFilesTurnBaseline(context);
+
+    const firstLines = firstBlocks[1].diff?.files?.[0]?.structuredPatch?.[0]?.lines ?? [];
+    expect(firstLines.some((line) => line.includes('-export const value = "one";'))).toBe(true);
+    expect(firstLines.some((line) => line.includes('+export const value = "two";'))).toBe(true);
+
+    const secondLines = secondBlocks[1].diff?.files?.[0]?.structuredPatch?.[0]?.lines ?? [];
+    expect(secondLines.some((line) => line.includes('-export const value = "two";'))).toBe(true);
+    expect(secondLines.some((line) => line.includes('+export const value = "three";'))).toBe(true);
+    expect(secondLines.some((line) => line.includes('"one"'))).toBe(false);
+  });
+
+  it('refreshes the Codex turn baseline after a non-edit_files tool mutates a file', async () => {
+    const repoDir = createTempGitRepo();
+    const filePath = path.join(repoDir, 'src', 'after-bash.ts');
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, 'export const value = "one";\n', 'utf-8');
+    execSync('git add .', { cwd: repoDir, stdio: 'ignore' });
+    execSync('git commit -m "initial"', { cwd: repoDir, stdio: 'ignore' });
+
+    const context = { workingDirectory: repoDir, snapshotScope: 'turn-refresh-after-bash' };
+    await registerEditFilesTurnBaseline(context);
+
+    // Simulate a completed Bash/command_execution tool mutating the worktree
+    // before a later Codex file_change/edit_files item updates the same file.
+    fs.writeFileSync(filePath, 'export const value = "two";\n', 'utf-8');
+    await refreshEditFilesTurnBaseline(context);
+
+    fs.writeFileSync(filePath, 'export const value = "three";\n', 'utf-8');
+    const blocks: TestContentBlock[] = [
+      {
+        type: 'tool_use',
+        id: 'tool-codex-edit-files-after-bash',
+        name: 'edit_files',
+        input: { changes: [{ path: 'src/after-bash.ts', kind: 'update' }] },
+      },
+      {
+        type: 'tool_result',
+        tool_use_id: 'tool-codex-edit-files-after-bash',
+        content: '[completed]',
+      },
+    ];
+
+    enrichContentBlocks(blocks, context);
+    clearEditFilesTurnBaseline(context);
+
+    const lines = blocks[1].diff?.files?.[0]?.structuredPatch?.[0]?.lines ?? [];
+    expect(lines.some((line) => line.includes('-export const value = "two";'))).toBe(true);
+    expect(lines.some((line) => line.includes('+export const value = "three";'))).toBe(true);
+    expect(lines.some((line) => line.includes('"one"'))).toBe(false);
+  });
+
+  it('skips tracked symlinks during Codex turn baseline capture', async () => {
+    const repoDir = createTempGitRepo();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agor-diff-enrichment-outside-'));
+    tempDirs.push(outsideDir);
+    const outsideFile = path.join(outsideDir, 'secret.txt');
+    const linkPath = path.join(repoDir, 'linked.txt');
+
+    fs.writeFileSync(outsideFile, 'outside-before\n', 'utf-8');
+    fs.symlinkSync(outsideFile, linkPath);
+    execSync('git add linked.txt', { cwd: repoDir, stdio: 'ignore' });
+    execSync('git commit -m "tracked symlink"', { cwd: repoDir, stdio: 'ignore' });
+
+    const context = { workingDirectory: repoDir, snapshotScope: 'turn-symlink' };
+    await registerEditFilesTurnBaseline(context);
+
+    fs.writeFileSync(outsideFile, 'outside-after\n', 'utf-8');
+    const blocks: TestContentBlock[] = [
+      {
+        type: 'tool_use',
+        id: 'tool-codex-edit-files-symlink',
+        name: 'edit_files',
+        input: { changes: [{ path: 'linked.txt', kind: 'update' }] },
+      },
+      {
+        type: 'tool_result',
+        tool_use_id: 'tool-codex-edit-files-symlink',
+        content: '[completed]',
+      },
+    ];
+
+    enrichContentBlocks(blocks, context);
+    clearEditFilesTurnBaseline(context);
+
+    expect(blocks[1].diff).toBeUndefined();
+  });
+
+  it('skips binary edit_files snapshots instead of rendering bogus text diffs', () => {
+    const repoDir = createTempGitRepo();
+    const filePath = path.join(repoDir, 'asset.bin');
+    fs.writeFileSync(filePath, Buffer.from([0, 1, 2, 3]));
+    execSync('git add .', { cwd: repoDir, stdio: 'ignore' });
+    execSync('git commit -m "initial"', { cwd: repoDir, stdio: 'ignore' });
+
+    registerToolInvocationStart(
+      'tool-codex-edit-files-binary-1',
+      'edit_files',
+      { changes: [{ path: 'asset.bin', kind: 'update' }] },
+      { workingDirectory: repoDir }
+    );
+    fs.writeFileSync(filePath, Buffer.from([0, 1, 9, 3]));
+
+    const contentBlocks: TestContentBlock[] = [
+      {
+        type: 'tool_use',
+        id: 'tool-codex-edit-files-binary-1',
+        name: 'edit_files',
+        input: { changes: [{ path: 'asset.bin', kind: 'update' }] },
+      },
+      {
+        type: 'tool_result',
+        tool_use_id: 'tool-codex-edit-files-binary-1',
+        content: '[completed]',
+      },
+    ];
+
+    enrichContentBlocks(contentBlocks, { workingDirectory: repoDir });
+
+    expect(contentBlocks[1].diff).toBeUndefined();
   });
 
   it('enriches Codex edit_files add operations with relative paths', () => {
@@ -211,6 +470,106 @@ describe('diff enrichment', () => {
     expect(toolResult.diff?.files?.[0]?.kind).toBe('add');
     const lines = toolResult.diff?.files?.[0]?.structuredPatch?.[0]?.lines ?? [];
     expect(lines.some((line) => line.includes('+export const added = true;'))).toBe(true);
+  });
+
+  it('skips symlinks in edit_files add fallback when no baseline is available', () => {
+    const repoDir = createTempGitRepo();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agor-diff-enrichment-add-outside-'));
+    tempDirs.push(outsideDir);
+    const outsideFile = path.join(outsideDir, 'secret.txt');
+    const linkPath = path.join(repoDir, 'linked-add.txt');
+
+    fs.writeFileSync(path.join(repoDir, 'README.md'), '# test\n', 'utf-8');
+    execSync('git add .', { cwd: repoDir, stdio: 'ignore' });
+    execSync('git commit -m "initial"', { cwd: repoDir, stdio: 'ignore' });
+
+    fs.writeFileSync(outsideFile, 'outside secret\n', 'utf-8');
+    fs.symlinkSync(outsideFile, linkPath);
+
+    const contentBlocks: TestContentBlock[] = [
+      {
+        type: 'tool_use',
+        id: 'tool-codex-edit-files-add-symlink',
+        name: 'edit_files',
+        input: { changes: [{ path: 'linked-add.txt', kind: 'add' }] },
+      },
+      {
+        type: 'tool_result',
+        tool_use_id: 'tool-codex-edit-files-add-symlink',
+        content: '[completed]',
+      },
+    ];
+
+    enrichContentBlocks(contentBlocks, { workingDirectory: repoDir });
+
+    expect(contentBlocks[1].diff).toBeUndefined();
+  });
+
+  it('skips binary files in edit_files add fallback when no baseline is available', () => {
+    const repoDir = createTempGitRepo();
+    fs.writeFileSync(path.join(repoDir, 'README.md'), '# test\n', 'utf-8');
+    execSync('git add .', { cwd: repoDir, stdio: 'ignore' });
+    execSync('git commit -m "initial"', { cwd: repoDir, stdio: 'ignore' });
+
+    fs.writeFileSync(path.join(repoDir, 'asset.bin'), Buffer.from([1, 2, 0, 3]));
+
+    const contentBlocks: TestContentBlock[] = [
+      {
+        type: 'tool_use',
+        id: 'tool-codex-edit-files-add-binary',
+        name: 'edit_files',
+        input: { changes: [{ path: 'asset.bin', kind: 'add' }] },
+      },
+      {
+        type: 'tool_result',
+        tool_use_id: 'tool-codex-edit-files-add-binary',
+        content: '[completed]',
+      },
+    ];
+
+    enrichContentBlocks(contentBlocks, { workingDirectory: repoDir });
+
+    expect(contentBlocks[1].diff).toBeUndefined();
+  });
+
+  it('truncates large edit_files add diffs before storing them', () => {
+    const repoDir = createTempGitRepo();
+    const srcDir = path.join(repoDir, 'src');
+    fs.mkdirSync(srcDir, { recursive: true });
+
+    fs.writeFileSync(path.join(repoDir, 'README.md'), '# test\n', 'utf-8');
+    execSync('git add .', { cwd: repoDir, stdio: 'ignore' });
+    execSync('git commit -m "initial"', { cwd: repoDir, stdio: 'ignore' });
+
+    const newFilePath = path.join(srcDir, 'large.ts');
+    const content = Array.from({ length: 250 }, (_, i) => `export const value${i} = ${i};`).join(
+      '\n'
+    );
+    fs.writeFileSync(newFilePath, `${content}\n`, 'utf-8');
+
+    const contentBlocks: TestContentBlock[] = [
+      {
+        type: 'tool_use',
+        id: 'tool-codex-edit-files-large-add-1',
+        name: 'edit_files',
+        input: {
+          changes: [{ path: 'src/large.ts', kind: 'add' }],
+        },
+      },
+      {
+        type: 'tool_result',
+        tool_use_id: 'tool-codex-edit-files-large-add-1',
+        content: '[completed]',
+      },
+    ];
+
+    enrichContentBlocks(contentBlocks, { workingDirectory: repoDir });
+
+    const lines = contentBlocks[1].diff?.files?.[0]?.structuredPatch?.[0]?.lines ?? [];
+    expect(lines).toHaveLength(201);
+    expect(lines[0]).toBe('+export const value0 = 0;');
+    expect(lines[199]).toBe('+export const value199 = 199;');
+    expect(lines[200]).toBe(' [diff output was truncated: showing first 200 of 250 lines]');
   });
 
   it('uses invocation snapshots so add then remove across calls both render correctly', () => {
@@ -355,7 +714,7 @@ describe('diff enrichment', () => {
     expect(linesB.some((line) => line.includes('a-pre'))).toBe(false);
   });
 
-  it('falls back to git HEAD diff after explicit snapshot cleanup', () => {
+  it('does not synthesize edit_files update diffs from HEAD after snapshot cleanup', () => {
     const repoDir = createTempGitRepo();
     const filePath = path.join(repoDir, 'cleanup.ts');
 
@@ -391,22 +750,17 @@ describe('diff enrichment', () => {
 
     enrichContentBlocks(blocks, { workingDirectory: repoDir, snapshotScope: 'scope-cleanup' });
 
-    const lines = blocks[1].diff?.files?.[0]?.structuredPatch?.[0]?.lines ?? [];
-    expect(lines.some((line) => line.includes('-const value = "head";'))).toBe(true);
-    expect(lines.some((line) => line.includes('+const value = "post";'))).toBe(true);
-    expect(lines.some((line) => line.includes('-const value = "pre";'))).toBe(false);
+    expect(blocks[1].diff).toBeUndefined();
   });
 
-  it('skips unsafe relative paths when resolving git HEAD content', () => {
+  it('skips unsafe relative paths when rendering add fallbacks', () => {
     const repoDir = createTempGitRepo();
-    const srcDir = path.join(repoDir, 'src');
-    fs.mkdirSync(srcDir, { recursive: true });
-    const filePath = path.join(srcDir, 'safe.ts');
-
-    fs.writeFileSync(filePath, 'const value = 1;\n', 'utf-8');
+    fs.writeFileSync(path.join(repoDir, 'README.md'), '# test\n', 'utf-8');
     execSync('git add .', { cwd: repoDir, stdio: 'ignore' });
     execSync('git commit -m "initial"', { cwd: repoDir, stdio: 'ignore' });
-    fs.writeFileSync(filePath, 'const value = 2;\n', 'utf-8');
+
+    const outsidePath = path.join(path.dirname(repoDir), 'outside.ts');
+    fs.writeFileSync(outsidePath, 'export const outside = true;\n', 'utf-8');
 
     const contentBlocks: TestContentBlock[] = [
       {
@@ -414,7 +768,7 @@ describe('diff enrichment', () => {
         id: 'tool-codex-edit-files-unsafe-1',
         name: 'edit_files',
         input: {
-          changes: [{ path: '../outside.ts', kind: 'update' }],
+          changes: [{ path: '../outside.ts', kind: 'add' }],
         },
       },
       {

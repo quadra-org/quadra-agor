@@ -4,7 +4,13 @@ import { select } from '../db/database-wrapper';
 import { decryptApiKey } from '../db/encryption';
 import { SessionEnvSelectionRepository } from '../db/repositories/session-env-selections';
 import { users } from '../db/schema';
-import type { GatewayEnvVar, SessionID, UserID } from '../types';
+import type {
+  AgenticToolName,
+  GatewayEnvVar,
+  SessionID,
+  StoredAgenticTools,
+  UserID,
+} from '../types';
 import { filterEnv } from './env-blocklist';
 import { normalizeStoredEnvMap, type StoredEnvVar } from './env-vars';
 
@@ -71,6 +77,8 @@ export const ALLOWED_ENV_VARS = new Set([
   // Node.js (safe subset — NOT NODE_OPTIONS which could inject code)
   'NODE_PATH',
   'NODE_EXTRA_CA_CERTS',
+  // Logging controls. Keep executor log filtering aligned with the daemon.
+  'LOG_LEVEL',
 
   // Git identity
   'GIT_AUTHOR_NAME',
@@ -84,8 +92,10 @@ export const ALLOWED_ENV_VARS = new Set([
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_AUTH_TOKEN',
   'OPENAI_API_KEY',
+  'OPENAI_BASE_URL',
   'GEMINI_API_KEY',
   'GOOGLE_API_KEY',
+  'CURSOR_API_KEY',
 
   // Vertex AI (Claude Code on GCP)
   'CLAUDE_CODE_USE_VERTEX',
@@ -127,7 +137,6 @@ export const AGOR_INTERNAL_ENV_VARS = new Set([
   'UI_PORT',
   'VITE_DAEMON_URL',
   'VITE_DAEMON_PORT',
-  'CODESPACES',
   'RAILWAY_ENVIRONMENT',
   'RENDER',
 ]);
@@ -142,20 +151,38 @@ export interface ResolveUserEnvOptions {
    * included). Global-scope vars are always included.
    *
    * If omitted, session-scope vars are EXCLUDED entirely (safe default for
-   * contexts without a session — e.g. worktree-level terminals).
+   * contexts without a session — e.g. branch-level terminals).
    */
   sessionId?: SessionID;
+  /**
+   * If set, the user's per-tool credentials for THIS tool are merged into the
+   * resolved env (e.g. claude-code → ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL).
+   * Other tools' credentials are NEVER merged regardless of value.
+   *
+   * If omitted, NO per-tool credentials are merged — safe default for
+   * branch-level terminals and other contexts that don't run an SDK.
+   */
+  tool?: AgenticToolName;
 }
 
 /**
- * Resolve user environment variables (decrypted from database, no system env vars)
- * Includes both env_vars and api_keys from user data.
+ * Resolve user environment variables (decrypted from database, no system env vars).
  *
- * Scope filtering (v0.5):
+ * Includes:
+ *   - User-defined env vars from `data.env_vars` (scope-filtered)
+ *   - If `options.tool` is set, the matching tool's credentials from
+ *     `data.agentic_tools[tool]` (e.g. claude-code → ANTHROPIC_API_KEY +
+ *     ANTHROPIC_BASE_URL). Other tools' credentials are NEVER merged.
+ *
+ * Precedence (later wins): tool credentials > user env vars. This matches the
+ * UX intent: per-tool config screens are the explicit, "this is the credential
+ * I want for this SDK" surface; global env vars are the fallback. The caller
+ * (`createUserProcessEnvironment`) layers config.yaml/system env underneath.
+ *
+ * Scope filtering on env_vars (v0.5):
  *   - `scope: 'global'` → always included
  *   - `scope: 'session'` → only included if `options.sessionId` is provided
- *     AND the var name has an entry in `session_env_selections` for that
- *     session.
+ *     AND the var name has an entry in `session_env_selections` for that session.
  *   - Any other scope value (reserved for v1+) is skipped.
  *
  * Legacy entries (plain-string values on disk) are treated as global-scope.
@@ -166,7 +193,7 @@ export async function resolveUserEnvironment(
   options: ResolveUserEnvOptions = {}
 ): Promise<Record<string, string>> {
   const env: Record<string, string> = {};
-  const { sessionId } = options;
+  const { sessionId, tool } = options;
 
   try {
     const row = await select(db).from(users).where(eq(users.user_id, userId)).one();
@@ -174,7 +201,7 @@ export async function resolveUserEnvironment(
     if (row) {
       const data = row.data as {
         env_vars?: Record<string, string | StoredEnvVar>;
-        api_keys?: Record<string, string>;
+        agentic_tools?: StoredAgenticTools;
       };
 
       // Normalize legacy + v0.5 shapes into StoredEnvVar records with scopes.
@@ -193,13 +220,13 @@ export async function resolveUserEnvironment(
         }
       }
 
-      // Decrypt and merge scoped env vars
+      // 1. Decrypt and merge scoped env vars (lower precedence — overridden by tool config)
       for (const [key, entry] of Object.entries(normalized)) {
         // Scope gating
         if (entry.scope === 'global') {
           // always include
         } else if (entry.scope === 'session') {
-          if (!sessionSelections || !sessionSelections.has(key)) {
+          if (!sessionSelections?.has(key)) {
             continue;
           }
         } else {
@@ -217,18 +244,25 @@ export async function resolveUserEnvironment(
         }
       }
 
-      // Decrypt and merge user API keys and base URLs (e.g., OPENAI_API_KEY, ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL)
-      // Only override if the decrypted value is non-empty
-      const encryptedApiKeys = data.api_keys;
-      if (encryptedApiKeys) {
-        for (const [key, encryptedValue] of Object.entries(encryptedApiKeys)) {
-          try {
-            const decryptedValue = decryptApiKey(encryptedValue);
-            if (decryptedValue && decryptedValue.trim() !== '') {
-              env[key] = decryptedValue;
+      // 2. Decrypt and merge ONLY this tool's per-SDK credentials (higher precedence).
+      //    Without `options.tool`, no tool config is merged — this is the fix for the
+      //    cross-SDK credential leak: a Codex spawn never sees ANTHROPIC_API_KEY.
+      if (tool) {
+        const toolFields = data.agentic_tools?.[tool];
+        if (toolFields) {
+          for (const [key, encryptedValue] of Object.entries(toolFields)) {
+            if (!encryptedValue) continue;
+            try {
+              const decryptedValue = decryptApiKey(encryptedValue);
+              if (decryptedValue && decryptedValue.trim() !== '') {
+                env[key] = decryptedValue;
+              }
+            } catch (err) {
+              console.error(
+                `Failed to decrypt agentic_tools.${tool}.${key} for user ${userId}:`,
+                err
+              );
             }
-          } catch (err) {
-            console.error(`Failed to decrypt API key ${key} for user ${userId}:`, err);
           }
         }
       }
@@ -292,7 +326,7 @@ function buildAllowlistedEnv(): Record<string, string> {
 }
 
 /**
- * Create a clean environment for user processes (worktrees, terminals, etc.)
+ * Create a clean environment for user processes (branches, terminals, etc.)
  *
  * SECURITY: Uses an allowlist approach — starts with an empty environment and
  * only copies variables that are explicitly safe. This prevents leaking internal
@@ -312,18 +346,18 @@ function buildAllowlistedEnv(): Record<string, string> {
  * @returns Clean environment object ready for child process spawning
  *
  * @example
- * // For worktree environment startup (with user)
- * const env = await createUserProcessEnvironment(worktree.created_by, db);
+ * // For branch environment startup (with user)
+ * const env = await createUserProcessEnvironment(branch.created_by, db);
  * spawn(command, { cwd, shell: true, env });
  *
  * @example
  * // For user impersonation (strips HOME/USER/LOGNAME/SHELL)
- * const env = await createUserProcessEnvironment(worktree.created_by, db, undefined, true);
+ * const env = await createUserProcessEnvironment(branch.created_by, db, undefined, true);
  * buildSpawnArgs(command, [], { asUser: 'alice', env });
  *
  * @example
- * // For worktree environment with custom NODE_ENV
- * const env = await createUserProcessEnvironment(worktree.created_by, db, {
+ * // For branch environment with custom NODE_ENV
+ * const env = await createUserProcessEnvironment(branch.created_by, db, {
  *   NODE_ENV: 'development',
  * });
  *
@@ -349,7 +383,14 @@ export async function createUserProcessEnvironment(
    * If provided, session-scope env vars selected for this session are
    * included in the user env. Session-scope vars are otherwise excluded.
    */
-  sessionId?: SessionID
+  sessionId?: SessionID,
+  /**
+   * If provided, the user's per-tool credentials for THIS tool are merged
+   * into the environment (e.g. claude-code → ANTHROPIC_*). Other tools'
+   * credentials are NEVER merged. Omit for non-SDK contexts (branch
+   * terminals, generic background jobs).
+   */
+  tool?: AgenticToolName
 ): Promise<Record<string, string>> {
   // SECURITY: Start with allowlisted env vars only — never inherit full process.env
   const env = buildAllowlistedEnv();
@@ -378,9 +419,11 @@ export async function createUserProcessEnvironment(
   }
 
   // 2. Resolve and merge user environment variables (if userId provided)
-  // Only override if values are non-empty — takes precedence over gateway fallback vars
+  // Only override if values are non-empty — takes precedence over gateway fallback vars.
+  // When `tool` is set, only THAT tool's per-SDK credentials are folded in;
+  // other tools' credentials are excluded (cross-SDK credential isolation).
   if (userId && db) {
-    const userEnv = await resolveUserEnvironment(userId, db, { sessionId });
+    const userEnv = await resolveUserEnvironment(userId, db, { sessionId, tool });
     for (const [key, value] of Object.entries(userEnv)) {
       if (value && value.trim() !== '') {
         env[key] = value;
@@ -409,6 +452,36 @@ export async function createUserProcessEnvironment(
         env[key] = value;
       }
     }
+  }
+
+  // If you set one half of GIT_AUTHOR_*/GIT_COMMITTER_* via env, mirror to the other.
+  // Env vars are the multi-tenant identity boundary; falling through to shared
+  // user.* config (or executor-host gitconfig) risks misattribution — see
+  // the 2026-04-20 / 2026-05-20 base-repo user.* leak audits.
+  // Note: if you have author/committer in non-env config AND set only one env var,
+  // this will override the config-derived counterpart with the env value. That's
+  // intentional — setting any identity env signals you mean the env pair to win.
+  if (env.GIT_AUTHOR_NAME && !env.GIT_COMMITTER_NAME) {
+    env.GIT_COMMITTER_NAME = env.GIT_AUTHOR_NAME;
+    console.debug(
+      `[env-resolver] Mirrored GIT_AUTHOR_NAME → GIT_COMMITTER_NAME${userId ? ` for user ${userId}` : ''}`
+    );
+  } else if (env.GIT_COMMITTER_NAME && !env.GIT_AUTHOR_NAME) {
+    env.GIT_AUTHOR_NAME = env.GIT_COMMITTER_NAME;
+    console.debug(
+      `[env-resolver] Mirrored GIT_COMMITTER_NAME → GIT_AUTHOR_NAME${userId ? ` for user ${userId}` : ''}`
+    );
+  }
+  if (env.GIT_AUTHOR_EMAIL && !env.GIT_COMMITTER_EMAIL) {
+    env.GIT_COMMITTER_EMAIL = env.GIT_AUTHOR_EMAIL;
+    console.debug(
+      `[env-resolver] Mirrored GIT_AUTHOR_EMAIL → GIT_COMMITTER_EMAIL${userId ? ` for user ${userId}` : ''}`
+    );
+  } else if (env.GIT_COMMITTER_EMAIL && !env.GIT_AUTHOR_EMAIL) {
+    env.GIT_AUTHOR_EMAIL = env.GIT_COMMITTER_EMAIL;
+    console.debug(
+      `[env-resolver] Mirrored GIT_COMMITTER_EMAIL → GIT_AUTHOR_EMAIL${userId ? ` for user ${userId}` : ''}`
+    );
   }
 
   // Set AGOR_USER_ENV_KEYS to communicate user-defined var keys to child processes

@@ -2,7 +2,7 @@
  * EventItem - Display a single socket event with timestamp, type, and data
  */
 
-import type { AgorClient, Repo, Session, SpawnConfig, User, Worktree } from '@agor-live/client';
+import type { AgorClient, Branch, Repo, Session, SpawnConfig, User } from '@agor-live/client';
 import {
   AimOutlined,
   ApiOutlined,
@@ -12,54 +12,52 @@ import {
   MessageOutlined,
   ThunderboltOutlined,
   ToolOutlined,
-  UserOutlined,
 } from '@ant-design/icons';
 import { Button, Popover, Typography, theme } from 'antd';
 import React from 'react';
 import type { SocketEvent } from '../../hooks/useEventStream';
-import { UserAvatar } from '../metadata/UserAvatar';
-import { EventStreamPill, SessionMetadataCard } from '../Pill';
+import BranchCard from '../BranchCard/BranchCard';
+import { ENTITY_PILL_COLORS, EventStreamPill, SessionMetadataCard, UserPill } from '../Pill';
 import { Tag } from '../Tag';
-import WorktreeCard from '../WorktreeCard/WorktreeCard';
 
 const { Text } = Typography;
 
-export interface WorktreeActions {
+export interface BranchActions {
   onSessionClick?: (sessionId: string) => void;
-  onCreateSession?: (worktreeId: string) => void;
+  onCreateSession?: (branchId: string) => void;
   onForkSession?: (sessionId: string, prompt: string) => Promise<void>;
   onSpawnSession?: (sessionId: string, config: string | Partial<SpawnConfig>) => Promise<void>;
-  onOpenTerminal?: (commands: string[], worktreeId?: string) => void;
-  onStartEnvironment?: (worktreeId: string) => void;
-  onStopEnvironment?: (worktreeId: string) => void;
-  onOpenSettings?: (worktreeId: string) => void;
-  onViewLogs?: (worktreeId: string) => void;
-  onNukeEnvironment?: (worktreeId: string) => void;
+  onOpenTerminal?: (commands: string[], branchId?: string) => void;
+  onStartEnvironment?: (branchId: string) => void;
+  onStopEnvironment?: (branchId: string) => void;
+  onOpenSettings?: (branchId: string) => void;
+  onViewLogs?: (branchId: string) => void;
+  onNukeEnvironment?: (branchId: string) => void;
 }
 
 export interface EventItemProps {
   event: SocketEvent;
-  worktreeById: Map<string, Worktree>;
+  branchById: Map<string, Branch>;
   sessionById: Map<string, Session>;
-  sessionsByWorktree: Map<string, Session[]>;
+  sessionsByBranch: Map<string, Session[]>;
   repos: Repo[];
   userById: Map<string, User>;
   currentUserId?: string;
   selectedSessionId?: string | null;
-  worktreeActions?: WorktreeActions;
+  branchActions?: BranchActions;
   client: AgorClient | null;
 }
 
 const EventItemComponent = ({
   event,
-  worktreeById,
+  branchById,
   sessionById,
-  sessionsByWorktree,
+  sessionsByBranch,
   repos,
   userById,
   currentUserId,
   selectedSessionId,
-  worktreeActions,
+  branchActions,
   client,
 }: EventItemProps): React.JSX.Element => {
   const { token } = theme.useToken();
@@ -138,15 +136,15 @@ const EventItemComponent = ({
     return { entity: eventName };
   };
 
-  // Extract session_id, worktree_id, and created_by from event data
+  // Extract session_id, branch_id, and created_by from event data
   const sessionId =
     event.data && typeof event.data === 'object' && 'session_id' in event.data
       ? (event.data.session_id as string)
       : undefined;
 
-  const worktreeId =
-    event.data && typeof event.data === 'object' && 'worktree_id' in event.data
-      ? (event.data.worktree_id as string)
+  const branchId =
+    event.data && typeof event.data === 'object' && 'branch_id' in event.data
+      ? (event.data.branch_id as string)
       : undefined;
 
   const createdBy =
@@ -156,11 +154,11 @@ const EventItemComponent = ({
 
   // Lookup full objects from maps
   const session = sessionId ? sessionById.get(sessionId) : undefined;
-  // Derive worktree from session if not directly in event data
-  const derivedWorktreeId = worktreeId || session?.worktree_id;
-  const worktree = derivedWorktreeId ? worktreeById.get(derivedWorktreeId) : undefined;
-  const repo = worktree ? repos.find((r) => r.repo_id === worktree.repo_id) : undefined;
-  const worktreeSessions = worktree ? sessionsByWorktree.get(worktree.worktree_id) || [] : [];
+  // Derive branch from session if not directly in event data
+  const derivedBranchId = branchId || session?.branch_id;
+  const branch = derivedBranchId ? branchById.get(derivedBranchId) : undefined;
+  const repo = branch ? repos.find((r) => r.repo_id === branch.repo_id) : undefined;
+  const branchSessions = branch ? sessionsByBranch.get(branch.branch_id) || [] : [];
 
   // Look up user if created_by is present
   const user = createdBy ? userById.get(createdBy) : undefined;
@@ -216,7 +214,7 @@ const EventItemComponent = ({
         {event.type}
       </Tag>
 
-      {/* Entity tag (e.g., "sessions", "worktrees") */}
+      {/* Entity tag (e.g., "sessions", "branches") */}
       {entity && (
         <Tag
           style={{
@@ -272,13 +270,13 @@ const EventItemComponent = ({
         <EventStreamPill
           id={sessionId}
           icon={CodeOutlined}
-          color="cyan"
+          color={ENTITY_PILL_COLORS.session}
           copyLabel="Session ID"
           metadataCard={
             session ? (
               <SessionMetadataCard
                 session={session}
-                worktree={worktree}
+                branch={branch}
                 repo={repo}
                 userById={userById}
                 currentUserId={currentUserId}
@@ -289,36 +287,32 @@ const EventItemComponent = ({
         />
       )}
 
-      {/* Worktree ID pill */}
-      {derivedWorktreeId && worktree && repo && (
+      {/* Branch ID pill */}
+      {derivedBranchId && branch && repo && (
         <EventStreamPill
-          id={derivedWorktreeId}
-          label={worktree.name}
+          id={derivedBranchId}
+          label={branch.name}
           icon={FolderOutlined}
-          color="geekblue"
-          copyLabel="Worktree ID"
+          color={ENTITY_PILL_COLORS.branch}
+          copyLabel="Branch ID"
           metadataCard={
-            <WorktreeCard
-              worktree={worktree}
+            <BranchCard
+              branch={branch}
               repo={repo}
-              sessions={worktreeSessions}
+              sessions={branchSessions}
               userById={userById}
               currentUserId={currentUserId}
               selectedSessionId={selectedSessionId}
               inPopover={true}
               client={client}
-              {...worktreeActions}
+              {...branchActions}
             />
           }
         />
       )}
 
       {/* User pill - shows who triggered this event */}
-      {user && (
-        <Tag icon={<UserOutlined />} color="magenta" style={{ margin: 0, fontSize: 11 }}>
-          <UserAvatar user={user} showName={true} size="small" />
-        </Tag>
-      )}
+      {user && <UserPill user={user} compact style={{ margin: 0, fontSize: 11 }} />}
 
       {event.data ? (
         <Popover content={detailsContent} title="Event Data" trigger="click" placement="left">

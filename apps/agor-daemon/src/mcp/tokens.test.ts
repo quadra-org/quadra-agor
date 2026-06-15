@@ -2,7 +2,7 @@
  * MCP token module tests.
  *
  * Exercises the issue → verify cycle against an in-memory SQLite database.
- * A minimal repo/worktree/session fixture is seeded so the session-existence
+ * A minimal repo/branch/session fixture is seeded so the session-existence
  * check in validate has something to read.
  *
  * Coverage:
@@ -14,6 +14,7 @@
  */
 
 import {
+  branches,
   type Database,
   deleteFrom,
   eq,
@@ -21,7 +22,7 @@ import {
   insert,
   RepoRepository,
   sessions,
-  worktrees,
+  shortId,
 } from '@agor/core/db';
 import type { SessionID, UserID } from '@agor/core/types';
 import jwt from 'jsonwebtoken';
@@ -58,7 +59,7 @@ async function seedSession(
   const repoRepo = new RepoRepository(db);
   const repo = await repoRepo.create({
     repo_id: generateId(),
-    slug: `slug-${opts.sessionId.slice(0, 8)}`,
+    slug: `slug-${shortId(opts.sessionId)}`,
     name: 'Test Repo',
     repo_type: 'remote' as const,
     remote_url: 'https://github.com/test/test.git',
@@ -66,15 +67,16 @@ async function seedSession(
     default_branch: 'main',
   });
 
-  const worktreeId = generateId();
-  await insert(db, worktrees)
+  const branchId = generateId();
+  await insert(db, branches)
     .values({
-      worktree_id: worktreeId,
+      branch_id: branchId,
       repo_id: repo.repo_id,
       created_at: new Date(),
+      created_by: 'test-user',
       name: 'main',
       ref: 'main',
-      worktree_unique_id: 1,
+      branch_unique_id: 1,
       data: { path: '/tmp/test/wt', git_state: { ref_at_start: 'main' } },
     })
     .run();
@@ -85,8 +87,8 @@ async function seedSession(
       created_at: new Date(),
       status: 'idle',
       agentic_tool: 'claude-code',
-      worktree_id: worktreeId,
-      created_by: 'anonymous',
+      branch_id: branchId,
+      created_by: 'test-user',
       data: { genealogy: { children: [] }, contextFiles: [], tasks: [], git_state: {} },
     })
     .run();
@@ -126,18 +128,28 @@ describe('generateSessionToken', () => {
     expect((decoded.exp as number) - (decoded.iat as number)).toBe(60);
   });
 
-  dbTest('each issuance produces a different jti', async ({ db }) => {
-    initMcpTokens({ db });
-    const sessionId = await seedSession(db, { sessionId: generateId() as SessionID });
+  dbTest('reuses cached tokens until they approach expiry', async ({ db }) => {
+    const baseMs = Date.now();
+    vi.useFakeTimers({ now: baseMs, shouldAdvanceTime: false });
+    try {
+      initMcpTokens({ db, expirationMs: 60_000 });
+      const sessionId = await seedSession(db, { sessionId: generateId() as SessionID });
 
-    const t1 = await generateSessionToken(makeApp(), sessionId, 'u' as UserID);
-    const t2 = await generateSessionToken(makeApp(), sessionId, 'u' as UserID);
-    const d1 = jwt.decode(t1) as { jti?: string };
-    const d2 = jwt.decode(t2) as { jti?: string };
+      const t1 = await generateSessionToken(makeApp(), sessionId, 'u' as UserID);
+      const t2 = await generateSessionToken(makeApp(), sessionId, 'u' as UserID);
+      expect(t2).toBe(t1);
 
-    expect(d1.jti).toBeDefined();
-    expect(d2.jti).toBeDefined();
-    expect(d1.jti).not.toBe(d2.jti);
+      vi.setSystemTime(new Date(baseMs + 31_000));
+      const t3 = await generateSessionToken(makeApp(), sessionId, 'u' as UserID);
+      const d1 = jwt.decode(t1) as { jti?: string };
+      const d3 = jwt.decode(t3) as { jti?: string };
+
+      expect(d1.jti).toBeDefined();
+      expect(d3.jti).toBeDefined();
+      expect(d3.jti).not.toBe(d1.jti);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   dbTest('throws when the session does not exist', async ({ db }) => {

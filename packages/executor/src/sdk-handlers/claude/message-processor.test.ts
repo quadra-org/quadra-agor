@@ -12,6 +12,101 @@ function rateLimitMsg(info: Record<string, unknown>) {
   return { type: 'rate_limit_event', rate_limit_info: info } as never;
 }
 
+function systemMsg(payload: Record<string, unknown>) {
+  return { type: 'system', ...payload } as never;
+}
+
+describe('SDKMessageProcessor system event suppression', () => {
+  it('suppresses status=requesting (PR #1116)', async () => {
+    const processor = createProcessor();
+    const events = await processor.process(
+      systemMsg({ subtype: 'status', status: 'requesting', session_id: 's', uuid: 'u' })
+    );
+    expect(events.filter((e) => e.type === 'sdk_event')).toHaveLength(0);
+  });
+
+  it('suppresses task_updated, including patches with an error field', async () => {
+    const processor = createProcessor();
+    const events = await processor.process(
+      systemMsg({
+        subtype: 'task_updated',
+        task_id: 't1',
+        patch: { status: 'failed', error: 'boom' },
+        session_id: 's',
+        uuid: 'u',
+      })
+    );
+    expect(events.filter((e) => e.type === 'sdk_event')).toHaveLength(0);
+  });
+
+  it('suppresses hook lifecycle telemetry', async () => {
+    const processor = createProcessor();
+
+    for (const subtype of ['hook_started', 'hook_progress', 'hook_response']) {
+      const events = await processor.process(
+        systemMsg({
+          subtype,
+          hook_event_name: 'PreToolUse',
+          session_id: 's',
+          uuid: `u-${subtype}`,
+        })
+      );
+      expect(events.filter((e) => e.type === 'sdk_event')).toHaveLength(0);
+    }
+  });
+
+  it('suppresses thinking token telemetry', async () => {
+    const processor = createProcessor();
+    const events = await processor.process(
+      systemMsg({
+        subtype: 'thinking_tokens',
+        thinking_tokens: 1234,
+        session_id: 's',
+        uuid: 'u',
+      })
+    );
+    expect(events.filter((e) => e.type === 'sdk_event')).toHaveLength(0);
+  });
+
+  it('surfaces failed hook responses for diagnostics', async () => {
+    const processor = createProcessor();
+    const events = await processor.process(
+      systemMsg({
+        subtype: 'hook_response',
+        hook_event: 'PreToolUse',
+        outcome: 'error',
+        stderr: 'hook failed',
+        exit_code: 1,
+        session_id: 's',
+        uuid: 'u',
+      })
+    );
+
+    const sdkEvents = events.filter((e) => e.type === 'sdk_event');
+    expect(sdkEvents).toHaveLength(1);
+    const event = sdkEvents[0] as Extract<ProcessedEvent, { type: 'sdk_event' }>;
+    expect(event.sdkSubtype).toBe('hook_response');
+  });
+
+  it('surfaces user-meaningful system subtypes (e.g. mirror_error)', async () => {
+    const processor = createProcessor();
+    const events = await processor.process(
+      systemMsg({
+        subtype: 'mirror_error',
+        error: 'disk full',
+        key: { projectKey: 'p', sessionId: 's' },
+        session_id: 's',
+        uuid: 'u',
+      })
+    );
+    const sdkEvents = events.filter((e) => e.type === 'sdk_event');
+    expect(sdkEvents).toHaveLength(1);
+    const event = sdkEvents[0] as Extract<ProcessedEvent, { type: 'sdk_event' }>;
+    expect(event.sdkType).toBe('system');
+    expect(event.sdkSubtype).toBe('mirror_error');
+  });
+});
+
 describe('SDKMessageProcessor rate_limit_event handling', () => {
   it('suppresses allowed status with no overage concern', async () => {
     const processor = createProcessor();

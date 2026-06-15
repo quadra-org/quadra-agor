@@ -5,7 +5,7 @@
  * Each tool tab displays its API key configuration and tool-specific settings.
  */
 
-import type { AgorClient, AgorConfig } from '@agor-live/client';
+import type { AgenticToolName, AgorClient, AgorConfig } from '@agor-live/client';
 import {
   CheckCircleOutlined,
   CloseCircleOutlined,
@@ -16,22 +16,52 @@ import {
 import { Alert, Button, Form, Input, Space, Spin, Switch, Tabs, Tooltip, theme } from 'antd';
 import { useEffect, useState } from 'react';
 import { useThemedMessage } from '../../utils/message';
-import { ApiKeyFields, type ApiKeyStatus } from '../ApiKeyFields';
+import {
+  type AgenticToolFieldConfig,
+  ApiKeyFields,
+  type FieldStatus,
+  TOOL_FIELD_CONFIGS,
+} from '../ApiKeyFields';
 
 export interface AgenticToolsSectionProps {
   client: AgorClient | null;
 }
 
-// Helper component for API key tabs
+/**
+ * Field set rendered at the global/admin config level. This is a strict
+ * subset of the per-user `TOOL_FIELD_CONFIGS` — fields that don't make sense
+ * globally (e.g. `CLAUDE_CODE_OAUTH_TOKEN` is a per-user Pro/Max subscription
+ * token) are filtered out.
+ */
+const GLOBAL_TOOL_FIELDS: Record<AgenticToolName, AgenticToolFieldConfig[]> = {
+  'claude-code': TOOL_FIELD_CONFIGS['claude-code'].filter(
+    (f) => f.field !== 'CLAUDE_CODE_OAUTH_TOKEN'
+  ),
+  // Claude Code CLI shares credentials with the SDK path. Same filter
+  // (OAUTH_TOKEN is per-user only).
+  'claude-code-cli': TOOL_FIELD_CONFIGS['claude-code-cli'].filter(
+    (f) => f.field !== 'CLAUDE_CODE_OAUTH_TOKEN'
+  ),
+  // OPENAI_BASE_URL is per-user only: in multiplayer Agor instances hosting
+  // multiple companies, a global override would silently route every user's
+  // Codex traffic through one tenant's endpoint. Each user sets their own.
+  codex: TOOL_FIELD_CONFIGS.codex.filter((f) => f.field !== 'OPENAI_BASE_URL'),
+  gemini: TOOL_FIELD_CONFIGS.gemini,
+  copilot: TOOL_FIELD_CONFIGS.copilot,
+  cursor: TOOL_FIELD_CONFIGS.cursor,
+  opencode: TOOL_FIELD_CONFIGS.opencode,
+};
+
+/** Per-tool global-config tab body. */
 const ApiKeyTabContent: React.FC<{
-  keyField: keyof ApiKeyStatus;
-  keyStatus: Partial<ApiKeyStatus>;
+  tool: AgenticToolName;
+  fieldStatus: FieldStatus;
   keysError: string | null;
   savingKeys: Record<string, boolean>;
-  onSave: (field: keyof ApiKeyStatus, value: string) => Promise<void>;
-  onClear: (field: keyof ApiKeyStatus) => Promise<void>;
+  onSave: (field: string, value: string) => Promise<void>;
+  onClear: (field: string) => Promise<void>;
   onClearError: () => void;
-}> = ({ keyField, keyStatus, keysError, savingKeys, onSave, onClear, onClearError }) => {
+}> = ({ tool, fieldStatus, keysError, savingKeys, onSave, onClear, onClearError }) => {
   const { token } = theme.useToken();
 
   return (
@@ -68,7 +98,9 @@ const ApiKeyTabContent: React.FC<{
       )}
 
       <ApiKeyFields
-        keyStatus={{ [keyField]: keyStatus[keyField] }}
+        tool={tool}
+        fields={GLOBAL_TOOL_FIELDS[tool]}
+        fieldStatus={fieldStatus}
         onSave={onSave}
         onClear={onClear}
         saving={savingKeys}
@@ -81,16 +113,13 @@ export const AgenticToolsSection: React.FC<AgenticToolsSectionProps> = ({ client
   const { token } = theme.useToken();
   const { showSuccess, showError } = useThemedMessage();
 
-  // Shared API keys state
+  // Shared API keys state. `fieldStatus` is a flat env-var → set/unset map;
+  // each per-tool tab projects out only the fields it owns via
+  // `GLOBAL_TOOL_FIELDS[tool]`.
   const [loadingKeys, setLoadingKeys] = useState(true);
   const [savingKeys, setSavingKeys] = useState<Record<string, boolean>>({});
   const [keysError, setKeysError] = useState<string | null>(null);
-  const [keyStatus, setKeyStatus] = useState<ApiKeyStatus>({
-    ANTHROPIC_API_KEY: false,
-    OPENAI_API_KEY: false,
-    GEMINI_API_KEY: false,
-    COPILOT_GITHUB_TOKEN: false,
-  });
+  const [fieldStatus, setFieldStatus] = useState<FieldStatus>({});
 
   // OpenCode state
   const [opencodeForm] = Form.useForm();
@@ -99,11 +128,6 @@ export const AgenticToolsSection: React.FC<AgenticToolsSectionProps> = ({ client
   const [opencodeConnected, setOpencodeConnected] = useState<boolean | null>(null);
   const [opencodeTesting, setOpencodeTesting] = useState(false);
   const [loadingOpencode, setLoadingOpencode] = useState(true);
-  const defaultCodexHome = '~/.agor/codex';
-  const [codexHome, setCodexHome] = useState(defaultCodexHome);
-  const [initialCodexHome, setInitialCodexHome] = useState(defaultCodexHome);
-  const [loadingCodexConfig, setLoadingCodexConfig] = useState(true);
-  const [savingCodexHome, setSavingCodexHome] = useState(false);
 
   // Load API keys configuration
   useEffect(() => {
@@ -118,12 +142,17 @@ export const AgenticToolsSection: React.FC<AgenticToolsSectionProps> = ({ client
           | AgorConfig['credentials']
           | undefined;
 
-        setKeyStatus({
-          ANTHROPIC_API_KEY: !!config?.ANTHROPIC_API_KEY,
-          OPENAI_API_KEY: !!config?.OPENAI_API_KEY,
-          GEMINI_API_KEY: !!config?.GEMINI_API_KEY,
-          COPILOT_GITHUB_TOKEN: !!(config as Record<string, unknown>)?.COPILOT_GITHUB_TOKEN,
-        });
+        // Project the YAML credentials blob into a flat env-var → boolean
+        // map. We deliberately walk the union of all global tool fields
+        // (rather than enumerating each one inline) so adding a new field
+        // to GLOBAL_TOOL_FIELDS auto-propagates here.
+        const next: FieldStatus = {};
+        for (const fields of Object.values(GLOBAL_TOOL_FIELDS)) {
+          for (const { field } of fields) {
+            next[field] = !!(config as Record<string, unknown> | undefined)?.[field];
+          }
+        }
+        setFieldStatus(next);
       } catch (err) {
         console.error('Failed to load API keys:', err);
         setKeysError(err instanceof Error ? err.message : 'Failed to load API keys');
@@ -162,31 +191,8 @@ export const AgenticToolsSection: React.FC<AgenticToolsSectionProps> = ({ client
     loadOpenCode();
   }, [client]);
 
-  // Load Codex configuration
-  useEffect(() => {
-    if (!client) return;
-
-    const loadCodex = async () => {
-      try {
-        setLoadingCodexConfig(true);
-        const config = (await client.service('config').get('codex')) as { home?: string } | null;
-        const home = config?.home || defaultCodexHome;
-        setCodexHome(home);
-        setInitialCodexHome(home);
-      } catch (err) {
-        console.error('Failed to load Codex config:', err);
-        setCodexHome(defaultCodexHome);
-        setInitialCodexHome(defaultCodexHome);
-      } finally {
-        setLoadingCodexConfig(false);
-      }
-    };
-
-    loadCodex();
-  }, [client]);
-
   // Save API key
-  const handleSaveKey = async (field: keyof ApiKeyStatus, value: string) => {
+  const handleSaveKey = async (field: string, value: string) => {
     if (!client) return;
 
     try {
@@ -199,7 +205,7 @@ export const AgenticToolsSection: React.FC<AgenticToolsSectionProps> = ({ client
         },
       });
 
-      setKeyStatus((prev) => ({ ...prev, [field]: true }));
+      setFieldStatus((prev) => ({ ...prev, [field]: true }));
     } catch (err) {
       console.error(`Failed to save ${field}:`, err);
       setKeysError(err instanceof Error ? err.message : `Failed to save ${field}`);
@@ -210,7 +216,7 @@ export const AgenticToolsSection: React.FC<AgenticToolsSectionProps> = ({ client
   };
 
   // Clear API key
-  const handleClearKey = async (field: keyof ApiKeyStatus) => {
+  const handleClearKey = async (field: string) => {
     if (!client) return;
 
     try {
@@ -223,39 +229,13 @@ export const AgenticToolsSection: React.FC<AgenticToolsSectionProps> = ({ client
         },
       });
 
-      setKeyStatus((prev) => ({ ...prev, [field]: false }));
+      setFieldStatus((prev) => ({ ...prev, [field]: false }));
     } catch (err) {
       console.error(`Failed to clear ${field}:`, err);
       setKeysError(err instanceof Error ? err.message : `Failed to clear ${field}`);
       throw err;
     } finally {
       setSavingKeys((prev) => ({ ...prev, [field]: false }));
-    }
-  };
-
-  const handleSaveCodexHome = async () => {
-    if (!client) return;
-
-    const trimmed = codexHome.trim();
-    if (!trimmed) {
-      showError('Codex home directory cannot be empty');
-      return;
-    }
-
-    try {
-      setSavingCodexHome(true);
-      await client.service('config').patch(null, {
-        codex: {
-          home: trimmed,
-        },
-      });
-      setInitialCodexHome(trimmed);
-      showSuccess('Codex home updated');
-    } catch (err) {
-      console.error('Failed to save Codex home:', err);
-      showError(err instanceof Error ? err.message : 'Failed to save Codex home');
-    } finally {
-      setSavingCodexHome(false);
     }
   };
 
@@ -298,8 +278,7 @@ export const AgenticToolsSection: React.FC<AgenticToolsSectionProps> = ({ client
     }
   };
 
-  const codexHomeChanged = codexHome !== initialCodexHome;
-  const loading = loadingKeys || loadingOpencode || loadingCodexConfig;
+  const loading = loadingKeys || loadingOpencode;
 
   if (loading) {
     return (
@@ -320,8 +299,8 @@ export const AgenticToolsSection: React.FC<AgenticToolsSectionProps> = ({ client
             label: 'Claude Code',
             children: (
               <ApiKeyTabContent
-                keyField="ANTHROPIC_API_KEY"
-                keyStatus={keyStatus}
+                tool="claude-code"
+                fieldStatus={fieldStatus}
                 keysError={keysError}
                 savingKeys={savingKeys}
                 onSave={handleSaveKey}
@@ -334,53 +313,15 @@ export const AgenticToolsSection: React.FC<AgenticToolsSectionProps> = ({ client
             key: 'codex',
             label: 'Codex',
             children: (
-              <div
-                style={{
-                  paddingTop: token.paddingMD,
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: token.marginXL,
-                }}
-              >
-                <ApiKeyTabContent
-                  keyField="OPENAI_API_KEY"
-                  keyStatus={keyStatus}
-                  keysError={keysError}
-                  savingKeys={savingKeys}
-                  onSave={handleSaveKey}
-                  onClear={handleClearKey}
-                  onClearError={() => setKeysError(null)}
-                />
-
-                <Form layout="vertical">
-                  <Form.Item
-                    label="Codex home directory"
-                    extra="Agor sets CODEX_HOME before launching Codex. Point this at another directory to reuse an existing Codex configuration."
-                  >
-                    <Input
-                      value={codexHome}
-                      onChange={(event) => setCodexHome(event.target.value)}
-                      placeholder={defaultCodexHome}
-                    />
-                  </Form.Item>
-                  <Space>
-                    <Button
-                      type="primary"
-                      onClick={handleSaveCodexHome}
-                      disabled={!codexHomeChanged}
-                      loading={savingCodexHome}
-                    >
-                      Save Codex home
-                    </Button>
-                    <Button
-                      onClick={() => setCodexHome(defaultCodexHome)}
-                      disabled={codexHome === defaultCodexHome}
-                    >
-                      Reset to default
-                    </Button>
-                  </Space>
-                </Form>
-              </div>
+              <ApiKeyTabContent
+                tool="codex"
+                fieldStatus={fieldStatus}
+                keysError={keysError}
+                savingKeys={savingKeys}
+                onSave={handleSaveKey}
+                onClear={handleClearKey}
+                onClearError={() => setKeysError(null)}
+              />
             ),
           },
           {
@@ -388,8 +329,8 @@ export const AgenticToolsSection: React.FC<AgenticToolsSectionProps> = ({ client
             label: 'Gemini',
             children: (
               <ApiKeyTabContent
-                keyField="GEMINI_API_KEY"
-                keyStatus={keyStatus}
+                tool="gemini"
+                fieldStatus={fieldStatus}
                 keysError={keysError}
                 savingKeys={savingKeys}
                 onSave={handleSaveKey}
@@ -403,8 +344,23 @@ export const AgenticToolsSection: React.FC<AgenticToolsSectionProps> = ({ client
             label: 'GitHub Copilot',
             children: (
               <ApiKeyTabContent
-                keyField="COPILOT_GITHUB_TOKEN"
-                keyStatus={keyStatus}
+                tool="copilot"
+                fieldStatus={fieldStatus}
+                keysError={keysError}
+                savingKeys={savingKeys}
+                onSave={handleSaveKey}
+                onClear={handleClearKey}
+                onClearError={() => setKeysError(null)}
+              />
+            ),
+          },
+          {
+            key: 'cursor',
+            label: 'Cursor SDK',
+            children: (
+              <ApiKeyTabContent
+                tool="cursor"
+                fieldStatus={fieldStatus}
                 keysError={keysError}
                 savingKeys={savingKeys}
                 onSave={handleSaveKey}

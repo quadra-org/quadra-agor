@@ -1,4 +1,5 @@
 import type { CodexApprovalPolicy, CodexSandboxMode, PermissionMode } from '@agor-live/client';
+import { getDefaultPermissionMode, mapToCodexPermissionConfig } from '@agor-live/client';
 import {
   EditOutlined,
   ExperimentOutlined,
@@ -19,9 +20,27 @@ interface ModeOption {
 export interface PermissionModeSelectorProps {
   value?: PermissionMode;
   onChange?: (value: PermissionMode) => void;
-  agentic_tool?: 'claude-code' | 'codex' | 'gemini' | 'opencode' | 'copilot';
+  agentic_tool?:
+    | 'claude-code'
+    | 'claude-code-cli'
+    | 'codex'
+    | 'gemini'
+    | 'opencode'
+    | 'copilot'
+    | 'cursor';
   /** If true, renders as a compact Select dropdown instead of Radio buttons */
   compact?: boolean;
+  /**
+   * When in Select (compact) mode, render only the icon in the trigger.
+   * Defaults to `false` — trigger shows icon + label so users in roomy
+   * contexts (e.g. session settings dropdown) can read the mode name.
+   * Set `true` for tight surfaces like the conversation footer where
+   * only the icon fits. The tooltip preserves the label either way.
+   */
+  iconOnly?: boolean;
+  /** Render compact selects with plain text labels (useful in popovers/forms). */
+  plain?: boolean;
+  fullWidth?: boolean;
   /** Size for compact mode */
   size?: 'small' | 'middle' | 'large';
   /** Codex-specific: sandbox mode value */
@@ -121,7 +140,7 @@ const GEMINI_MODES: ModeOption[] = [
   },
 ];
 
-// Copilot permission modes (GitHub Copilot SDK - same semantics as Claude Code)
+// Copilot autonomous permission modes.
 const COPILOT_MODES: ModeOption[] = [
   {
     mode: 'default',
@@ -143,6 +162,19 @@ const COPILOT_MODES: ModeOption[] = [
     description: 'Auto-approve all operations without prompting',
     icon: <UnlockOutlined />,
     color: '#faad14', // Orange/yellow
+  },
+];
+
+// Cursor SDK is currently autonomous in Agor: @cursor/sdk does not expose a
+// blocking permission callback that we can proxy to the Agor UI. Keep the UI
+// honest by showing only the effective mode instead of borrowed Copilot modes.
+const CURSOR_MODES: ModeOption[] = [
+  {
+    mode: 'bypassPermissions',
+    label: 'Autonomous',
+    description: 'Cursor SDK runs autonomously; Agor cannot intercept permission requests yet',
+    icon: <UnlockOutlined />,
+    color: '#faad14',
   },
 ];
 
@@ -225,21 +257,10 @@ const getModesForTool = (tool: PermissionModeSelectorProps['agentic_tool']): Mod
       return OPENCODE_MODES;
     case 'copilot':
       return COPILOT_MODES;
+    case 'cursor':
+      return CURSOR_MODES;
     default:
       return CLAUDE_CODE_MODES;
-  }
-};
-
-/** Get the default permission mode for a given agentic tool */
-const getDefaultMode = (tool: PermissionModeSelectorProps['agentic_tool']): PermissionMode => {
-  switch (tool) {
-    case 'codex':
-      return 'auto';
-    case 'gemini':
-    case 'opencode':
-      return 'autoEdit';
-    default:
-      return 'acceptEdits';
   }
 };
 
@@ -248,14 +269,26 @@ export const PermissionModeSelector: React.FC<PermissionModeSelectorProps> = ({
   onChange,
   agentic_tool = 'claude-code',
   compact = false,
+  iconOnly = false,
+  plain = false,
+  fullWidth = false,
   size = 'middle',
-  codexSandboxMode = 'workspace-write',
-  codexApprovalPolicy = 'on-request',
+  codexSandboxMode,
+  codexApprovalPolicy,
   onCodexChange,
 }) => {
   const { token } = theme.useToken();
   const modes = getModesForTool(agentic_tool);
-  const effectiveValue = value || getDefaultMode(agentic_tool);
+  const effectiveValue =
+    agentic_tool === 'cursor'
+      ? 'bypassPermissions'
+      : value || getDefaultPermissionMode(agentic_tool);
+  // Fill Codex prop defaults from the resolved mode so the dropdown shows
+  // the same values the executor will actually run with for a session
+  // missing explicit sub-config.
+  const codexDefaults = mapToCodexPermissionConfig(effectiveValue);
+  const effectiveCodexSandboxMode = codexSandboxMode ?? codexDefaults.sandboxMode;
+  const effectiveCodexApprovalPolicy = codexApprovalPolicy ?? codexDefaults.approvalPolicy;
 
   // Compact mode: render as Select dropdown(s)
   if (compact) {
@@ -263,14 +296,18 @@ export const PermissionModeSelector: React.FC<PermissionModeSelectorProps> = ({
     // (used by SessionPanel for inline Codex controls)
     if (agentic_tool === 'codex' && onCodexChange) {
       return (
-        <Space size={4}>
+        <Space size={4} direction={fullWidth ? 'vertical' : 'horizontal'} style={{ width: '100%' }}>
           <Select
-            value={codexSandboxMode}
-            onChange={(val) => onCodexChange(val, codexApprovalPolicy)}
+            value={effectiveCodexSandboxMode}
+            onChange={(val) => onCodexChange(val, effectiveCodexApprovalPolicy)}
             size={size}
             placeholder="Sandbox"
             popupMatchSelectWidth={false}
-            style={{ minWidth: 70, fontSize: token.fontSizeSM }}
+            style={{
+              minWidth: 70,
+              width: fullWidth ? '100%' : undefined,
+              fontSize: token.fontSizeSM,
+            }}
             optionLabelProp="label"
             options={CODEX_SANDBOX_MODES.map(({ value, label, description }) => ({
               label,
@@ -287,12 +324,16 @@ export const PermissionModeSelector: React.FC<PermissionModeSelectorProps> = ({
             )}
           />
           <Select
-            value={codexApprovalPolicy}
-            onChange={(val) => onCodexChange(codexSandboxMode, val)}
+            value={effectiveCodexApprovalPolicy}
+            onChange={(val) => onCodexChange(effectiveCodexSandboxMode, val)}
             size={size}
             placeholder="Approval"
             popupMatchSelectWidth={false}
-            style={{ minWidth: 70, fontSize: token.fontSizeSM }}
+            style={{
+              minWidth: 70,
+              width: fullWidth ? '100%' : undefined,
+              fontSize: token.fontSizeSM,
+            }}
             optionLabelProp="label"
             options={CODEX_APPROVAL_POLICIES.map(({ value, label, description }) => ({
               label,
@@ -324,12 +365,21 @@ export const PermissionModeSelector: React.FC<PermissionModeSelectorProps> = ({
         <Select
           value={effectiveValue}
           onChange={onChange}
-          style={{ fontSize: token.fontSizeSM }}
+          style={{ fontSize: token.fontSizeSM, width: fullWidth ? '100%' : undefined }}
           size={size}
           popupMatchSelectWidth={false}
           optionLabelProp="label"
           options={modes.map(({ mode, label, description, icon, color }) => ({
-            label: <span style={{ color, fontSize: token.fontSizeSM }}>{icon}</span>,
+            label: plain ? (
+              label
+            ) : iconOnly ? (
+              <span style={{ color, fontSize: token.fontSizeSM }}>{icon}</span>
+            ) : (
+              <Space size={4} style={{ fontSize: token.fontSizeSM }}>
+                <span style={{ color }}>{icon}</span>
+                <span>{label}</span>
+              </Space>
+            ),
             value: mode,
             title: description,
             icon,

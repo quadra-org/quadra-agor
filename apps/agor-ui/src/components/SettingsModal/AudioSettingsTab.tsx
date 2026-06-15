@@ -105,7 +105,7 @@ export const AudioSettingsTab: React.FC<AudioSettingsTabProps> = ({ user, form }
           type="warning"
           showIcon
           icon={<InfoCircleOutlined />}
-          message="Browser Audio Permissions Required"
+          title="Browser Audio Permissions Required"
           description={
             <div>
               <p style={{ marginBottom: 8 }}>
@@ -223,18 +223,19 @@ export const AudioSettingsTab: React.FC<AudioSettingsTabProps> = ({ user, form }
             <Form.Item noStyle shouldUpdate={(prev, curr) => prev.enabled !== curr.enabled}>
               {() => (
                 <Form.Item
-                  name="minDurationSeconds"
                   label="Minimum Task Duration"
                   tooltip="Only play chime for tasks that take longer than this. Set to 0 to always play."
                 >
                   <Space.Compact style={{ width: '100%' }}>
-                    <InputNumber
-                      min={MIN_DURATION_MIN}
-                      max={MIN_DURATION_MAX}
-                      step={1}
-                      style={{ width: '100%' }}
-                      disabled={!form.getFieldValue('enabled')}
-                    />
+                    <Form.Item name="minDurationSeconds" noStyle>
+                      <InputNumber
+                        min={MIN_DURATION_MIN}
+                        max={MIN_DURATION_MAX}
+                        step={1}
+                        style={{ width: '100%' }}
+                        disabled={!form.getFieldValue('enabled')}
+                      />
+                    </Form.Item>
                     <Input
                       value="seconds"
                       disabled

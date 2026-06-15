@@ -8,6 +8,8 @@
 
 import type { AgorClient } from '@agor/core/api';
 import type {
+  Branch,
+  BranchID,
   MCPServer,
   MCPServerFilters,
   MCPServerID,
@@ -18,8 +20,6 @@ import type {
   SessionID,
   SessionMCPServer,
   User,
-  Worktree,
-  WorktreeID,
 } from '@agor/core/types';
 
 /**
@@ -77,15 +77,15 @@ export class FeathersSessionsRepository {
 }
 
 /**
- * Worktrees Repository - proxies to 'worktrees' Feathers service
+ * Branches Repository - proxies to 'branches' Feathers service
  */
-export class FeathersWorktreesRepository {
+export class FeathersBranchesRepository {
   constructor(private client: AgorClient) {}
 
-  async findById(worktreeId: WorktreeID): Promise<Worktree | null> {
+  async findById(branchId: BranchID): Promise<Branch | null> {
     try {
-      const service = this.client.service('worktrees');
-      return await service.get(worktreeId);
+      const service = this.client.service('branches');
+      return await service.get(branchId);
     } catch (_error) {
       return null;
     }
@@ -191,32 +191,32 @@ export class FeathersSessionMCPServersRepository {
    * @returns Array of MCPServer objects
    */
   async listServers(sessionId: SessionID, enabledOnly?: boolean): Promise<MCPServer[]> {
-    // Get session-mcp-server join records
-    const query: Record<string, unknown> = {
-      session_id: sessionId,
-      $limit: 1000,
-    };
+    const service = this.client.service(`/sessions/${sessionId}/mcp-servers`);
+    const query: Record<string, unknown> = {};
 
     if (enabledOnly) {
-      query.enabled = true;
+      query.enabledOnly = true;
     }
 
-    const sessionMCPService = this.client.service('session-mcp-servers');
-    const result = await sessionMCPService.find({ query });
-    const sessionMCPServers = (Array.isArray(result) ? result : result.data) as SessionMCPServer[];
+    const result = await service.find({ query });
+    return (Array.isArray(result) ? result : result.data) as MCPServer[];
+  }
 
-    // Get full MCPServer objects for each join record
-    const mcpServerService = this.client.service('mcp-servers');
-    const servers: MCPServer[] = [];
+  /**
+   * List the effective MCP servers for a session (global + session-assigned).
+   * Executors use the session-scoped route so session-token callers can receive
+   * the raw config needed to launch only their own session's MCP servers.
+   */
+  async listEffectiveServers(sessionId: SessionID, enabledOnly?: boolean): Promise<MCPServer[]> {
+    const service = this.client.service(`/sessions/${sessionId}/mcp-servers`);
+    const query: Record<string, unknown> = { includeGlobal: true };
 
-    for (const link of sessionMCPServers) {
-      try {
-        const server = await mcpServerService.get(link.mcp_server_id);
-        servers.push(server);
-      } catch (_error) {}
+    if (enabledOnly) {
+      query.enabledOnly = true;
     }
 
-    return servers;
+    const result = await service.find({ query });
+    return (Array.isArray(result) ? result : result.data) as MCPServer[];
   }
 
   /**
@@ -230,38 +230,19 @@ export class FeathersSessionMCPServersRepository {
     sessionId: SessionID,
     enabledOnly = false
   ): Promise<Array<{ server: MCPServer; added_at: number; enabled: boolean }>> {
-    // Get session-mcp-server join records
-    const query: Record<string, unknown> = {
-      session_id: sessionId,
-      $limit: 1000,
-    };
+    const service = this.client.service(`/sessions/${sessionId}/mcp-servers`);
+    const query: Record<string, unknown> = { includeMetadata: true };
 
     if (enabledOnly) {
-      query.enabled = true;
+      query.enabledOnly = true;
     }
 
-    const sessionMCPService = this.client.service('session-mcp-servers');
-    const result = await sessionMCPService.find({ query });
-    const sessionMCPServers = (Array.isArray(result) ? result : result.data) as SessionMCPServer[];
-
-    // Get full MCPServer objects with metadata for each join record
-    const mcpServerService = this.client.service('mcp-servers');
-    const results: Array<{ server: MCPServer; added_at: number; enabled: boolean }> = [];
-
-    for (const link of sessionMCPServers) {
-      try {
-        const server = await mcpServerService.get(link.mcp_server_id);
-        results.push({
-          server,
-          added_at: new Date(link.added_at).getTime(), // Convert to timestamp
-          enabled: Boolean(link.enabled),
-        });
-      } catch (_error) {
-        // Skip servers that can't be fetched
-      }
-    }
-
-    return results;
+    const result = await service.find({ query });
+    return (Array.isArray(result) ? result : result.data) as Array<{
+      server: MCPServer;
+      added_at: number;
+      enabled: boolean;
+    }>;
   }
 }
 
@@ -291,7 +272,7 @@ export class FeathersUsersRepository {
  */
 export type MessagesRepository = FeathersMessagesRepository;
 export type SessionRepository = FeathersSessionsRepository;
-export type WorktreeRepository = FeathersWorktreesRepository;
+export type BranchRepository = FeathersBranchesRepository;
 export type RepoRepository = FeathersReposRepository;
 export type MCPServerRepository = FeathersMCPServersRepository;
 export type SessionMCPServerRepository = FeathersSessionMCPServersRepository;
@@ -305,7 +286,7 @@ export function createFeathersBackedRepositories(client: AgorClient) {
     // Repositories
     messages: new FeathersMessagesRepository(client),
     sessions: new FeathersSessionsRepository(client),
-    worktrees: new FeathersWorktreesRepository(client),
+    branches: new FeathersBranchesRepository(client),
     repos: new FeathersReposRepository(client),
     users: new FeathersUsersRepository(client),
     mcpServers: new FeathersMCPServersRepository(client),

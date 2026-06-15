@@ -4,8 +4,8 @@ import type { EffortLevel, PermissionMode } from './session';
 
 /**
  * User role types
- * - superadmin: Full system access including worktree RBAC bypass (requires allow_superadmin=true in config)
- * - admin: Can manage most resources (MCP servers, config, users), no worktree RBAC bypass
+ * - superadmin: Full system access including branch RBAC bypass (requires allow_superadmin=true in config)
+ * - admin: Can manage most resources (MCP servers, config, users), no branch RBAC bypass
  * - member: Standard user access, can create and manage own sessions
  * - viewer: Read-only access
  *
@@ -22,6 +22,35 @@ export const ROLES = {
   MEMBER: 'member',
   VIEWER: 'viewer',
 } as const satisfies Record<string, UserRole>;
+
+/**
+ * Display metadata for each role. Ordered from most → least privileged so UI
+ * dropdowns can render directly from this list without re-sorting.
+ *
+ * This is the single source of truth for role labels and descriptions —
+ * dropdowns, CLI prompts, and any other surface listing roles should map
+ * over this array instead of hard-coding role strings.
+ */
+export interface RoleOption {
+  value: UserRole;
+  label: string;
+  description: string;
+}
+
+export const ROLE_OPTIONS: readonly RoleOption[] = [
+  {
+    value: ROLES.SUPERADMIN,
+    label: 'Superadmin',
+    description: 'Full system access + branch RBAC bypass',
+  },
+  {
+    value: ROLES.ADMIN,
+    label: 'Admin',
+    description: 'Manage resources (users, MCP servers, config)',
+  },
+  { value: ROLES.MEMBER, label: 'Member', description: 'Standard user' },
+  { value: ROLES.VIEWER, label: 'Viewer', description: 'Read-only access' },
+] as const;
 
 /**
  * Role rank used for minimum-role comparisons.
@@ -63,6 +92,8 @@ export interface DefaultModelConfig {
   model?: string;
   /** Effort level for reasoning depth */
   effort?: EffortLevel;
+  /** Claude Code advisor model (e.g., 'opus', 'sonnet', 'fable'); unset means no session override */
+  advisorModel?: string;
 }
 
 /**
@@ -88,10 +119,207 @@ export interface DefaultAgenticToolConfig {
  */
 export interface DefaultAgenticConfig {
   'claude-code'?: DefaultAgenticToolConfig;
+  'claude-code-cli'?: DefaultAgenticToolConfig;
   codex?: DefaultAgenticToolConfig;
   gemini?: DefaultAgenticToolConfig;
   opencode?: DefaultAgenticToolConfig;
   copilot?: DefaultAgenticToolConfig;
+  cursor?: DefaultAgenticToolConfig;
+}
+
+/**
+ * Per-tool credential field shapes.
+ *
+ * Field names equal the env var names exported into the SDK CLI's environment.
+ * Storage values are encrypted at rest; the public DTO (User.agentic_tools)
+ * exposes the same field names with `boolean` presence flags.
+ */
+export interface ClaudeCodeConfig {
+  ANTHROPIC_API_KEY?: string;
+  CLAUDE_CODE_OAUTH_TOKEN?: string;
+  ANTHROPIC_AUTH_TOKEN?: string;
+  ANTHROPIC_BASE_URL?: string;
+}
+
+export interface CodexConfig {
+  OPENAI_API_KEY?: string;
+  OPENAI_BASE_URL?: string;
+}
+
+export interface GeminiConfig {
+  GEMINI_API_KEY?: string;
+}
+
+export interface CopilotConfig {
+  COPILOT_GITHUB_TOKEN?: string;
+}
+
+export interface CursorConfig {
+  CURSOR_API_KEY?: string;
+}
+
+/**
+ * Per-tool credential map. Each tool's config is independent and
+ * scoped to its own SDK at session-spawn time.
+ */
+export interface AgenticToolsConfig {
+  'claude-code'?: ClaudeCodeConfig;
+  // claude-code-cli wraps the `claude` shell binary. Same Anthropic env vars
+  // apply as the SDK path (ANTHROPIC_API_KEY, OAuth token, base URL); the
+  // subscription path doesn't use env vars at all — it reads
+  // ~/.claude/.credentials.json managed by `claude auth login`.
+  'claude-code-cli'?: ClaudeCodeConfig;
+  codex?: CodexConfig;
+  gemini?: GeminiConfig;
+  copilot?: CopilotConfig;
+  cursor?: CursorConfig;
+  opencode?: Record<string, never>;
+}
+
+/** Union of all valid env-var-named fields across all tool configs. */
+export type AgenticToolConfigField =
+  | keyof ClaudeCodeConfig
+  | keyof CodexConfig
+  | keyof GeminiConfig
+  | keyof CopilotConfig
+  | keyof CursorConfig;
+
+/**
+ * Public DTO shape: per-tool credential presence flags.
+ *
+ * Flips every field of every tool config from `string` (encrypted) to `boolean`
+ * (set/unset). Used by `User.agentic_tools` and the user-facing API responses
+ * — the daemon never returns decrypted credential values to clients.
+ */
+export type AgenticToolsStatus = {
+  [Tool in keyof AgenticToolsConfig]?: AgenticToolsConfig[Tool] extends infer Cfg
+    ? { [Field in keyof Cfg]?: boolean }
+    : never;
+};
+
+/**
+ * Encrypted-at-rest projection of `AgenticToolsConfig` — the on-disk shape of
+ * `users.data.agentic_tools`. Each field's `string` (plaintext) is replaced
+ * with the encrypted ciphertext bytes (also a string at the storage layer).
+ *
+ * Lives next to `AgenticToolsConfig` so the canonical type, the public DTO,
+ * and the storage projection move together. Imported by the repo (writer/
+ * decryptor), the env resolver (reader), and the daemon users service
+ * (patcher) — keeping the alias single-source avoids the historical drift
+ * across these three call sites.
+ */
+export type StoredAgenticTools = {
+  [Tool in keyof AgenticToolsConfig]?: Record<string, string>;
+};
+
+/**
+ * Project the encrypted-at-rest blob to the boolean presence DTO returned to
+ * clients. Empty buckets are dropped so the API response stays compact.
+ */
+export function toAgenticToolsStatus(
+  stored: StoredAgenticTools | undefined
+): AgenticToolsStatus | undefined {
+  if (!stored) return undefined;
+  const out: Record<string, Record<string, boolean>> = {};
+  for (const [tool, fields] of Object.entries(stored)) {
+    if (!fields) continue;
+    const flags: Record<string, boolean> = {};
+    for (const [field, value] of Object.entries(fields)) {
+      if (value) flags[field] = true;
+    }
+    if (Object.keys(flags).length > 0) {
+      out[tool] = flags;
+    }
+  }
+  return Object.keys(out).length > 0 ? (out as AgenticToolsStatus) : undefined;
+}
+
+/**
+ * Update DTO shape: per-tool credential patch payload.
+ *
+ * String values set the field (plaintext, encrypted before storage); `null`
+ * clears the field. Omitted fields are untouched. Used by PATCH /users/:id.
+ */
+export type AgenticToolsUpdate = {
+  [Tool in keyof AgenticToolsConfig]?: AgenticToolsConfig[Tool] extends infer Cfg
+    ? { [Field in keyof Cfg]?: string | null }
+    : never;
+};
+
+/**
+ * Per-tool whitelist of fields whose plaintext is safe to echo back to the
+ * field's owner.
+ *
+ * Base URLs are config (not credentials) — the user benefits from seeing the
+ * exact value they configured (e.g. distinguishing
+ * `https://gateway.example.com/v1` from `https://gateway.example.com`). API
+ * keys, OAuth tokens, and auth tokens are NEVER on this list and never
+ * decrypted on read.
+ *
+ * Even for whitelisted fields, the daemon only returns the plaintext to the
+ * field's *owner* — never to other users (base URLs can leak internal
+ * hostnames) and never to admins viewing someone else's profile.
+ */
+export const AGENTIC_TOOLS_PUBLIC_FIELDS: {
+  readonly [Tool in keyof AgenticToolsConfig]?: ReadonlyArray<
+    keyof NonNullable<AgenticToolsConfig[Tool]> & string
+  >;
+} = {
+  'claude-code': ['ANTHROPIC_BASE_URL'],
+  'claude-code-cli': ['ANTHROPIC_BASE_URL'],
+  codex: ['OPENAI_BASE_URL'],
+} as const;
+
+/**
+ * Owner-visible plaintext values for the fields listed in
+ * `AGENTIC_TOOLS_PUBLIC_FIELDS`. Sibling map to `AgenticToolsStatus` —
+ * presence remains the source of truth; this just lets the UI render the
+ * saved value back without forcing a clear-and-retype.
+ *
+ * Always undefined / partial when the requester is not the field's owner.
+ */
+export type AgenticToolsPublicValues = {
+  [Tool in keyof AgenticToolsConfig]?: AgenticToolsConfig[Tool] extends infer Cfg
+    ? { [Field in keyof Cfg]?: string }
+    : never;
+};
+
+/**
+ * Decrypt the whitelisted public fields from the on-disk encrypted blob.
+ * Returns undefined when no public fields are populated, so the API response
+ * stays compact.
+ *
+ * The caller is responsible for the self-only authorization check — this
+ * helper assumes the requester is already authorized to see the values.
+ */
+export function extractAgenticToolsPublicValues(
+  stored: StoredAgenticTools | undefined,
+  decrypt: (ciphertext: string) => string
+): AgenticToolsPublicValues | undefined {
+  if (!stored) return undefined;
+  const out: Record<string, Record<string, string>> = {};
+  for (const [tool, fields] of Object.entries(stored) as Array<
+    [keyof AgenticToolsConfig, Record<string, string> | undefined]
+  >) {
+    if (!fields) continue;
+    const whitelist = AGENTIC_TOOLS_PUBLIC_FIELDS[tool];
+    if (!whitelist || whitelist.length === 0) continue;
+    const plaintext: Record<string, string> = {};
+    for (const field of whitelist) {
+      const ciphertext = fields[field as string];
+      if (!ciphertext) continue;
+      try {
+        plaintext[field as string] = decrypt(ciphertext);
+      } catch {
+        // Silently skip undecryptable values; the boolean status flag will
+        // still indicate presence so the user can clear and re-set.
+      }
+    }
+    if (Object.keys(plaintext).length > 0) {
+      out[tool] = plaintext;
+    }
+  }
+  return Object.keys(out).length > 0 ? (out as AgenticToolsPublicValues) : undefined;
 }
 
 /**
@@ -134,10 +362,16 @@ export interface EventStreamPreferences {
 export interface OnboardingState {
   /** Which path the user took */
   path?: 'assistant' | 'own-repo' | 'persisted-agent';
-  /** The worktree ID created during onboarding */
-  worktreeId?: string;
+  /** The repo ID associated with this onboarding (framework repo or user's repo) */
+  repoId?: string;
+  /** The branch ID created during onboarding */
+  branchId?: string;
   /** The board ID created for this user */
   boardId?: string;
+  /** Assistant display name captured during onboarding identity step */
+  assistantDisplayName?: string;
+  /** Assistant emoji captured during onboarding identity step */
+  assistantEmoji?: string;
 }
 
 /**
@@ -151,6 +385,21 @@ export interface UserPreferences {
   mainBoardId?: string;
   // Future preferences can be added here
   [key: string]: unknown;
+}
+
+/** Stable external identity link stored with a local user. */
+export interface UserExternalIdentity {
+  /** SHA-256 of provider + issuer + subject; stable lookup key. */
+  key: string;
+  /** Stable provider label configured for the external launch provider. */
+  provider: string;
+  /** Trusted issuer that produced the launch assertion. */
+  issuer: string;
+  /** Subject from the trusted issuer; not an email address. */
+  subject: string;
+  email?: string;
+  name?: string;
+  last_login_at: string;
 }
 
 /**
@@ -177,13 +426,20 @@ export interface User extends BaseUserFields {
   updated_at?: Date;
   // Unix username for process impersonation (optional, unique, admin-managed)
   unix_username?: string;
-  // API key status (boolean only, never exposes actual keys)
-  api_keys?: {
-    ANTHROPIC_API_KEY?: boolean; // true = key is set, false/undefined = not set
-    OPENAI_API_KEY?: boolean;
-    GEMINI_API_KEY?: boolean;
-    COPILOT_GITHUB_TOKEN?: boolean;
-  };
+  /**
+   * Per-tool credential & auth status (boolean only, never exposes actual values).
+   *
+   * Mirrors `AgenticToolsConfig` field-for-field with each value flipped from
+   * encrypted-string to `boolean` for presence checking.
+   */
+  agentic_tools?: AgenticToolsStatus;
+  /**
+   * Plaintext values for fields listed in `AGENTIC_TOOLS_PUBLIC_FIELDS` —
+   * only populated when the requester is the field's owner. Lets the UI
+   * render the saved value (e.g. the user's custom `OPENAI_BASE_URL`) back
+   * without forcing a clear-and-retype. Never contains API keys or tokens.
+   */
+  agentic_tools_public_values?: AgenticToolsPublicValues;
   // Environment variable status with scope (never exposes actual values).
   // Map from env var name → presence/scope metadata. For v0.5 the only validated
   // scope values are 'global' and 'session'; other values are reserved for v1 and
@@ -258,13 +514,13 @@ export interface UpdateUserInput extends Partial<BaseUserFields> {
   unix_username?: string;
   /** Force user to change password on next login (admin-only) */
   must_change_password?: boolean;
-  // API keys for update (accepts plaintext, encrypted before storage)
-  api_keys?: {
-    ANTHROPIC_API_KEY?: string | null; // string = set key, null = clear key
-    OPENAI_API_KEY?: string | null;
-    GEMINI_API_KEY?: string | null;
-    COPILOT_GITHUB_TOKEN?: string | null;
-  };
+  /**
+   * Per-tool credential updates (accepts plaintext, encrypted before storage).
+   *
+   * Each tool's sub-object is a partial patch — only fields you include are
+   * touched; `null` clears the field, a string sets it. Field names = env var names.
+   */
+  agentic_tools?: AgenticToolsUpdate;
   // Environment variables for update (accepts plaintext, encrypted before storage).
   // `null` clears the variable. A plain `string` creates/updates the value and leaves
   // the existing scope in place (defaults to 'global' for new vars).

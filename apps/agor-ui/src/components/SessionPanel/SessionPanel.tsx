@@ -1,22 +1,28 @@
 import type {
   AgorClient,
+  Branch,
   CodexApprovalPolicy,
   CodexSandboxMode,
   EffortLevel,
-  Message,
   PermissionMode,
   Session,
   SessionID,
   SpawnConfig,
+  Task,
   User,
-  Worktree,
 } from '@agor-live/client';
-import { AGENTIC_TOOL_CAPABILITIES, SessionStatus, TaskStatus } from '@agor-live/client';
 import {
+  AGENTIC_TOOL_CAPABILITIES,
+  getDefaultPermissionMode,
+  mapToCodexPermissionConfig,
+  SessionStatus,
+  TaskStatus,
+} from '@agor-live/client';
+import {
+  AimOutlined,
   BranchesOutlined,
   CloseOutlined,
   CodeOutlined,
-  DeleteOutlined,
   ForkOutlined,
   QuestionCircleOutlined,
   SendOutlined,
@@ -24,58 +30,34 @@ import {
   StopOutlined,
 } from '@ant-design/icons';
 import { Alert, App, Badge, Button, Space, Spin, Tooltip, Typography, theme } from 'antd';
-import Handlebars from 'handlebars';
 import React from 'react';
 import { getDaemonUrl } from '../../config/daemon';
 import { useAppActions } from '../../contexts/AppActionsContext';
-import { useAppData } from '../../contexts/AppDataContext';
+import { useAppMcpData, useAppUserData } from '../../contexts/AppDataContext';
+import { useRecenterMap } from '../../contexts/CanvasNavigationContext';
 import { useConnectionDisabled } from '../../contexts/ConnectionContext';
+import { useSessionActions } from '../../hooks/useSessionActions';
 import { useSharedReactiveSession } from '../../hooks/useSharedReactiveSession';
-import spawnSubsessionTemplate from '../../templates/spawn_subsession.hbs?raw';
 import { getContextWindowGradient } from '../../utils/contextWindow';
 import { mcpServerNeedsAuth } from '../../utils/mcpAuth';
+import { useThemedMessage } from '../../utils/message';
 import { getSessionDisplayTitle, getSessionTitleStyles } from '../../utils/sessionTitle';
-import { compileTemplate } from '../../utils/templates';
+import { ArchiveActionButton } from '../ArchiveButton';
 import { AutocompleteTextarea } from '../AutocompleteTextarea';
-import { EffortSelector } from '../EffortSelector';
+import { CallbackToggleButton } from '../CallbackToggleButton';
 import { FileUpload, FileUploadButton } from '../FileUpload';
-import { MCPServerPill } from '../MCPServerPill';
+import { MCPServerPill } from '../MCPServer';
+import type { ModelConfig } from '../ModelSelector';
 import { CreatedByTag } from '../metadata';
-import { PermissionModeSelector } from '../PermissionModeSelector';
-import { ContextWindowPill, ModelPill, SessionIdPill, TimerPill, TokenCountPill } from '../Pill';
+import { ContextWindowPill, TimerPill, TokenCountPill } from '../Pill';
+import { SessionIdsButton } from '../SessionIds';
 import { ToolIcon } from '../ToolIcon';
+import { SessionMcpFooterControl } from './SessionMcpFooterControl';
 import { SessionPanelContent } from './SessionPanelContent';
-
-// Register helper to check if value is defined (not undefined)
-// This allows us to distinguish between false and undefined in templates
-Handlebars.registerHelper('isDefined', (value: unknown) => value !== undefined);
+import { SessionRunSettingsPopover } from './SessionRunSettingsPopover';
 
 // Re-export PermissionMode from SDK for convenience
 export type { PermissionMode };
-
-/** Context shape for the spawn subsession Handlebars template */
-interface SpawnTemplateContext {
-  userPrompt: string;
-  hasConfig?: boolean;
-  agenticTool?: string;
-  permissionMode?: PermissionMode;
-  modelConfig?: SpawnConfig['modelConfig'];
-  codexSandboxMode?: CodexSandboxMode;
-  codexApprovalPolicy?: CodexApprovalPolicy;
-  codexNetworkAccess?: boolean;
-  mcpServerIds?: string[];
-  hasCallbackConfig?: boolean;
-  callbackConfig?: {
-    enableCallback?: boolean;
-    includeLastMessage?: boolean;
-    includeOriginalPrompt?: boolean;
-  };
-  extraInstructions?: string;
-}
-
-// Compile the spawn subsession template once at module level (after helper registration)
-const compiledSpawnSubsessionTemplate =
-  compileTemplate<SpawnTemplateContext>(spawnSubsessionTemplate);
 
 // ---------------------------------------------------------------------------
 // PromptInput — thin wrapper around AutocompleteTextarea that keeps the typed
@@ -219,6 +201,7 @@ const PromptInput = React.forwardRef<PromptInputHandle, PromptInputProps>(
         onFilesDrop={onFilesDrop}
         slashCommands={slashCommands}
         skills={skills}
+        highlightWhenEmpty
       />
     );
   }
@@ -228,10 +211,12 @@ PromptInput.displayName = 'PromptInput';
 
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+
 export interface SessionPanelProps {
   client: AgorClient | null;
   session: Session | null;
-  worktree?: Worktree | null;
+  branch?: Branch | null;
   currentUserId?: string;
   sessionMcpServerIds?: string[];
   open: boolean;
@@ -241,29 +226,30 @@ export interface SessionPanelProps {
 const SessionPanel: React.FC<SessionPanelProps> = ({
   client,
   session,
-  worktree = null,
+  branch = null,
   currentUserId,
   sessionMcpServerIds = [],
   open,
   onClose,
 }) => {
   const { token } = theme.useToken();
-  const { modal, message } = App.useApp();
+  const { modal } = App.useApp();
+  const { showSuccess, showInfo, showError } = useThemedMessage();
   const connectionDisabled = useConnectionDisabled();
+  const recenterMap = useRecenterMap();
 
-  // Get data from context
-  const { userById, mcpServerById, userAuthenticatedMcpServerIds } = useAppData();
+  // Subscribe only to the entity families this panel needs. SessionPanel
+  // intentionally does NOT subscribe to live (sessions / branches / boards)
+  // data here, so streaming session patches don't trigger re-renders through
+  // context; user and MCP updates are also isolated from repo edits.
+  const { userById } = useAppUserData();
+  const { mcpServerById, userAuthenticatedMcpServerIds } = useAppMcpData();
 
   // Get actions from context
-  const {
-    onSendPrompt,
-    onFork,
-    onBtwFork,
-    onOpenSettings,
-    onUpdateSession,
-    onDeleteSession: onDelete,
-    onOpenTerminal,
-  } = useAppActions();
+  const { onSendPrompt, onFork, onBtwFork, onOpenSettings, onUpdateSession, onOpenTerminal } =
+    useAppActions();
+
+  const { archiveSession } = useSessionActions(client);
 
   // Tool capabilities — drives which buttons are shown
   const toolCaps = session?.agentic_tool
@@ -314,25 +300,41 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
   const [hasInput, setHasInput] = React.useState(() => !!inputValueRef.current.trim());
   const handleHasInputChange = React.useCallback((v: boolean) => setHasInput(v), []);
 
-  const getDefaultPermissionMode = React.useCallback((agent?: string): PermissionMode => {
-    return agent === 'codex' ? 'auto' : 'acceptEdits';
-  }, []);
+  // getDefaultPermissionMode imported from @agor-live/client — canonical
+  // per-tool defaults live in core's `getDefaultPermissionMode`. The local
+  // shadow that used to live here was stale (missing gemini/opencode/copilot)
+  // and silently drifted from the core definition.
 
-  const [permissionMode, setPermissionMode] = React.useState<PermissionMode>(
-    session?.permission_config?.mode || getDefaultPermissionMode(session?.agentic_tool)
-  );
+  const initialPermissionMode: PermissionMode =
+    session?.permission_config?.mode ??
+    (session?.agentic_tool
+      ? getDefaultPermissionMode(session.agentic_tool)
+      : getDefaultPermissionMode('claude-code'));
+  const initialCodexDefaults = mapToCodexPermissionConfig(initialPermissionMode);
+  const [permissionMode, setPermissionMode] = React.useState<PermissionMode>(initialPermissionMode);
   const [codexSandboxMode, setCodexSandboxMode] = React.useState<CodexSandboxMode>(
-    session?.permission_config?.codex?.sandboxMode || 'workspace-write'
+    session?.permission_config?.codex?.sandboxMode ?? initialCodexDefaults.sandboxMode
   );
   const [codexApprovalPolicy, setCodexApprovalPolicy] = React.useState<CodexApprovalPolicy>(
-    session?.permission_config?.codex?.approvalPolicy || 'on-request'
+    session?.permission_config?.codex?.approvalPolicy ?? initialCodexDefaults.approvalPolicy
   );
   const [effortLevel, setEffortLevel] = React.useState<EffortLevel>(
     session?.model_config?.effort || 'high'
   );
+  /**
+   * Claude Code CLI view toggle: 'terminal' shows the embedded `claude`
+   * REPL full-height (with the Agor textarea hidden, since `claude` has
+   * its own input prompt); 'conversation' shows Agor's standard message
+   * feed rebuilt from the JSONL by the daemon watcher.
+   *
+   * Only meaningful when `session.agentic_tool === 'claude-code-cli'`.
+   * Defaults to 'terminal' so users see the live REPL on first open.
+   * Persisting this per-session as a UI preference is a v1.5 follow-up.
+   */
+  const [cliViewMode, setCliViewMode] = React.useState<'terminal' | 'conversation'>('terminal');
   const [scrollToBottom, setScrollToBottom] = React.useState<(() => void) | null>(null);
   const [scrollToTop, setScrollToTop] = React.useState<(() => void) | null>(null);
-  const [queuedMessages, setQueuedMessages] = React.useState<Message[]>([]);
+  const [queuedTasks, setQueuedTasks] = React.useState<Task[]>([]);
   const [spawnModalOpen, setSpawnModalOpen] = React.useState(false);
   const [uploadModalOpen, setUploadModalOpen] = React.useState(false);
   const [droppedFiles, setDroppedFiles] = React.useState<File[]>([]);
@@ -345,17 +347,15 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
 
   const tasks = reactiveSessionState?.tasks || [];
 
-  // Fetch queued messages
+  // Fetch queued tasks (post never-lose-prompt: queueing lives on tasks, not messages).
   React.useEffect(() => {
     if (!client || !session) return;
 
     const fetchQueue = async () => {
       try {
-        const response = await client
-          .service(`/sessions/${session.session_id}/messages/queue`)
-          .find();
-        const data = (response as { data: Message[] }).data || [];
-        setQueuedMessages(data);
+        const response = await client.service(`/sessions/${session.session_id}/tasks/queue`).find();
+        const data = (response as { data: Task[] }).data || [];
+        setQueuedTasks(data);
       } catch (error) {
         console.error('[SessionPanel] Failed to fetch queue:', error);
       }
@@ -363,30 +363,43 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
 
     fetchQueue();
 
-    const messagesService = client.service('messages');
+    const tasksService = client.service('tasks');
 
-    const handleQueued = (msg: Message) => {
-      if (msg.session_id === session.session_id) {
-        setQueuedMessages((prev) => {
-          // Deduplicate: optimistic update from enqueue may have already added this message
-          if (prev.some((m) => m.message_id === msg.message_id)) return prev;
-          return [...prev, msg].sort((a, b) => (a.queue_position ?? 0) - (b.queue_position ?? 0));
+    const handleQueued = (task: Task) => {
+      if (task.session_id === session.session_id) {
+        setQueuedTasks((prev) => {
+          // Deduplicate: optimistic update from enqueue may have already added this task
+          if (prev.some((t) => t.task_id === task.task_id)) return prev;
+          return [...prev, task].sort((a, b) => (a.queue_position ?? 0) - (b.queue_position ?? 0));
         });
       }
     };
 
-    const handleMessageRemoved = (msg: Message) => {
-      if (msg.status === 'queued' && msg.session_id === session.session_id) {
-        setQueuedMessages((prev) => prev.filter((m) => m.message_id !== msg.message_id));
+    // A queued task drops out of the drawer when its status flips off 'queued'
+    // (drained by spawnTaskExecutor → RUNNING, or admin-cancelled to STOPPED).
+    const handleTaskPatched = (task: Task) => {
+      if (task.session_id !== session.session_id) return;
+      if (task.status !== TaskStatus.QUEUED) {
+        setQueuedTasks((prev) => prev.filter((t) => t.task_id !== task.task_id));
       }
     };
 
-    messagesService.on('queued', handleQueued);
-    messagesService.on('removed', handleMessageRemoved);
+    const handleTaskRemoved = (task: Task) => {
+      if (task.session_id === session.session_id) {
+        setQueuedTasks((prev) => prev.filter((t) => t.task_id !== task.task_id));
+      }
+    };
+
+    tasksService.on('queued', handleQueued);
+    tasksService.on('patched', handleTaskPatched);
+    tasksService.on('updated', handleTaskPatched);
+    tasksService.on('removed', handleTaskRemoved);
 
     return () => {
-      messagesService.off('queued', handleQueued);
-      messagesService.off('removed', handleMessageRemoved);
+      tasksService.off('queued', handleQueued);
+      tasksService.off('patched', handleTaskPatched);
+      tasksService.off('updated', handleTaskPatched);
+      tasksService.off('removed', handleTaskRemoved);
     };
   }, [client, session]);
 
@@ -428,11 +441,16 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
           return {
             used: task.computed_context_window,
             limit: contextWindowLimit || 0,
+            // Forward the full normalized response so ContextWindowPill can
+            // honor `contextUsageSnapshot.percentage` instead of recomputing
+            // from raw used/limit (which is wrong for Codex's baseline-adjusted
+            // display).
             taskMetadata: {
               model: task.model,
               duration_ms: task.duration_ms,
               agentic_tool: session.agentic_tool,
               raw_sdk_response: task.raw_sdk_response,
+              normalized_sdk_response: task.normalized_sdk_response,
             },
           };
         }
@@ -443,7 +461,11 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
 
   const footerGradient = React.useMemo(() => {
     if (!latestContextWindow) return undefined;
-    return getContextWindowGradient(latestContextWindow.used, latestContextWindow.limit);
+    return getContextWindowGradient(
+      latestContextWindow.used,
+      latestContextWindow.limit,
+      latestContextWindow.taskMetadata.normalized_sdk_response?.contextUsageSnapshot
+    );
   }, [latestContextWindow]);
 
   const footerTimerTask = React.useMemo(() => {
@@ -476,27 +498,12 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
       setCodexSandboxMode(session.permission_config.codex.sandboxMode);
       setCodexApprovalPolicy(session.permission_config.codex.approvalPolicy);
     }
-  }, [
-    session?.permission_config?.mode,
-    session?.permission_config?.codex,
-    session?.agentic_tool,
-    getDefaultPermissionMode,
-  ]);
+  }, [session?.permission_config?.mode, session?.permission_config?.codex, session?.agentic_tool]);
 
   // Update effort level when session changes (default to 'high' for sessions without effort config)
   React.useEffect(() => {
     setEffortLevel(session?.model_config?.effort || 'high');
   }, [session?.model_config?.effort]);
-
-  // Scroll to bottom when panel opens or session changes
-  React.useEffect(() => {
-    if (open && scrollToBottom && session) {
-      const timeoutId = setTimeout(() => {
-        scrollToBottom();
-      }, 300);
-      return () => clearTimeout(timeoutId);
-    }
-  }, [open, scrollToBottom, session]);
 
   // When there's no session, render nothing (panel is collapsed to zero).
   // When open=false, we still render the component tree (hidden) so that
@@ -505,16 +512,25 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
     return null;
   }
 
-  const handleDelete = () => {
+  const handleArchive = () => {
+    if (!client || connectionDisabled) {
+      showError('Cannot archive while disconnected from the daemon.');
+      return;
+    }
+
     modal.confirm({
-      title: 'Delete Session',
-      content: 'Are you sure you want to delete this session? This action cannot be undone.',
-      okText: 'Delete',
-      okType: 'danger',
+      title: 'Archive session?',
+      content: 'Are you sure you want to archive this session?',
+      okText: 'Archive',
       cancelText: 'Cancel',
-      onOk: () => {
-        onDelete?.(session.session_id);
-        onClose();
+      onOk: async () => {
+        const archived = await archiveSession(session.session_id);
+        if (archived) {
+          showSuccess('Session archived');
+          onClose();
+        } else {
+          showError('Failed to archive session');
+        }
       },
     });
   };
@@ -529,34 +545,11 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
 
     const promptToSend = value.trim();
 
-    try {
-      if (isRunning && client) {
-        const response = (await client
-          .service(`/sessions/${session.session_id}/messages/queue`)
-          .create({
-            prompt: promptToSend,
-          })) as { success: boolean; message: Message; queue_position: number };
-
-        if (response.message) {
-          setQueuedMessages((prev) => {
-            if (prev.some((m) => m.message_id === response.message.message_id)) return prev;
-            return [...prev, response.message].sort(
-              (a, b) => (a.queue_position ?? 0) - (b.queue_position ?? 0)
-            );
-          });
-        }
-
-        message.success(`Message queued at position ${response.message.queue_position}`);
-        promptRef.current?.clear();
-      } else {
-        promptRef.current?.clear();
-        onSendPrompt?.(session.session_id, promptToSend, permissionMode);
-      }
-    } catch (error) {
-      message.error(
-        `Failed to ${isRunning ? 'queue' : 'send'} message: ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
+    // Single entry point: /prompt. The daemon decides run-vs-queue based on
+    // session state and reports it back via `task.status`. The 'queued'
+    // WebSocket event populates the queue panel for queued prompts.
+    promptRef.current?.clear();
+    onSendPrompt?.(session.session_id, promptToSend, permissionMode);
   };
 
   const handleStop = async () => {
@@ -564,7 +557,7 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
 
     // Show feedback immediately if this is a retry
     if (isStopping) {
-      message.info('Retrying stop request...');
+      showInfo('Retrying stop request...');
     }
 
     setStopRequestInFlight(true);
@@ -572,7 +565,7 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
       await client.service(`sessions/${session.session_id}/stop`).create({});
     } catch (error) {
       console.error('Failed to stop execution:', error);
-      message.error('Failed to stop execution. You can try again.');
+      showError('Failed to stop execution. You can try again.');
     } finally {
       setStopRequestInFlight(false);
     }
@@ -606,49 +599,39 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
   };
 
   const handleSpawnModalConfirm = async (config: string | Partial<SpawnConfig>) => {
-    if (!session) return;
+    if (!session || !client) return;
 
-    if (typeof config === 'string') {
-      const metaPrompt = compiledSpawnSubsessionTemplate({ userPrompt: config });
-      await onSendPrompt?.(session.session_id, metaPrompt, permissionMode);
-    } else {
-      const hasConfig =
-        config.agent !== undefined ||
-        config.permissionMode !== undefined ||
-        config.modelConfig !== undefined ||
-        config.codexSandboxMode !== undefined ||
-        config.codexApprovalPolicy !== undefined ||
-        config.codexNetworkAccess !== undefined ||
-        (config.mcpServerIds?.length ?? 0) > 0 ||
-        config.enableCallback !== undefined ||
-        config.includeLastMessage !== undefined ||
-        config.includeOriginalPrompt !== undefined ||
-        config.extraInstructions !== undefined;
+    // Daemon owns the spawn-subsession meta-prompt template. The UI sends raw
+    // `{userPrompt, config}` to /sessions/:id/spawn-prompt, which renders the
+    // meta-prompt and forwards it to /sessions/:id/prompt in one round trip.
+    //
+    // `parentPermissionMode` is the *parent* session's permission mode for the
+    // forwarding prompt; the spawn config's `permissionMode` is rendered into
+    // the meta-prompt as the *child* session's intended mode. They're distinct
+    // — don't reuse one for the other.
+    const spawnConfig =
+      typeof config === 'string'
+        ? { userPrompt: config }
+        : {
+            userPrompt: config.prompt || '',
+            agenticTool: config.agent,
+            permissionMode: config.permissionMode,
+            modelConfig: config.modelConfig,
+            codexSandboxMode: config.codexSandboxMode,
+            codexApprovalPolicy: config.codexApprovalPolicy,
+            codexNetworkAccess: config.codexNetworkAccess,
+            mcpServerIds: config.mcpServerIds,
+            callbackConfig: {
+              enableCallback: config.enableCallback,
+              includeLastMessage: config.includeLastMessage,
+              includeOriginalPrompt: config.includeOriginalPrompt,
+            },
+            extraInstructions: config.extraInstructions,
+          };
 
-      const metaPrompt = compiledSpawnSubsessionTemplate({
-        userPrompt: config.prompt || '',
-        hasConfig,
-        agenticTool: config.agent,
-        permissionMode: config.permissionMode,
-        modelConfig: config.modelConfig,
-        codexSandboxMode: config.codexSandboxMode,
-        codexApprovalPolicy: config.codexApprovalPolicy,
-        codexNetworkAccess: config.codexNetworkAccess,
-        mcpServerIds: config.mcpServerIds,
-        hasCallbackConfig:
-          config.enableCallback !== undefined ||
-          config.includeLastMessage !== undefined ||
-          config.includeOriginalPrompt !== undefined,
-        callbackConfig: {
-          enableCallback: config.enableCallback,
-          includeLastMessage: config.includeLastMessage,
-          includeOriginalPrompt: config.includeOriginalPrompt,
-        },
-        extraInstructions: config.extraInstructions,
-      });
-
-      await onSendPrompt?.(session.session_id, metaPrompt, permissionMode);
-    }
+    await client
+      .service(`sessions/${session.session_id}/spawn-prompt`)
+      .create({ ...spawnConfig, parentPermissionMode: permissionMode });
 
     setSpawnModalOpen(false);
     promptRef.current?.clear();
@@ -703,6 +686,20 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
     }
   };
 
+  const handleModelConfigChange = (newConfig: ModelConfig) => {
+    if (session && onUpdateSession) {
+      onUpdateSession(session.session_id, {
+        model_config: {
+          ...session.model_config,
+          mode: newConfig.mode,
+          model: newConfig.model,
+          ...(newConfig.provider ? { provider: newConfig.provider } : {}),
+          updated_at: new Date().toISOString(),
+        },
+      });
+    }
+  };
+
   const getStatusColor = () => {
     switch (session.status) {
       case 'running':
@@ -717,6 +714,20 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
         return 'default';
     }
   };
+
+  const modelLabel =
+    session.model_config?.model &&
+    session.agentic_tool === 'opencode' &&
+    session.model_config.provider
+      ? `${session.model_config.provider}/${session.model_config.model}`
+      : session.model_config?.model;
+  const modelConfig: ModelConfig | undefined = session.model_config?.model
+    ? {
+        mode: session.model_config.mode || 'alias',
+        model: session.model_config.model,
+        provider: session.model_config.provider,
+      }
+    : undefined;
 
   // Footer controls
   const footerControls = (
@@ -754,7 +765,7 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
           <Alert
             type="warning"
             showIcon
-            message={
+            title={
               <span>
                 {unauthedMcpServers.map((server) => (
                   <MCPServerPill
@@ -767,7 +778,7 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
                 not authenticated — click to sign in.
               </span>
             }
-            style={{ marginBottom: 0 }}
+            style={{ marginBottom: 0, borderRadius: token.borderRadius }}
             banner
           />
         )}
@@ -812,6 +823,14 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
           }}
         >
           <Space size={4} wrap>
+            <SessionMcpFooterControl
+              client={client}
+              sessionId={session.session_id}
+              sessionMcpServerIds={sessionMcpServerIds}
+              mcpServerById={mcpServerById}
+              userAuthenticatedMcpServerIds={userAuthenticatedMcpServerIds}
+              onOpenSessionSettings={onOpenSettings}
+            />
             {footerTimerTask && (
               <TimerPill
                 status={footerTimerTask.status}
@@ -822,25 +841,10 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
                   footerTimerTask.message_range?.end_timestamp || footerTimerTask.completed_at
                 }
                 durationMs={footerTimerTask.duration_ms}
+                lastExecutorHeartbeatAt={footerTimerTask.last_executor_heartbeat_at}
               />
             )}
-            <SessionIdPill
-              sessionId={session.session_id}
-              sdkSessionId={session.sdk_session_id}
-              agenticTool={session.agentic_tool}
-              showCopy={true}
-            />
-            {session.model_config?.model && (
-              <ModelPill
-                model={
-                  session.agentic_tool === 'opencode' &&
-                  session.model_config.provider &&
-                  session.model_config.model
-                    ? `${session.model_config.provider}/${session.model_config.model}`
-                    : session.model_config.model
-                }
-              />
-            )}
+            <SessionIdsButton session={session} />
             {tokenBreakdown.total > 0 && (
               <TokenCountPill
                 count={tokenBreakdown.total}
@@ -860,25 +864,22 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
             )}
           </Space>
           <Space size={4} wrap style={{ marginLeft: 'auto' }}>
-            {session.agentic_tool === 'claude-code' && (
-              <EffortSelector
-                value={effortLevel}
-                onChange={handleEffortChange}
-                size="small"
-                compact
-              />
-            )}
-            <PermissionModeSelector
-              value={permissionMode}
-              onChange={handlePermissionModeChange}
-              agentic_tool={session.agentic_tool}
+            {isRunning && <Spin size="small" />}
+            <CallbackToggleButton session={session} />
+            <SessionRunSettingsPopover
+              client={client}
+              session={session}
+              modelLabel={modelLabel}
+              modelConfig={modelConfig}
+              onModelConfigChange={handleModelConfigChange}
+              effortLevel={effortLevel}
+              onEffortChange={handleEffortChange}
+              permissionMode={permissionMode}
+              onPermissionModeChange={handlePermissionModeChange}
               codexSandboxMode={codexSandboxMode}
               codexApprovalPolicy={codexApprovalPolicy}
-              onCodexChange={handleCodexPermissionChange}
-              compact
-              size="small"
+              onCodexPermissionChange={handleCodexPermissionChange}
             />
-            {isRunning && <Spin size="small" />}
             <Space.Compact>
               <Tooltip
                 title={
@@ -1016,12 +1017,25 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
             </div>
           </Space>
           <Space size={4}>
-            {onOpenTerminal && worktree && (
-              <Tooltip title="Open terminal in worktree directory">
+            {branch && (
+              <Tooltip title="Center map on branch">
+                <Button
+                  type="text"
+                  icon={<AimOutlined />}
+                  onClick={() =>
+                    recenterMap(branch.branch_id, {
+                      boardId: branch.board_id ?? undefined,
+                    })
+                  }
+                />
+              </Tooltip>
+            )}
+            {onOpenTerminal && branch && (
+              <Tooltip title="Open terminal in branch directory">
                 <Button
                   type="text"
                   icon={<CodeOutlined />}
-                  onClick={() => onOpenTerminal([`cd ${worktree.path}`], worktree.worktree_id)}
+                  onClick={() => onOpenTerminal([`cd ${branch.path}`], branch.branch_id)}
                 />
               </Tooltip>
             )}
@@ -1034,11 +1048,12 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
                 />
               </Tooltip>
             )}
-            {onDelete && (
-              <Tooltip title="Delete Session">
-                <Button type="text" danger icon={<DeleteOutlined />} onClick={handleDelete} />
-              </Tooltip>
-            )}
+            <ArchiveActionButton
+              tooltip={connectionDisabled ? 'Disconnected from daemon' : 'Archive session'}
+              size="middle"
+              disabled={connectionDisabled || !client}
+              onClick={handleArchive}
+            />
             <Tooltip title="Close Panel">
               <Button
                 type="text"
@@ -1064,25 +1079,32 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
         <SessionPanelContent
           client={client}
           session={session}
-          worktree={worktree}
+          branch={branch}
           currentUserId={currentUserId}
           sessionMcpServerIds={sessionMcpServerIds}
           scrollToBottom={scrollToBottom}
           scrollToTop={scrollToTop}
           setScrollToBottom={setScrollToBottom}
           setScrollToTop={setScrollToTop}
-          queuedMessages={queuedMessages}
-          setQueuedMessages={setQueuedMessages}
+          queuedTasks={queuedTasks}
+          setQueuedTasks={setQueuedTasks}
           spawnModalOpen={spawnModalOpen}
           setSpawnModalOpen={setSpawnModalOpen}
           onSpawnModalConfirm={handleSpawnModalConfirm}
           inputValueRef={inputValueRef}
           isOpen={open}
+          cliViewMode={cliViewMode}
+          setCliViewMode={setCliViewMode}
         />
 
         {/* Footer Controls — rendered outside SessionPanelContent so that
-            keystroke-driven re-renders don't propagate to ConversationView */}
-        {footerControls}
+            keystroke-driven re-renders don't propagate to ConversationView.
+            Hidden for CLI sessions in 'terminal' view because the embedded
+            `claude` REPL has its own input prompt; the Agor textarea is
+            redundant (and would inject via PTY anyway, racy with whatever
+            the user is typing into the REPL directly). */}
+        {!(session.agentic_tool === 'claude-code-cli' && cliViewMode === 'terminal') &&
+          footerControls}
 
         {/* File upload modal */}
         {session && (
@@ -1096,7 +1118,7 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
             }}
             initialFiles={droppedFiles}
             onUploadComplete={(files) => {
-              message.success(`Uploaded ${files.length} file(s)`);
+              showSuccess(`Uploaded ${files.length} file(s)`);
             }}
             onInsertMention={(filepath) => {
               // Insert @filepath mention into the textarea
@@ -1109,4 +1131,9 @@ const SessionPanel: React.FC<SessionPanelProps> = ({
   );
 };
 
-export default SessionPanel;
+// SessionPanel reads only entity-context data (users, MCP servers) and receives
+// session/branch as props. Wrapping with React.memo (default shallow compare)
+// lets it bail out of re-renders triggered by App's live-context updates as
+// long as its props are referentially stable. Callers MUST pass stable
+// `onClose` and `sessionMcpServerIds` (use EMPTY_STRING_ARRAY for empty).
+export default React.memo(SessionPanel);

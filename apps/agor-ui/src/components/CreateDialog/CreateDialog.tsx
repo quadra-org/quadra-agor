@@ -1,4 +1,12 @@
-import type { Board, Repo } from '@agor-live/client';
+import type {
+  AgorClient,
+  Board,
+  CreateLocalRepoRequest,
+  CreateRepoRequest,
+  MCPServer,
+  Repo,
+  User,
+} from '@agor-live/client';
 import {
   AppstoreOutlined,
   BranchesOutlined,
@@ -7,22 +15,35 @@ import {
 } from '@ant-design/icons';
 import { Alert, Button, Modal, Tabs } from 'antd';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import type { BranchStorageConfig } from '@/utils/branchStorage';
+import type { AgenticToolOption } from '../../types';
 import type { AssistantTabResult } from './tabs/AssistantTab';
 import { AssistantTab } from './tabs/AssistantTab';
 import { BoardTab } from './tabs/BoardTab';
+import type { BranchTabConfig } from './tabs/BranchTab';
+import { BranchTab } from './tabs/BranchTab';
 import type { RepoTabResult } from './tabs/RepoTab';
 import { RepoTab } from './tabs/RepoTab';
-import type { WorktreeTabConfig } from './tabs/WorktreeTab';
-import { WorktreeTab } from './tabs/WorktreeTab';
 
-type ActiveTab = 'worktree' | 'assistant' | 'board' | 'repository';
+type ActiveTab = 'branch' | 'assistant' | 'board' | 'repository';
+
+export interface CreateDialogProgress {
+  onStatusChange?: (status: string) => void;
+}
+
+const INITIAL_VALIDITY: Record<ActiveTab, boolean> = {
+  branch: false,
+  assistant: false,
+  board: false,
+  repository: false,
+};
 
 const PURPOSE_TEXT: Record<ActiveTab, React.ReactNode> = {
-  worktree: (
+  branch: (
     <>
-      A worktree (built on{' '}
-      <a href="https://git-scm.com/docs/git-worktree" target="_blank" rel="noopener noreferrer">
-        git worktrees
+      A branch (built on{' '}
+      <a href="https://git-scm.com/docs/git-branch" target="_blank" rel="noopener noreferrer">
+        git branches
       </a>
       ) is essentially a place in the filesystem representing an isolated development branch. This
       is where one or more coding sessions take place. In Agor, they're generally ephemeral and
@@ -32,13 +53,13 @@ const PURPOSE_TEXT: Record<ActiveTab, React.ReactNode> = {
   assistant:
     'Assistants are long-lived agents with an identity, purpose, and goals. Think of them like employees. They have memory, can build their own skills, coordinate multiple coding agents, typically operate on their own Agor board, and can act proactively.',
   board:
-    'Boards are spatial canvases for organizing work. They contain worktrees, zones, cards, and other visual elements. Use boards to create workspaces for teams, projects, or assistants.',
+    'Boards are spatial canvases for organizing work. They contain branches, zones, cards, and other visual elements. Use boards to create workspaces for teams, projects, or assistants.',
   repository:
-    'Repositories connect your code to Agor. They can be cloned from GitHub or registered from a local path. Once connected, you can create worktrees for coding tasks.',
+    'Repositories connect your code to Agor. They can be cloned from GitHub or registered from a local path. Once connected, you can create branches for coding tasks.',
 };
 
 const ACTION_LABELS: Record<ActiveTab, string> = {
-  worktree: 'Create Worktree',
+  branch: 'Create Branch',
   assistant: 'Create Assistant',
   board: 'Create Board',
   repository: 'Add Repository',
@@ -51,12 +72,29 @@ export interface CreateDialogProps {
   boardById: Map<string, Board>;
   currentBoardId?: string;
   defaultPosition?: { x: number; y: number };
+  availableAgents: AgenticToolOption[];
+  mcpServerById?: Map<string, MCPServer>;
+  currentUser?: User | null;
+  client?: AgorClient | null;
   defaultTab?: ActiveTab;
-  onCreateWorktree: (config: WorktreeTabConfig) => void;
-  onCreateBoard: (board: Partial<Board>) => void;
-  onCreateRepo: (data: { url: string; slug: string; default_branch: string }) => void;
-  onCreateLocalRepo: (data: { path: string; slug?: string }) => void;
-  onCreateAssistant: (result: AssistantTabResult) => void;
+  onCreateBranch: (config: BranchTabConfig) => void | Promise<void>;
+  onCreateBoard: (board: Partial<Board>) => void | Promise<void>;
+  onCreateRepo: (data: CreateRepoRequest) => void | Promise<void>;
+  onCreateLocalRepo: (data: CreateLocalRepoRequest) => void | Promise<void>;
+  onCreateAssistant: (
+    result: AssistantTabResult,
+    progress?: CreateDialogProgress
+  ) => void | Promise<void>;
+  branchStorageConfig?: BranchStorageConfig;
+}
+
+/** Fire the parent handler and close the dialog. We don't `await` here
+ *  because the parent may navigate (away from the dialog's host
+ *  component) as part of its work — blocking the close on that would
+ *  delay the modal teardown. Rejections are swallowed: each parent
+ *  handler already surfaces its own errors via toasts. */
+function fireAndForget(result: void | Promise<void>) {
+  Promise.resolve(result).catch(() => {});
 }
 
 export const CreateDialog: React.FC<CreateDialogProps> = ({
@@ -66,19 +104,30 @@ export const CreateDialog: React.FC<CreateDialogProps> = ({
   boardById,
   currentBoardId,
   defaultPosition,
-  defaultTab = 'worktree',
-  onCreateWorktree,
+  availableAgents,
+  mcpServerById,
+  currentUser,
+  client,
+  defaultTab = 'assistant',
+  onCreateBranch,
   onCreateBoard,
   onCreateRepo,
   onCreateLocalRepo,
   onCreateAssistant,
+  branchStorageConfig,
 }) => {
   const [activeTab, setActiveTab] = useState<ActiveTab>(defaultTab);
-  const [isValid, setIsValid] = useState(false);
+  // Validity is tracked per tab so a sibling tab's empty-form state (or a
+  // deferred validity push from its init effect) can't clobber the active
+  // tab's submit button.
+  const [validByTab, setValidByTab] = useState<Record<ActiveTab, boolean>>(INITIAL_VALIDITY);
+  const isValid = validByTab[activeTab];
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitStatus, setSubmitStatus] = useState<string | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
   // Form submit refs — each tab exposes a submit function
-  const worktreeFormRef = useRef<(() => Promise<WorktreeTabConfig | null>) | null>(null);
+  const branchFormRef = useRef<(() => Promise<BranchTabConfig | null>) | null>(null);
   const boardFormRef = useRef<(() => Promise<Partial<Board> | null>) | null>(null);
   const repoFormRef = useRef<(() => Promise<RepoTabResult | null>) | null>(null);
   const assistantFormRef = useRef<(() => Promise<AssistantTabResult | null>) | null>(null);
@@ -86,28 +135,46 @@ export const CreateDialog: React.FC<CreateDialogProps> = ({
   // Reset state when dialog closes (covers both cancel and successful submit)
   useEffect(() => {
     if (!open) {
-      setIsValid(false);
+      setValidByTab(INITIAL_VALIDITY);
       setActiveTab(defaultTab);
+      setIsSubmitting(false);
+      setSubmitStatus(null);
+      setSubmitError(null);
     }
   }, [open, defaultTab]);
 
-  const handleValidityChange = useCallback((valid: boolean) => {
-    setIsValid(valid);
+  const setTabValid = useCallback((tab: ActiveTab, valid: boolean) => {
+    setValidByTab((prev) => (prev[tab] === valid ? prev : { ...prev, [tab]: valid }));
   }, []);
+
+  const handleBranchValid = useCallback((v: boolean) => setTabValid('branch', v), [setTabValid]);
+  const handleAssistantValid = useCallback(
+    (v: boolean) => setTabValid('assistant', v),
+    [setTabValid]
+  );
+  const handleBoardValid = useCallback((v: boolean) => setTabValid('board', v), [setTabValid]);
+  const handleRepositoryValid = useCallback(
+    (v: boolean) => setTabValid('repository', v),
+    [setTabValid]
+  );
 
   const handleTabChange = (key: string) => {
     setActiveTab(key as ActiveTab);
-    setIsValid(false);
+    setSubmitError(null);
+    setSubmitStatus(null);
   };
 
   const handleSubmit = async () => {
     setIsSubmitting(true);
+    setSubmitError(null);
+    setSubmitStatus(null);
+
     try {
       switch (activeTab) {
-        case 'worktree': {
-          const config = await worktreeFormRef.current?.();
+        case 'branch': {
+          const config = await branchFormRef.current?.();
           if (config) {
-            onCreateWorktree(config);
+            fireAndForget(onCreateBranch(config));
             onClose();
           }
           break;
@@ -115,7 +182,7 @@ export const CreateDialog: React.FC<CreateDialogProps> = ({
         case 'board': {
           const board = await boardFormRef.current?.();
           if (board) {
-            onCreateBoard(board);
+            fireAndForget(onCreateBoard(board));
             onClose();
           }
           break;
@@ -124,9 +191,9 @@ export const CreateDialog: React.FC<CreateDialogProps> = ({
           const result = await repoFormRef.current?.();
           if (result) {
             if (result.mode === 'local' && result.local) {
-              onCreateLocalRepo(result.local);
+              fireAndForget(onCreateLocalRepo(result.local));
             } else if (result.remote) {
-              onCreateRepo(result.remote);
+              fireAndForget(onCreateRepo(result.remote));
             }
             onClose();
           }
@@ -135,48 +202,26 @@ export const CreateDialog: React.FC<CreateDialogProps> = ({
         case 'assistant': {
           const result = await assistantFormRef.current?.();
           if (result) {
-            onCreateAssistant(result);
+            setSubmitStatus('Creating assistant…');
+            await onCreateAssistant(result, { onStatusChange: setSubmitStatus });
             onClose();
           }
           break;
         }
       }
+    } catch (error) {
+      setSubmitError(error instanceof Error ? error.message : String(error));
     } finally {
       setIsSubmitting(false);
     }
   };
 
   const handleCancel = () => {
+    if (isSubmitting) return;
     onClose();
   };
 
   const tabItems = [
-    {
-      key: 'worktree',
-      label: (
-        <span>
-          <BranchesOutlined style={{ marginRight: 8 }} />
-          Worktree
-        </span>
-      ),
-      children: (
-        <div>
-          <Alert
-            type="info"
-            showIcon
-            description={PURPOSE_TEXT.worktree}
-            style={{ marginBottom: 16 }}
-          />
-          <WorktreeTab
-            repoById={repoById}
-            currentBoardId={currentBoardId}
-            defaultPosition={defaultPosition}
-            onValidityChange={handleValidityChange}
-            formRef={worktreeFormRef}
-          />
-        </div>
-      ),
-    },
     {
       key: 'assistant',
       label: (
@@ -195,10 +240,41 @@ export const CreateDialog: React.FC<CreateDialogProps> = ({
           />
           <AssistantTab
             repoById={repoById}
-            boardById={boardById}
-            onValidityChange={handleValidityChange}
+            onValidityChange={handleAssistantValid}
             formRef={assistantFormRef}
             onCreateRepo={onCreateRepo}
+            availableAgents={availableAgents}
+            mcpServerById={mcpServerById}
+            currentUser={currentUser}
+            client={client}
+          />
+        </div>
+      ),
+    },
+    {
+      key: 'branch',
+      label: (
+        <span>
+          <BranchesOutlined style={{ marginRight: 8 }} />
+          Branch
+        </span>
+      ),
+      children: (
+        <div>
+          <Alert
+            type="info"
+            showIcon
+            description={PURPOSE_TEXT.branch}
+            style={{ marginBottom: 16 }}
+          />
+          <BranchTab
+            repoById={repoById}
+            boardById={boardById}
+            currentBoardId={currentBoardId}
+            defaultPosition={defaultPosition}
+            onValidityChange={handleBranchValid}
+            formRef={branchFormRef}
+            branchStorageConfig={branchStorageConfig}
           />
         </div>
       ),
@@ -219,7 +295,7 @@ export const CreateDialog: React.FC<CreateDialogProps> = ({
             description={PURPOSE_TEXT.board}
             style={{ marginBottom: 16 }}
           />
-          <BoardTab onValidityChange={handleValidityChange} formRef={boardFormRef} />
+          <BoardTab onValidityChange={handleBoardValid} formRef={boardFormRef} />
         </div>
       ),
     },
@@ -239,7 +315,7 @@ export const CreateDialog: React.FC<CreateDialogProps> = ({
             description={PURPOSE_TEXT.repository}
             style={{ marginBottom: 16 }}
           />
-          <RepoTab onValidityChange={handleValidityChange} formRef={repoFormRef} />
+          <RepoTab onValidityChange={handleRepositoryValid} formRef={repoFormRef} />
         </div>
       ),
     },
@@ -252,8 +328,11 @@ export const CreateDialog: React.FC<CreateDialogProps> = ({
       onCancel={handleCancel}
       destroyOnHidden
       width={720}
+      closable={!isSubmitting}
+      maskClosable={!isSubmitting}
+      keyboard={!isSubmitting}
       footer={[
-        <Button key="cancel" onClick={handleCancel}>
+        <Button key="cancel" onClick={handleCancel} disabled={isSubmitting}>
           Cancel
         </Button>,
         <Button
@@ -263,7 +342,7 @@ export const CreateDialog: React.FC<CreateDialogProps> = ({
           disabled={!isValid}
           loading={isSubmitting}
         >
-          {ACTION_LABELS[activeTab]}
+          {isSubmitting && submitStatus ? submitStatus : ACTION_LABELS[activeTab]}
         </Button>,
       ]}
       styles={{
@@ -276,6 +355,15 @@ export const CreateDialog: React.FC<CreateDialogProps> = ({
         items={tabItems}
         style={{ minHeight: 360 }}
       />
+      {submitError && (
+        <Alert
+          type="error"
+          showIcon
+          message="Couldn't finish creating this item"
+          description={submitError}
+          style={{ marginTop: 16 }}
+        />
+      )}
     </Modal>
   );
 };

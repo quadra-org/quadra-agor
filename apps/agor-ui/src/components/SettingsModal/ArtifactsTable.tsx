@@ -1,5 +1,6 @@
-import type { Artifact, Board, Worktree } from '@agor-live/client';
-import { DeleteOutlined, EditOutlined } from '@ant-design/icons';
+import type { Artifact, ArtifactID, Board, Branch } from '@agor-live/client';
+import { artifactFullscreenPath, shortId } from '@agor-live/client';
+import { AimOutlined, DeleteOutlined, EditOutlined, ExportOutlined } from '@ant-design/icons';
 import {
   Badge,
   Button,
@@ -15,15 +16,22 @@ import {
   Tooltip,
   Typography,
 } from 'antd';
-import { useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { mapToArray, mapToSortedArray } from '@/utils/mapHelpers';
+import { filterBySettingsSearch } from '@/utils/settingsSearch';
+import { uiRouteHref } from '@/utils/uiRoutes';
+import { useAppNavigation } from '../../hooks/useAppNavigation';
+import { HighlightMatch } from '../HighlightMatch';
 
 interface ArtifactsTableProps {
   artifactById: Map<string, Artifact>;
-  worktreeById: Map<string, Worktree>;
+  branchById: Map<string, Branch>;
   boardById: Map<string, Board>;
   onUpdate?: (artifactId: string, updates: Partial<Artifact>) => void;
   onDelete?: (artifactId: string) => void;
+  /** Close the parent Settings modal so the canvas isn't obscured by it
+   *  after recenter. Wired by SettingsModal. */
+  onClose?: () => void;
 }
 
 const templateColors: Record<string, string> = {
@@ -35,14 +43,31 @@ const templateColors: Record<string, string> = {
 
 export const ArtifactsTable: React.FC<ArtifactsTableProps> = ({
   artifactById,
-  worktreeById,
+  branchById,
   boardById,
   onUpdate,
   onDelete,
+  onClose,
 }) => {
   const [editModalOpen, setEditModalOpen] = useState(false);
   const [editingArtifact, setEditingArtifact] = useState<Artifact | null>(null);
+  const [searchTerm, setSearchTerm] = useState('');
   const [form] = Form.useForm();
+
+  // Reuses the `artifactById` prop so we don't read the same data via
+  // both props and context. Only goToArtifact is used from this table.
+  const navigation = useAppNavigation({ boardById, artifactById });
+
+  const handleRecenter = useCallback(
+    (artifact: Artifact) => {
+      // Close the modal first so the canvas isn't obscured by it after the
+      // pan/zoom. goToArtifact pushes the shareable URL and recenterMap
+      // handles the cross-board case via the queue+switch mechanism.
+      onClose?.();
+      navigation.goToArtifact(artifact.artifact_id);
+    },
+    [onClose, navigation]
+  );
 
   const handleEdit = (artifact: Artifact) => {
     setEditingArtifact(artifact);
@@ -92,11 +117,13 @@ export const ArtifactsTable: React.FC<ArtifactsTableProps> = ({
       dataIndex: 'name',
       key: 'name',
       render: (name: string, artifact: Artifact) => (
-        <Space direction="vertical" size={0}>
-          <Typography.Text strong>{name}</Typography.Text>
+        <Space orientation="vertical" size={0}>
+          <Typography.Text strong>
+            <HighlightMatch text={name} query={searchTerm} />
+          </Typography.Text>
           {artifact.description && (
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-              {artifact.description}
+              <HighlightMatch text={artifact.description} query={searchTerm} />
             </Typography.Text>
           )}
         </Space>
@@ -108,7 +135,9 @@ export const ArtifactsTable: React.FC<ArtifactsTableProps> = ({
       key: 'template',
       width: 120,
       render: (template: string) => (
-        <Tag color={templateColors[template] || 'default'}>{template}</Tag>
+        <Tag color={templateColors[template] || 'default'}>
+          <HighlightMatch text={template} query={searchTerm} />
+        </Tag>
       ),
     },
     {
@@ -131,16 +160,16 @@ export const ArtifactsTable: React.FC<ArtifactsTableProps> = ({
       },
     },
     {
-      title: 'Worktree',
-      dataIndex: 'worktree_id',
-      key: 'worktree_id',
+      title: 'Branch',
+      dataIndex: 'branch_id',
+      key: 'branch_id',
       width: 160,
-      render: (worktreeId: string | null) => {
-        if (!worktreeId) return <Typography.Text type="secondary">—</Typography.Text>;
-        const worktree = worktreeById.get(worktreeId);
+      render: (branchId: string | null) => {
+        if (!branchId) return <Typography.Text type="secondary">—</Typography.Text>;
+        const branch = branchById.get(branchId);
         return (
           <Typography.Text type="secondary">
-            {worktree?.name || worktreeId.slice(0, 8)}
+            <HighlightMatch text={branch?.name || shortId(branchId)} query={searchTerm} />
           </Typography.Text>
         );
       },
@@ -154,7 +183,10 @@ export const ArtifactsTable: React.FC<ArtifactsTableProps> = ({
         const board = boardById.get(boardId);
         return (
           <Typography.Text type="secondary">
-            {board ? `${board.icon || ''} ${board.name}`.trim() : boardId.slice(0, 8)}
+            <HighlightMatch
+              text={board ? `${board.icon || ''} ${board.name}`.trim() : shortId(boardId)}
+              query={searchTerm}
+            />
           </Typography.Text>
         );
       },
@@ -169,9 +201,33 @@ export const ArtifactsTable: React.FC<ArtifactsTableProps> = ({
     {
       title: 'Actions',
       key: 'actions',
-      width: 90,
+      width: 150,
       render: (_: unknown, artifact: Artifact) => (
         <Space size="small">
+          {artifact.board_id && (
+            <Tooltip title="Center map on artifact">
+              <Button
+                type="text"
+                size="small"
+                icon={<AimOutlined />}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleRecenter(artifact);
+                }}
+              />
+            </Tooltip>
+          )}
+          <Tooltip title="Open fullscreen">
+            <Button
+              type="text"
+              size="small"
+              icon={<ExportOutlined />}
+              href={uiRouteHref(artifactFullscreenPath(artifact.artifact_id as ArtifactID))}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={(e) => e.stopPropagation()}
+            />
+          </Tooltip>
           <Tooltip title="Edit artifact">
             <Button
               type="text"
@@ -197,16 +253,47 @@ export const ArtifactsTable: React.FC<ArtifactsTableProps> = ({
     },
   ];
 
-  const dataSource = mapToSortedArray(artifactById, (a, b) =>
-    a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
-  ).filter((artifact) => !artifact.archived);
+  const dataSource = useMemo(() => {
+    const activeArtifacts = mapToSortedArray(artifactById, (a, b) =>
+      a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+    ).filter((artifact) => !artifact.archived);
+    return filterBySettingsSearch(activeArtifacts, searchTerm, [
+      (artifact) => artifact.name,
+      (artifact) => artifact.description,
+      (artifact) => artifact.template,
+      (artifact) => artifact.build_status,
+      (artifact) => artifact.artifact_id,
+      (artifact) => {
+        const branch = artifact.branch_id ? branchById.get(artifact.branch_id) : undefined;
+        return [branch?.name, branch?.ref, artifact.branch_id];
+      },
+      (artifact) => {
+        const board = boardById.get(artifact.board_id);
+        return [board?.name, board?.slug, artifact.board_id];
+      },
+    ]);
+  }, [artifactById, searchTerm, branchById, boardById]);
 
   return (
     <div>
-      <div style={{ marginBottom: 16 }}>
+      <div
+        style={{
+          marginBottom: 16,
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+        }}
+      >
         <Typography.Text type="secondary">
           Live web application artifacts created by agents via MCP tools.
         </Typography.Text>
+        <Input
+          allowClear
+          placeholder="Search name, description, template, branch, or board"
+          value={searchTerm}
+          onChange={(event) => setSearchTerm(event.target.value)}
+          style={{ width: 360 }}
+        />
       </div>
 
       {dataSource.length === 0 ? (

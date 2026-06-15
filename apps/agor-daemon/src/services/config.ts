@@ -14,7 +14,44 @@ import {
 } from '@agor/core/config';
 import type { Database } from '@agor/core/db';
 import type { Application } from '@agor/core/feathers';
-import type { Params, TaskID, UserID } from '@agor/core/types';
+import { BadRequest, Forbidden, NotAuthenticated } from '@agor/core/feathers';
+import {
+  type AgenticToolName,
+  type AuthenticatedParams,
+  type Params,
+  type TaskID,
+  TOOL_API_KEY_NAMES,
+  type UserID,
+} from '@agor/core/types';
+
+const RESOLVABLE_API_KEY_NAMES: Record<ApiKeyName, true> = {
+  ANTHROPIC_API_KEY: true,
+  ANTHROPIC_AUTH_TOKEN: true,
+  CLAUDE_CODE_OAUTH_TOKEN: true,
+  OPENAI_API_KEY: true,
+  GEMINI_API_KEY: true,
+  COPILOT_GITHUB_TOKEN: true,
+  CURSOR_API_KEY: true,
+};
+
+function isResolvableApiKeyName(value: string): value is ApiKeyName {
+  return Object.hasOwn(RESOLVABLE_API_KEY_NAMES, value);
+}
+
+type ExecutorTokenPayload = {
+  type?: string;
+  purpose?: string;
+  task_id?: string;
+};
+
+function getExecutorTokenPayload(params?: Params): ExecutorTokenPayload | undefined {
+  const payload = (params as AuthenticatedParams | undefined)?.authentication?.payload as
+    | ExecutorTokenPayload
+    | undefined;
+  return payload?.type === 'executor-session' && payload.purpose === 'executor-task'
+    ? payload
+    : undefined;
+}
 
 /**
  * Mask API keys for secure display
@@ -91,32 +128,103 @@ export class ConfigService {
    * This allows executors to request API key resolution without direct database access.
    * The service handles the precedence: user-level > config > env > native auth.
    *
-   * Called via: client.service('config').resolveApiKey({ taskId, keyName })
+   * Called via: client.service('config/resolve-api-key').create({ taskId, keyName })
    */
-  async resolveApiKey(data: { taskId: TaskID; keyName: string }): Promise<{
+  async resolveApiKey(
+    data: {
+      taskId: TaskID;
+      keyName: string;
+      /**
+       * Restrict the per-user lookup to this tool's credential bucket. Executors
+       * always pass this; absent it, the resolver falls back to a cross-tool
+       * sweep (legacy behavior preserved for non-SDK callers).
+       */
+      tool?: AgenticToolName;
+    },
+    params?: Params
+  ): Promise<{
     apiKey: string | null;
     source: 'user' | 'config' | 'env' | 'native';
     useNativeAuth: boolean;
     decryptionFailed?: boolean;
   }> {
-    const { taskId, keyName } = data;
+    const { taskId, keyName, tool } = data;
+    if (!isResolvableApiKeyName(keyName)) {
+      throw new BadRequest('Unsupported API key name');
+    }
 
-    // Fetch task to get creator user ID
+    // This method returns plaintext secret material and is only for trusted
+    // daemon/executor flows. External callers must authenticate either as the
+    // service account or with a task-scoped executor runtime JWT. Normal
+    // user/API-key auth may read masked config via /config but must not resolve
+    // raw configured keys.
+    const executorPayload = getExecutorTokenPayload(params);
+    if (params?.provider) {
+      const caller = (params as AuthenticatedParams | undefined)?.user;
+      const isServiceAccount = caller?._isServiceAccount === true;
+      if (!isServiceAccount && !executorPayload) {
+        if (!caller) {
+          throw new NotAuthenticated('Authentication required');
+        }
+        throw new Forbidden('Only executor runtime credentials may resolve API keys');
+      }
+      if (executorPayload?.task_id && executorPayload.task_id !== taskId) {
+        throw new Forbidden('Executor token task scope does not match this request');
+      }
+    }
+
+    // Fetch task to get creator user ID and session. This is required for
+    // executor-token calls and best-effort for internal/service-account calls.
     let userId: UserID | undefined;
+    let sessionId: string | undefined;
     try {
       const tasksService = this.app?.service('tasks');
       if (tasksService) {
         const task = await tasksService.get(taskId, { provider: undefined });
         userId = task?.created_by;
+        sessionId = task?.session_id;
       }
     } catch (err) {
       console.warn(`[Config.resolveApiKey] Failed to fetch task ${taskId}:`, err);
+      if (executorPayload) {
+        throw new Forbidden('Executor token task scope could not be verified');
+      }
+    }
+
+    if (executorPayload && (!userId || !sessionId)) {
+      throw new Forbidden('Executor token task scope could not be verified');
+    }
+
+    // Executor runtime calls are narrowly scoped to the SDK for this session.
+    // Do not let a compromised executor token ask for another tool's bucket or
+    // an unrelated credential name.
+    if (executorPayload) {
+      const verifiedSessionId = sessionId;
+      if (!verifiedSessionId) {
+        throw new Forbidden('Executor token task scope could not be verified');
+      }
+      if (!tool) {
+        throw new BadRequest('Tool is required for executor API key resolution');
+      }
+      const expectedKeyName = TOOL_API_KEY_NAMES[tool];
+      if (!expectedKeyName || expectedKeyName !== keyName) {
+        throw new Forbidden('Executor token is not valid for this API key');
+      }
+      const sessionsService = this.app?.service('sessions');
+      if (!sessionsService) {
+        throw new Forbidden('Executor token tool scope could not be verified');
+      }
+      const session = await sessionsService.get(verifiedSessionId, { provider: undefined });
+      if (session?.agentic_tool !== tool) {
+        throw new Forbidden('Executor token tool scope does not match this session');
+      }
     }
 
     // Use core resolveApiKey with database access
-    const result = await resolveApiKey(keyName as ApiKeyName, {
+    const result = await resolveApiKey(keyName, {
       userId,
       db: this.db,
+      tool,
     });
 
     // Map KeyResolutionResult to service response type
@@ -191,25 +299,6 @@ export class ConfigService {
       }
       if (data.onboarding.frameworkRepoUrl !== undefined) {
         config.onboarding.frameworkRepoUrl = data.onboarding.frameworkRepoUrl;
-      }
-    }
-
-    // Allow updating codex configuration
-    if (data.codex) {
-      if (!config.codex) {
-        config.codex = {};
-      }
-
-      if (data.codex.home !== undefined) {
-        const home = data.codex.home;
-        if (home === null || home === '') {
-          // Treat empty string as unset
-          delete config.codex.home;
-        } else if (typeof home === 'string') {
-          config.codex.home = home;
-        } else {
-          throw new Error('codex.home must be a string');
-        }
       }
     }
 

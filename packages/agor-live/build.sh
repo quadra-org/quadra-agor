@@ -13,6 +13,11 @@
 
 set -e  # Exit on error
 
+# Raise Node's heap ceiling so DTS generation in @agor/core (~3 GB peak) and
+# vite/next bundle steps don't OOM on low-RAM hosts. User-set NODE_OPTIONS
+# wins because Node honors the last `--max-old-space-size` it sees.
+export NODE_OPTIONS="--max-old-space-size=4096 ${NODE_OPTIONS:-}"
+
 # ── Parse flags ──────────────────────────────────────────────────────────────
 
 PUBLISH=false
@@ -126,37 +131,26 @@ rm -rf "$CLIENT_DIR/dist"
 mkdir -p "$DIST_STAGE"
 
 # ── Build all components ─────────────────────────────────────────────────────
+#
+# Use turbo to build everything in workspace-dependency order. turbo.json
+# declares `"dependsOn": ["^build"]`, so e.g. @agor/cli (which imports types
+# from @agor/daemon) waits for daemon's dist/index.d.ts before its own DTS
+# step runs. Hand-ordering this sequence is fragile — every time someone
+# adds a new cross-package import the wrong order silently passes locally
+# (because of stale dist/) and explodes on a clean CI checkout.
+#
+# Excludes @agor/docs (Nextra docs site, not part of the published artifact).
+# NODE_ENV=production matters for the UI's vite build; harmless for the rest.
 
 echo ""
-echo "📦 Building @agor/core..."
-cd "$REPO_ROOT/packages/core"
-pnpm build
+echo "📦 Building all workspace packages (turbo, dep-ordered)..."
+cd "$REPO_ROOT"
+NODE_ENV=production pnpm exec turbo run build --filter='!@agor/docs'
 
 echo ""
-echo "📦 Building @agor-live/client..."
+echo "🔍 Verifying @agor-live/client pack..."
 cd "$CLIENT_DIR"
-pnpm build
 pnpm check:pack
-
-echo ""
-echo "⚙️  Building Daemon..."
-cd "$REPO_ROOT/apps/agor-daemon"
-pnpm build
-
-echo ""
-echo "🖥️  Building CLI..."
-cd "$REPO_ROOT/apps/agor-cli"
-pnpm build
-
-echo ""
-echo "🔧 Building Executor..."
-cd "$REPO_ROOT/packages/executor"
-pnpm build
-
-echo ""
-echo "🎨 Building UI..."
-cd "$REPO_ROOT/apps/agor-ui"
-NODE_ENV=production pnpm build
 
 # ── Build self-hosted Sandpack bundler (optional) ────────────────────────────
 
@@ -241,6 +235,9 @@ cp -r "$REPO_ROOT/apps/agor-cli/dist/"* "$DIST_STAGE/cli/"
 
 echo "  → Copying daemon..."
 mkdir -p "$DIST_STAGE/daemon"
+# .build-info (sha + builtAt) is stamped into apps/agor-daemon/dist by the
+# daemon's own build script (apps/agor-daemon/scripts/stamp-build-info.mjs)
+# and gets carried along by this cp -r. loadBuildInfo() reads it at boot.
 cp -r "$REPO_ROOT/apps/agor-daemon/dist/"* "$DIST_STAGE/daemon/"
 
 echo "  → Copying executor..."
@@ -318,18 +315,24 @@ if [[ "$PUBLISH" == true ]]; then
     echo "🧪 Dry run — showing what would be published..."
     echo ""
     echo "── agor-live@$NEW_VERSION ──"
-    cd "$SCRIPT_DIR" && npm publish --dry-run 2>&1 | tail -20
+    cd "$SCRIPT_DIR" && pnpm publish --dry-run --no-git-checks 2>&1 | tail -20
     echo ""
     echo "── @agor-live/client@$NEW_VERSION ──"
-    cd "$CLIENT_DIR" && npm publish --access public --dry-run 2>&1 | tail -20
+    cd "$CLIENT_DIR" && pnpm publish --access public --dry-run --no-git-checks 2>&1 | tail -20
   else
     echo "🚀 Publishing packages..."
     echo ""
+    # IMPORTANT: use `pnpm publish` (not `npm publish`). pnpm transforms
+    # `workspace:*` into a concrete semver range when packing the tarball;
+    # plain `npm publish` leaves the protocol verbatim and breaks consumers.
+    # `--no-git-checks` skips pnpm's "branch must be main / clean tree" guard
+    # since this script runs from feature/release branches with dist/ artifacts.
     echo "── Publishing agor-live@$NEW_VERSION ──"
-    cd "$SCRIPT_DIR" && npm login && npm publish
+    cd "$SCRIPT_DIR" && npm whoami >/dev/null 2>&1 || npm login
+    cd "$SCRIPT_DIR" && pnpm publish --no-git-checks
     echo ""
     echo "── Publishing @agor-live/client@$NEW_VERSION ──"
-    cd "$CLIENT_DIR" && npm publish --access public
+    cd "$CLIENT_DIR" && pnpm publish --access public --no-git-checks
     echo ""
     echo "✅ Both packages published!"
     echo "  npm i agor-live@$NEW_VERSION"

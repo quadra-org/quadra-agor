@@ -11,7 +11,7 @@ import type { User, UserID } from '../types';
 import { normalizeRole } from '../types/user';
 import type { Database } from './client';
 import { insert, select } from './database-wrapper';
-import { users } from './schema';
+import { type UserRow, users } from './schema';
 
 /**
  * Create user input
@@ -22,6 +22,39 @@ export interface CreateUserData {
   name?: string;
   role?: 'superadmin' | 'admin' | 'member' | 'viewer';
   unix_username?: string;
+  /**
+   * Force the user to change their password on first login. Set this for
+   * any user whose initial password was generated/printed (e.g. the
+   * first-run bootstrap admin) so the cleartext doesn't stay valid.
+   */
+  must_change_password?: boolean;
+}
+
+/**
+ * Convert a raw `users` row into the canonical `User` model. Centralized so
+ * all callers agree on field handling — JSON-bag fields (avatar, preferences)
+ * come from `row.data`, role goes through `normalizeRole`, and nullable DB
+ * columns become `undefined` rather than `null`.
+ */
+export function userRowToUser(row: UserRow): User {
+  const userData = (row.data ?? {}) as {
+    avatar?: string;
+    preferences?: Record<string, unknown>;
+  };
+  return {
+    user_id: row.user_id as UserID,
+    email: row.email,
+    name: row.name ?? undefined,
+    emoji: row.emoji ?? undefined,
+    role: normalizeRole(row.role ?? undefined),
+    unix_username: row.unix_username ?? undefined,
+    avatar: userData.avatar,
+    preferences: userData.preferences,
+    onboarding_completed: !!row.onboarding_completed,
+    must_change_password: !!row.must_change_password,
+    created_at: row.created_at,
+    updated_at: row.updated_at ?? undefined,
+  };
 }
 
 /**
@@ -50,7 +83,7 @@ export async function createUser(db: Database, data: CreateUserData): Promise<Us
   const user_id = generateId() as UserID;
 
   const role = data.role || 'member';
-  const defaultEmoji = role === 'admin' ? '⭐' : '👤';
+  const defaultEmoji = role === 'superadmin' || role === 'admin' ? '⭐' : '👤';
 
   // For PostgreSQL, we need to use ISO strings for timestamps
   // For SQLite, Date objects work because of timestamp_ms mode
@@ -66,6 +99,7 @@ export async function createUser(db: Database, data: CreateUserData): Promise<Us
       emoji: defaultEmoji,
       role,
       unix_username: data.unix_username ?? null,
+      must_change_password: data.must_change_password ?? false,
       created_at: createdAt,
       updated_at: updatedAt,
       data: {
@@ -75,23 +109,7 @@ export async function createUser(db: Database, data: CreateUserData): Promise<Us
     .returning()
     .one();
 
-  // Convert to User type
-  const userData = row.data as { avatar?: string; preferences?: Record<string, unknown> };
-
-  return {
-    user_id: row.user_id as UserID,
-    email: row.email,
-    name: row.name ?? undefined,
-    emoji: row.emoji ?? undefined,
-    role: normalizeRole(row.role ?? undefined),
-    unix_username: row.unix_username ?? undefined,
-    avatar: userData.avatar,
-    preferences: userData.preferences,
-    onboarding_completed: !!row.onboarding_completed,
-    must_change_password: !!row.must_change_password,
-    created_at: row.created_at,
-    updated_at: row.updated_at ?? undefined,
-  };
+  return userRowToUser(row);
 }
 
 /**
@@ -115,57 +133,99 @@ export async function userExists(db: Database, email: string): Promise<boolean> 
  */
 export async function getUserByEmail(db: Database, email: string): Promise<User | null> {
   const row = await select(db).from(users).where(eq(users.email, email)).one();
-
-  if (!row) {
-    return null;
-  }
-
-  const userData = row.data as { avatar?: string; preferences?: Record<string, unknown> };
-
-  return {
-    user_id: row.user_id as UserID,
-    email: row.email,
-    name: row.name ?? undefined,
-    emoji: row.emoji ?? undefined,
-    role: normalizeRole(row.role ?? undefined),
-    unix_username: row.unix_username ?? undefined,
-    avatar: userData.avatar,
-    preferences: userData.preferences,
-    onboarding_completed: !!row.onboarding_completed,
-    must_change_password: !!row.must_change_password,
-    created_at: row.created_at,
-    updated_at: row.updated_at ?? undefined,
-  };
+  return row ? userRowToUser(row) : null;
 }
 
 /**
- * Default admin user credentials
- * Used by both init and user create-admin commands
+ * Development-only admin user credentials.
+ *
+ * Never use this in production/bootstrap paths. Production first-run setup
+ * should use an operator-provided password or a generated one-time credential
+ * file (see first-run-bootstrap / daemon setup).
  */
-export const DEFAULT_ADMIN_USER = {
+export const DEVELOPMENT_DEFAULT_ADMIN_USER = {
   email: 'admin@agor.live',
   password: 'admin',
   name: 'Admin',
-  role: 'admin' as const,
+  role: 'superadmin' as const,
+  unix_username: 'admin',
 };
 
+export const MIN_BOOTSTRAP_ADMIN_PASSWORD_LENGTH = 8;
+
+export function assertUsableBootstrapAdminPassword(
+  password: string,
+  label: string = 'Bootstrap admin password'
+): void {
+  if (password === DEVELOPMENT_DEFAULT_ADMIN_USER.password) {
+    throw new Error(`${label} must not be the legacy fixed default password.`);
+  }
+  if (password.length < MIN_BOOTSTRAP_ADMIN_PASSWORD_LENGTH) {
+    throw new Error(`${label} must be at least ${MIN_BOOTSTRAP_ADMIN_PASSWORD_LENGTH} characters.`);
+  }
+}
+
+export interface CreateDefaultAdminUserOptions {
+  email?: string;
+  password?: string;
+  name?: string;
+  unix_username?: string;
+  /**
+   * Explicitly opt into the legacy admin@agor.live/admin credential for
+   * development/test ergonomics. Refused when NODE_ENV=production.
+   */
+  allowDevelopmentDefault?: boolean;
+}
+
 /**
- * Create default admin user (admin@agor.live / admin)
+ * Create bootstrap admin user.
  *
- * This is a convenience function for creating the default admin user
- * with hardcoded credentials. Use createUser() if you need custom credentials.
+ * Production callers must pass an explicit password. The fixed
+ * admin@agor.live/admin credential is available only behind an explicit
+ * development/test gate.
  *
  * @param db - Database instance
+ * @param options - Admin identity/password options
  * @returns Created user
  * @throws Error if admin user already exists
  */
-export async function createDefaultAdminUser(db: Database): Promise<User> {
-  // Check if admin user already exists
-  const existing = await getUserByEmail(db, DEFAULT_ADMIN_USER.email);
-
-  if (existing) {
-    throw new Error(`Admin user already exists (email: ${DEFAULT_ADMIN_USER.email})`);
+export async function createDefaultAdminUser(
+  db: Database,
+  options: CreateDefaultAdminUserOptions = {}
+): Promise<User> {
+  const useDevelopmentDefault = options.allowDevelopmentDefault === true;
+  if (!options.password && !useDevelopmentDefault) {
+    throw new Error(
+      'Refusing to create admin with fixed default credentials. Pass an explicit password, or set allowDevelopmentDefault only in development/test.'
+    );
+  }
+  if (options.password && !useDevelopmentDefault) {
+    assertUsableBootstrapAdminPassword(options.password);
+  }
+  if (useDevelopmentDefault && process.env.NODE_ENV === 'production') {
+    throw new Error('Refusing development default admin credentials when NODE_ENV=production');
   }
 
-  return createUser(db, DEFAULT_ADMIN_USER);
+  const adminData = {
+    ...DEVELOPMENT_DEFAULT_ADMIN_USER,
+    ...options,
+    password: options.password ?? DEVELOPMENT_DEFAULT_ADMIN_USER.password,
+    role: 'superadmin' as const,
+  };
+
+  // Check if admin user already exists
+  const existing = await getUserByEmail(db, adminData.email);
+
+  if (existing) {
+    throw new Error(`Admin user already exists (email: ${adminData.email})`);
+  }
+
+  return createUser(db, {
+    email: adminData.email,
+    password: adminData.password,
+    name: adminData.name,
+    role: adminData.role,
+    unix_username: adminData.unix_username,
+    must_change_password: !useDevelopmentDefault,
+  });
 }

@@ -1,18 +1,29 @@
 import {
+  type AgorClient,
   AVAILABLE_CLAUDE_MODEL_ALIASES,
   CODEX_MODEL_METADATA,
+  COPILOT_MODEL_METADATA,
+  CURSOR_MODEL_METADATA,
   DEFAULT_CODEX_MODEL,
+  DEFAULT_COPILOT_MODEL,
   GEMINI_MODELS,
   type GeminiModel,
 } from '@agor-live/client';
 import { InfoCircleOutlined } from '@ant-design/icons';
-import { Input, Radio, Select, Space, Tooltip } from 'antd';
-import { useState } from 'react';
+import { Input, Radio, Select, Space, Tooltip, theme } from 'antd';
+import { useEffect, useState } from 'react';
+import {
+  DEFAULT_CURSOR_MODEL,
+  ensureDefaultModelOption,
+  getModelSelectorFallbackModel,
+} from './modelDefaults';
 import { type OpenCodeModelConfig, OpenCodeModelSelector } from './OpenCodeModelSelector';
 
 export interface ModelConfig {
   mode: 'alias' | 'exact';
   model: string;
+  // Claude Code-specific: server-side advisor tool model.
+  advisorModel?: string;
   // OpenCode-specific: provider + model
   provider?: string;
 }
@@ -20,8 +31,44 @@ export interface ModelConfig {
 export interface ModelSelectorProps {
   value?: ModelConfig;
   onChange?: (config: ModelConfig) => void;
-  agent?: 'claude-code' | 'codex' | 'gemini' | 'opencode' | 'copilot'; // Kept as 'agent' for backwards compat in prop name
-  agentic_tool?: 'claude-code' | 'codex' | 'gemini' | 'opencode' | 'copilot';
+  agent?:
+    | 'claude-code'
+    | 'claude-code-cli'
+    | 'codex'
+    | 'gemini'
+    | 'opencode'
+    | 'copilot'
+    | 'cursor'; // Kept as 'agent' for backwards compat in prop name
+  agentic_tool?:
+    | 'claude-code'
+    | 'claude-code-cli'
+    | 'codex'
+    | 'gemini'
+    | 'opencode'
+    | 'copilot'
+    | 'cursor';
+  /**
+   * Optional Feathers client. When provided AND the agentic tool supports
+   * dynamic model discovery (Copilot/Cursor), the picker fetches the live
+   * model list server-side and merges it with the static fallback. Without a
+   * client, the picker only shows static models.
+   */
+  client?: AgorClient | null;
+  /** Render as a single compact dropdown suitable for popovers/toolbars. */
+  compact?: boolean;
+}
+
+interface DynamicModelOption {
+  id: string;
+  displayName: string;
+  description?: string;
+  source: 'dynamic' | 'static';
+}
+
+interface DynamicModelsResponse {
+  default: string;
+  models: DynamicModelOption[];
+  source: 'dynamic' | 'static';
 }
 
 // Codex model options (derived from @agor/core metadata)
@@ -38,6 +85,35 @@ const GEMINI_MODEL_OPTIONS = Object.entries(GEMINI_MODELS).map(([modelId, meta])
   description: meta.description,
 }));
 
+// Copilot model options (static fallback). The dynamic list from the SDK's
+// listModels() is fetched server-side and may include BYOK-configured models
+// not represented here.
+const COPILOT_STATIC_MODEL_OPTIONS = Object.entries(COPILOT_MODEL_METADATA).map(
+  ([modelId, meta]) => ({
+    id: modelId,
+    label: meta.name,
+    description: meta.description,
+  })
+);
+
+const CURSOR_MODEL_OPTIONS = [
+  {
+    id: DEFAULT_CURSOR_MODEL,
+    label: CURSOR_MODEL_METADATA[DEFAULT_CURSOR_MODEL].displayName,
+    description: CURSOR_MODEL_METADATA[DEFAULT_CURSOR_MODEL].description,
+  },
+];
+
+function preferDefaultModel<T extends { id: string }>(models: T[], defaultModel: string): T[] {
+  const defaultIndex = models.findIndex((model) => model.id === defaultModel);
+  if (defaultIndex <= 0) return models;
+  return [
+    models[defaultIndex],
+    ...models.slice(0, defaultIndex),
+    ...models.slice(defaultIndex + 1),
+  ];
+}
+
 /**
  * Model Selector Component
  *
@@ -52,15 +128,104 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
   onChange,
   agent,
   agentic_tool,
+  client,
+  compact = false,
 }) => {
+  const { token } = theme.useToken();
+
   // Determine which model list to use based on agentic_tool (with backwards compat for agent prop)
   const effectiveTool = agentic_tool || agent || 'claude-code';
 
-  // Calculate model list (needed for initial mode calculation)
-  // Copilot models are discovered dynamically via listModels() — use a placeholder
-  const COPILOT_MODEL_OPTIONS = [
-    { id: 'default', label: 'Default', description: 'Use Copilot default model' },
-  ];
+  // Copilot model list — fetched once when the picker opens for Copilot and
+  // a client is available. The daemon returns either the live `listModels()`
+  // result (source: 'dynamic') or the static fallback (source: 'static',
+  // typically when no GitHub token is configured). Either way we render
+  // whatever the server returns; the local static list is a last-resort
+  // fallback for when the call itself fails.
+  const [copilotServerOptions, setCopilotServerOptions] = useState<Array<{
+    id: string;
+    label: string;
+    description?: string;
+  }> | null>(null);
+  const [copilotSource, setCopilotSource] = useState<'dynamic' | 'static' | null>(null);
+  const [cursorServerOptions, setCursorServerOptions] = useState<Array<{
+    id: string;
+    label: string;
+    description?: string;
+  }> | null>(null);
+  const [cursorSource, setCursorSource] = useState<'dynamic' | 'static' | null>(null);
+  const [copilotDefaultModel, setCopilotDefaultModel] = useState(DEFAULT_COPILOT_MODEL);
+  const [cursorDefaultModel, setCursorDefaultModel] = useState(DEFAULT_CURSOR_MODEL);
+
+  useEffect(() => {
+    if (effectiveTool !== 'copilot' || !client) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const raw = await client.service('copilot-models').find();
+        const response = raw as unknown as DynamicModelsResponse;
+        if (cancelled || !response?.models?.length) return;
+        const defaultModel = response.default || DEFAULT_COPILOT_MODEL;
+        const models = response.models.map((m) => ({
+          id: m.id,
+          label: m.displayName,
+          description: m.description,
+        }));
+        setCopilotServerOptions(
+          preferDefaultModel(
+            ensureDefaultModelOption(models, defaultModel, (id) => ({
+              id,
+              label: id,
+              description: 'Default model',
+            })),
+            defaultModel
+          )
+        );
+        setCopilotDefaultModel(defaultModel);
+        setCopilotSource(response.source);
+      } catch {
+        // Silent fallback to local static — best-effort.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [effectiveTool, client]);
+
+  useEffect(() => {
+    if (effectiveTool !== 'cursor' || !client) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const raw = await client.service('cursor-models').find();
+        const response = raw as unknown as DynamicModelsResponse;
+        if (cancelled || !response?.models?.length) return;
+        const defaultModel = response.default || DEFAULT_CURSOR_MODEL;
+        const models = response.models.map((m) => ({
+          id: m.id,
+          label: m.displayName,
+          description: m.description,
+        }));
+        setCursorServerOptions(
+          preferDefaultModel(
+            ensureDefaultModelOption(models, defaultModel, (id) => ({
+              id,
+              label: id,
+              description: 'Default model',
+            })),
+            defaultModel
+          )
+        );
+        setCursorDefaultModel(defaultModel);
+        setCursorSource(response.source);
+      } catch {
+        // Silent fallback to local static — best-effort.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [effectiveTool, client]);
 
   const modelList =
     effectiveTool === 'codex'
@@ -70,8 +235,10 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
         : effectiveTool === 'opencode'
           ? [] // OpenCode doesn't use this list
           : effectiveTool === 'copilot'
-            ? COPILOT_MODEL_OPTIONS
-            : AVAILABLE_CLAUDE_MODEL_ALIASES;
+            ? (copilotServerOptions ?? COPILOT_STATIC_MODEL_OPTIONS)
+            : effectiveTool === 'cursor'
+              ? preferDefaultModel(cursorServerOptions ?? CURSOR_MODEL_OPTIONS, cursorDefaultModel)
+              : AVAILABLE_CLAUDE_MODEL_ALIASES;
 
   // Determine initial mode based on whether the value is in the aliases list
   // If no value provided, default to 'alias' mode (recommended)
@@ -106,26 +273,20 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
     );
   }
 
+  const fallbackModel = getModelSelectorFallbackModel(effectiveTool, modelList, {
+    copilotDefaultModel,
+    cursorDefaultModel,
+  });
+
   const handleModeChange = (newMode: 'alias' | 'exact') => {
     setMode(newMode);
     if (onChange) {
-      // When switching modes, provide a default model
-      let defaultModel: string;
-      if (newMode === 'alias') {
-        defaultModel = modelList[0].id;
-      } else if (effectiveTool === 'codex') {
-        defaultModel = DEFAULT_CODEX_MODEL;
-      } else if (effectiveTool === 'gemini') {
-        defaultModel = 'gemini-2.5-flash';
-      } else if (effectiveTool === 'copilot') {
-        defaultModel = 'default';
-      } else {
-        // claude-code (opencode is handled earlier in the component)
-        defaultModel = 'claude-sonnet-4-6';
-      }
+      // When switching modes, provide the same effective default the daemon
+      // applies if the form is submitted without a model_config.
       onChange({
+        ...value,
         mode: newMode,
-        model: value?.model || defaultModel,
+        model: value?.model || fallbackModel,
       });
     }
   };
@@ -133,11 +294,47 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
   const handleModelChange = (newModel: string) => {
     if (onChange) {
       onChange({
+        ...value,
         mode,
         model: newModel,
       });
     }
   };
+
+  const handleAdvisorModelChange = (advisorModel: string | undefined) => {
+    if (onChange) {
+      onChange({
+        ...value,
+        mode,
+        model: value?.model || fallbackModel,
+        advisorModel,
+      });
+    }
+  };
+
+  if (compact) {
+    const currentValue = value?.model || fallbackModel;
+    const options = modelList.map((m) => ({
+      value: m.id,
+      label: m.id,
+    }));
+    if (currentValue && !options.some((option) => option.value === currentValue)) {
+      options.unshift({ value: currentValue, label: currentValue });
+    }
+
+    return (
+      <Select
+        value={currentValue}
+        onChange={handleModelChange}
+        size="small"
+        showSearch
+        optionFilterProp="label"
+        popupMatchSelectWidth={false}
+        style={{ width: '100%', fontSize: token.fontSizeSM }}
+        options={options}
+      />
+    );
+  }
 
   return (
     <Space orientation="vertical" style={{ width: '100%' }}>
@@ -155,7 +352,9 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
           {mode === 'alias' && (
             <div style={{ marginLeft: 24, marginTop: 8 }}>
               <Select
-                value={value?.model || modelList[0].id}
+                showSearch
+                optionFilterProp="label"
+                value={value?.model || fallbackModel}
                 onChange={handleModelChange}
                 style={{ width: '100%', minWidth: 400 }}
                 options={modelList.map((m) => ({
@@ -163,6 +362,35 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
                   label: m.id,
                 }))}
               />
+              {effectiveTool === 'copilot' && copilotSource && (
+                <div style={{ marginTop: 6, fontSize: 12, color: 'rgba(255, 255, 255, 0.45)' }}>
+                  {copilotSource === 'dynamic' ? (
+                    <>
+                      Live list from your Copilot account (via SDK <code>listModels()</code>).
+                    </>
+                  ) : (
+                    <>
+                      Showing static fallback. Set <code>COPILOT_GITHUB_TOKEN</code> on the daemon
+                      to see your account's live list (including BYOK models).
+                    </>
+                  )}
+                </div>
+              )}
+              {effectiveTool === 'cursor' && cursorSource && (
+                <div style={{ marginTop: 6, fontSize: 12, color: 'rgba(255, 255, 255, 0.45)' }}>
+                  {cursorSource === 'dynamic' ? (
+                    <>
+                      Live list from your Cursor account (via SDK <code>Cursor.models.list()</code>
+                      ).
+                    </>
+                  ) : (
+                    <>
+                      Showing static fallback. Set <code>CURSOR_API_KEY</code> to see your account's
+                      live Cursor model list.
+                    </>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -187,7 +415,9 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
                       ? 'e.g., gemini-2.5-pro'
                       : effectiveTool === 'copilot'
                         ? 'e.g., gpt-4o or claude-3.5-sonnet'
-                        : 'e.g., claude-opus-4-20250514' // claude-code (opencode handled earlier)
+                        : effectiveTool === 'cursor'
+                          ? `e.g., ${DEFAULT_CURSOR_MODEL}`
+                          : 'e.g., claude-opus-4-20250514' // claude-code (opencode handled earlier)
                 }
                 style={{ width: '100%', minWidth: 400 }}
               />
@@ -201,7 +431,9 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
                         ? 'https://ai.google.dev/gemini-api/docs/models'
                         : effectiveTool === 'copilot'
                           ? 'https://github.com/features/copilot'
-                          : 'https://platform.claude.com/docs/en/about-claude/models' // claude-code (opencode handled earlier)
+                          : effectiveTool === 'cursor'
+                            ? 'https://cursor.com/docs/api/sdk/typescript'
+                            : 'https://platform.claude.com/docs/en/about-claude/models' // claude-code (opencode handled earlier)
                   }
                   target="_blank"
                   rel="noopener noreferrer"
@@ -215,6 +447,30 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
           )}
         </Space>
       </Radio.Group>
+
+      {(effectiveTool === 'claude-code' || effectiveTool === 'claude-code-cli') && (
+        <div>
+          <Space size={4}>
+            <span>Advisor model</span>
+            <Tooltip title="Optional Claude Code advisor tool model. Leave unset to use existing Claude settings or disable session-level override.">
+              <InfoCircleOutlined />
+            </Tooltip>
+          </Space>
+          <Select
+            allowClear
+            showSearch
+            optionFilterProp="label"
+            placeholder="Not set"
+            value={value?.advisorModel}
+            onChange={handleAdvisorModelChange}
+            style={{ width: '100%', minWidth: 400, marginTop: 8 }}
+            options={AVAILABLE_CLAUDE_MODEL_ALIASES.map((model) => ({
+              value: model.id,
+              label: model.id,
+            }))}
+          />
+        </div>
+      )}
     </Space>
   );
 };

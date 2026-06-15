@@ -7,8 +7,8 @@ import type {
   Board,
   BoardEntityObject,
   BoardObject,
+  Branch,
   Session,
-  Worktree,
 } from '@agor-live/client';
 import { useCallback, useMemo, useRef } from 'react';
 import type { Node } from 'reactflow';
@@ -17,26 +17,31 @@ import { mapToArray } from '@/utils/mapHelpers';
 interface UseBoardObjectsProps {
   board: Board | null;
   client: AgorClient | null;
-  sessionsByWorktree: Map<string, Session[]>; // O(1) worktree filtering
-  worktrees: Worktree[];
+  sessionsByBranch: Map<string, Session[]>; // O(1) branch filtering
+  branches: Branch[];
   boardObjectById: Map<string, BoardEntityObject>; // Map-based board object storage
   setNodes: React.Dispatch<React.SetStateAction<Node[]>>;
   deletedObjectsRef: React.MutableRefObject<Set<string>>;
   eraserMode?: boolean;
   selectedSessionId?: string | null;
+  /** Artifact ID currently targeted by an `/a/<…>/` deep link. Used to
+   *  flag the matching ArtifactNode so it can render the dashed
+   *  "selected" outline. */
+  activeUrlTargetArtifactId?: string | null;
   onEditMarkdown?: (objectId: string, content: string, width: number) => void;
 }
 
 export const useBoardObjects = ({
   board,
   client,
-  sessionsByWorktree,
-  worktrees,
+  sessionsByBranch,
+  branches,
   boardObjectById,
   setNodes,
   deletedObjectsRef,
   eraserMode = false,
   selectedSessionId,
+  activeUrlTargetArtifactId,
   onEditMarkdown,
 }: UseBoardObjectsProps) => {
   // Use ref to avoid recreating callbacks when board changes
@@ -49,18 +54,18 @@ export const useBoardObjects = ({
   // biome-ignore lint/correctness/useExhaustiveDependencies: Intentionally using JSON serialization for deep equality
   const boardObjects = useMemo(() => board?.objects, [boardObjectsJson]);
 
-  // Get session IDs for this board (worktree-centric model)
+  // Get session IDs for this board (branch-centric model)
   const _boardSessionIds = useMemo(() => {
     if (!board) return [];
-    const boardWorktreeIds = worktrees
+    const boardBranchIds = branches
       .filter((w) => w.board_id === board.board_id)
-      .map((w) => w.worktree_id);
+      .map((w) => w.branch_id);
 
-    // Use O(1) Map lookups to get sessions for each worktree
-    return boardWorktreeIds
-      .flatMap((worktreeId) => sessionsByWorktree.get(worktreeId) || [])
+    // Use O(1) Map lookups to get sessions for each branch
+    return boardBranchIds
+      .flatMap((branchId) => sessionsByBranch.get(branchId) || [])
       .map((s) => s.session_id);
-  }, [board, worktrees, sessionsByWorktree]);
+  }, [board, branches, sessionsByBranch]);
 
   /**
    * Update an existing board object
@@ -84,7 +89,7 @@ export const useBoardObjects = ({
   );
 
   /**
-   * Delete a zone (worktree-centric: zones can pin worktrees)
+   * Delete a zone (branch-centric: zones can pin branches)
    */
   const deleteZone = useCallback(
     async (objectId: string, _deleteAssociatedSessions: boolean) => {
@@ -93,27 +98,12 @@ export const useBoardObjects = ({
       // Mark as deleted to prevent re-appearance during WebSocket updates
       deletedObjectsRef.current.add(objectId);
 
-      // Find worktrees and cards pinned to this zone (via board_objects.zone_id)
-      const affectedObjectIds: string[] = [];
-      for (const boardObj of mapToArray(boardObjectById)) {
-        if (boardObj.zone_id === objectId && (boardObj.worktree_id || boardObj.card_id)) {
-          affectedObjectIds.push(boardObj.object_id);
-        }
-      }
-
-      // Optimistic removal of zone (just the zone node, entities remain but unpinned)
+      // Optimistic removal of zone. The SessionCanvas setNodes wrapper clears
+      // any orphaned parentId values locally; the daemon owns persistent
+      // unpinning and converts zone-relative child positions to absolute.
       setNodes((nodes) => nodes.filter((n) => n.id !== objectId));
 
       try {
-        // IMPORTANT: Unpin entities FIRST before deleting the zone
-        // This prevents a race condition where entities have parentId pointing to a deleted zone
-        for (const objId of affectedObjectIds) {
-          await client.service('board-objects').patch(objId, {
-            zone_id: null,
-          });
-        }
-
-        // Now delete the zone after all worktrees are unpinned
         await client.service('boards').patch(board.board_id, {
           _action: 'deleteZone',
           objectId,
@@ -130,7 +120,7 @@ export const useBoardObjects = ({
         // Note: WebSocket update should restore the actual state
       }
     },
-    [board, client, setNodes, deletedObjectsRef, boardObjectById]
+    [board, client, setNodes, deletedObjectsRef]
   );
 
   /**
@@ -224,9 +214,9 @@ export const useBoardObjects = ({
             id: objectId,
             type: 'appNode',
             position: { x: objectData.x, y: objectData.y },
-            draggable: true,
+            // draggable inherits from canvas-level nodesDraggable (mutationGate.canMutate)
             selectable: true,
-            zIndex: 400, // Above markdown (300), below worktrees (500)
+            zIndex: 400, // Above markdown (300), below branches (500)
             className: eraserMode ? 'eraser-mode' : undefined,
             data: {
               objectId,
@@ -252,7 +242,7 @@ export const useBoardObjects = ({
             id: objectId,
             type: 'artifactNode',
             position: { x: objectData.x, y: objectData.y },
-            draggable: true,
+            // draggable inherits from canvas-level nodesDraggable (mutationGate.canMutate)
             selectable: true,
             zIndex: 400,
             className: eraserMode ? 'eraser-mode' : undefined,
@@ -261,6 +251,7 @@ export const useBoardObjects = ({
               artifactId: objectData.artifact_id,
               width: objectData.width,
               height: objectData.height,
+              isActiveUrlTarget: objectData.artifact_id === activeUrlTargetArtifactId,
               onUpdate: handleUpdateObject,
               onDeleteArtifact: deleteArtifact,
             },
@@ -273,9 +264,9 @@ export const useBoardObjects = ({
             id: objectId,
             type: 'markdown',
             position: { x: objectData.x, y: objectData.y },
-            draggable: true,
+            // draggable inherits from canvas-level nodesDraggable (mutationGate.canMutate)
             selectable: true,
-            zIndex: 300, // Above zones (100), below worktrees (500)
+            zIndex: 300, // Above zones (100), below branches (500)
             className: eraserMode ? 'eraser-mode' : undefined,
             data: {
               objectId,
@@ -283,21 +274,22 @@ export const useBoardObjects = ({
               width: objectData.width,
               onUpdate: handleUpdateObject,
               onEdit: onEditMarkdown,
+              onDelete: deleteObject,
             },
           };
         }
 
-        // Calculate worktree count for this zone (worktree-centric model)
+        // Calculate branch count for this zone (branch-centric model)
         let sessionCount = 0;
         if (objectData.type === 'zone') {
-          // Count worktrees pinned to this zone via board_objects.zone_id
+          // Count branches pinned to this zone via board_objects.zone_id
           for (const boardObj of mapToArray(boardObjectById)) {
             if (boardObj.zone_id === objectId) {
-              // Count sessions in this worktree using O(1) Map lookup
-              const worktreeSessions = boardObj.worktree_id
-                ? sessionsByWorktree.get(boardObj.worktree_id) || []
+              // Count sessions in this branch using O(1) Map lookup
+              const branchSessions = boardObj.branch_id
+                ? sessionsByBranch.get(boardObj.branch_id) || []
                 : [];
-              sessionCount += worktreeSessions.length;
+              sessionCount += branchSessions.length;
             }
           }
         }
@@ -308,8 +300,10 @@ export const useBoardObjects = ({
           id: objectId,
           type: 'zone',
           position: { x: objectData.x, y: objectData.y },
-          draggable: !isLocked, // Respect locked state
-          zIndex: 100, // Zones behind worktrees and comments
+          // Locked zones are never draggable. Unlocked zones inherit from
+          // canvas-level nodesDraggable (mutationGate.canMutate).
+          ...(isLocked ? { draggable: false } : {}),
+          zIndex: 100, // Zones behind branches and comments
           className: eraserMode ? 'eraser-mode' : undefined,
           // Set dimensions both as direct props (for collision detection) and style (for rendering)
           width: objectData.width,
@@ -340,12 +334,13 @@ export const useBoardObjects = ({
   }, [
     boardObjects, // Use stabilized boardObjects instead of board?.objects
     boardObjectById,
-    sessionsByWorktree,
+    sessionsByBranch,
     handleUpdateObject,
     deleteZone,
     deleteObject,
     deleteArtifact,
     eraserMode,
+    activeUrlTargetArtifactId,
     onEditMarkdown,
   ]);
 
@@ -368,8 +363,8 @@ export const useBoardObjects = ({
           id: objectId,
           type: 'zone',
           position: { x, y },
-          draggable: true,
-          zIndex: 100, // Zones behind worktrees and comments
+          // draggable inherits from canvas-level nodesDraggable (mutationGate.canMutate)
+          zIndex: 100, // Zones behind branches and comments
           style: {
             width,
             height,

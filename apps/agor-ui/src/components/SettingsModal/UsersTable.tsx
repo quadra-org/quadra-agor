@@ -1,10 +1,13 @@
 import type {
   AgorClient,
   CreateUserInput,
+  Group,
+  GroupMembership,
   MCPServer,
   UpdateUserInput,
   User,
 } from '@agor-live/client';
+import { hasMinimumRole, ROLE_OPTIONS, ROLES } from '@agor-live/client';
 import { DeleteOutlined, EditOutlined, PlusOutlined } from '@ant-design/icons';
 import {
   Button,
@@ -20,9 +23,12 @@ import {
   Tag,
   Typography,
 } from 'antd';
-import { useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { mapToSortedArray } from '@/utils/mapHelpers';
+import { filterBySettingsSearch } from '@/utils/settingsSearch';
+import { useThemedMessage } from '../../utils/message';
 import { FormEmojiPickerInput } from '../EmojiPickerInput';
+import { HighlightMatch } from '../HighlightMatch';
 import { UserSettingsModal } from './UserSettingsModal';
 
 interface UsersTableProps {
@@ -44,9 +50,68 @@ export const UsersTable: React.FC<UsersTableProps> = ({
   onUpdate,
   onDelete,
 }) => {
+  const { showError } = useThemedMessage();
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [editingUser, setEditingUser] = useState<User | null>(null);
+  const [groups, setGroups] = useState<Group[]>([]);
+  const [memberships, setMemberships] = useState<GroupMembership[]>([]);
+  const [searchTerm, setSearchTerm] = useState('');
   const [form] = Form.useForm();
+  const isAdmin = hasMinimumRole(currentUser?.role, ROLES.ADMIN);
+
+  const loadGroups = useCallback(async () => {
+    if (!client || !isAdmin) {
+      setGroups([]);
+      setMemberships([]);
+      return;
+    }
+    const [nextGroups, nextMemberships] = await Promise.all([
+      client.service('groups').findAll({ query: { archived: false } }),
+      client.service('group-memberships').findAll({}),
+    ]);
+    setGroups(nextGroups as Group[]);
+    setMemberships(nextMemberships as GroupMembership[]);
+  }, [client, isAdmin]);
+
+  useEffect(() => {
+    loadGroups().catch((error) =>
+      showError(
+        `Failed to load user groups: ${error instanceof Error ? error.message : String(error)}`
+      )
+    );
+  }, [loadGroups, showError]);
+
+  const groupsByUser = useMemo(() => {
+    const map = new Map<string, Group['group_id'][]>();
+    for (const membership of memberships) {
+      const ids = map.get(membership.user_id) || [];
+      ids.push(membership.group_id);
+      map.set(membership.user_id, ids);
+    }
+    return map;
+  }, [memberships]);
+
+  const groupById = useMemo(
+    () => new Map(groups.map((group) => [group.group_id, group])),
+    [groups]
+  );
+
+  const users = useMemo(() => {
+    const sorted = mapToSortedArray(userById, (a, b) =>
+      a.email.localeCompare(b.email, undefined, { sensitivity: 'base' })
+    );
+    return filterBySettingsSearch(sorted, searchTerm, [
+      (user) => user.email,
+      (user) => user.name,
+      (user) => user.unix_username,
+      (user) => user.role,
+      (user) =>
+        (groupsByUser.get(user.user_id) || [])
+          .map((groupId) => groupById.get(groupId))
+          .filter((group): group is Group => Boolean(group))
+          .flatMap((group) => [group.name, group.slug]),
+    ]);
+  }, [userById, searchTerm, groupsByUser, groupById]);
 
   const handleDelete = (userId: string) => {
     onDelete?.(userId);
@@ -61,7 +126,7 @@ export const UsersTable: React.FC<UsersTableProps> = ({
           password: values.password,
           name: values.name,
           emoji: values.emoji || '👤',
-          role: values.role || 'member',
+          role: values.role || ROLES.MEMBER,
           unix_username: values.unix_username,
           must_change_password: values.must_change_password || false,
         });
@@ -96,7 +161,9 @@ export const UsersTable: React.FC<UsersTableProps> = ({
       render: (email: string, user: User) => (
         <Space>
           <span style={{ fontSize: 20 }}>{user.emoji || '👤'}</span>
-          <span>{email}</span>
+          <span>
+            <HighlightMatch text={email} query={searchTerm} />
+          </span>
         </Space>
       ),
     },
@@ -104,7 +171,11 @@ export const UsersTable: React.FC<UsersTableProps> = ({
       title: 'Name',
       dataIndex: 'name',
       key: 'name',
-      render: (name: string) => <Typography.Text>{name || '—'}</Typography.Text>,
+      render: (name: string) => (
+        <Typography.Text>
+          {name ? <HighlightMatch text={name} query={searchTerm} /> : '—'}
+        </Typography.Text>
+      ),
     },
     {
       title: 'Role',
@@ -114,11 +185,29 @@ export const UsersTable: React.FC<UsersTableProps> = ({
       render: (role: User['role']) => <Tag color={getRoleColor(role)}>{role.toUpperCase()}</Tag>,
     },
     {
-      title: 'Created',
-      dataIndex: 'created_at',
-      key: 'created_at',
-      width: 180,
-      render: (date: Date) => new Date(date).toLocaleDateString(),
+      title: 'Groups',
+      key: 'groups',
+      width: 280,
+      render: (_: unknown, user: User) => {
+        const userGroupIds = groupsByUser.get(user.user_id) || [];
+        if (userGroupIds.length === 0) {
+          return <Typography.Text type="secondary">—</Typography.Text>;
+        }
+
+        return (
+          <Space size={[4, 4]} wrap>
+            {userGroupIds
+              .map((groupId) => groupById.get(groupId))
+              .filter((group): group is Group => Boolean(group))
+              .sort((a, b) => a.name.localeCompare(b.name))
+              .map((group) => (
+                <Tag key={group.group_id}>
+                  <HighlightMatch text={group.name} query={searchTerm} />
+                </Tag>
+              ))}
+          </Space>
+        );
+      },
     },
     {
       title: 'Actions',
@@ -158,15 +247,22 @@ export const UsersTable: React.FC<UsersTableProps> = ({
         }}
       >
         <Typography.Text type="secondary">Manage user accounts and permissions.</Typography.Text>
-        <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateModalOpen(true)}>
-          New User
-        </Button>
+        <Space>
+          <Input
+            allowClear
+            placeholder="Search name, email, username, role, or groups"
+            value={searchTerm}
+            onChange={(event) => setSearchTerm(event.target.value)}
+            style={{ width: 320 }}
+          />
+          <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateModalOpen(true)}>
+            New User
+          </Button>
+        </Space>
       </div>
 
       <Table
-        dataSource={mapToSortedArray(userById, (a, b) =>
-          a.email.localeCompare(b.email, undefined, { sensitivity: 'base' })
-        )}
+        dataSource={users}
         columns={columns}
         rowKey="user_id"
         pagination={false}
@@ -237,15 +333,16 @@ export const UsersTable: React.FC<UsersTableProps> = ({
           <Form.Item
             label="Role"
             name="role"
-            initialValue="member"
+            initialValue={ROLES.MEMBER}
             rules={[{ required: true, message: 'Please select a role' }]}
           >
-            <Select>
-              {/* <Select.Option value="owner">Owner</Select.Option> */}
-              <Select.Option value="admin">Admin</Select.Option>
-              <Select.Option value="member">Member</Select.Option>
-              <Select.Option value="viewer">Viewer</Select.Option>
-            </Select>
+            <Select
+              options={ROLE_OPTIONS.map((opt) => ({
+                value: opt.value,
+                label: opt.label,
+                title: opt.description,
+              }))}
+            />
           </Form.Item>
 
           <Form.Item name="must_change_password" valuePropName="checked" initialValue={false}>
@@ -257,7 +354,10 @@ export const UsersTable: React.FC<UsersTableProps> = ({
       {/* Edit User Modal - reuses UserSettingsModal */}
       <UserSettingsModal
         open={!!editingUser}
-        onClose={() => setEditingUser(null)}
+        onClose={() => {
+          setEditingUser(null);
+          void loadGroups();
+        }}
         user={editingUser}
         mcpServerById={mcpServerById}
         client={client}

@@ -41,6 +41,14 @@ export class MigrationError extends Error {
   }
 }
 
+function getRootCause(error: unknown): unknown {
+  let current = error;
+  while (current instanceof Error && current.cause) {
+    current = current.cause;
+  }
+  return current;
+}
+
 /**
  * Check if migrations tracking table exists (dialect-aware)
  */
@@ -61,8 +69,13 @@ async function hasMigrationsTable(db: Database): Promise<boolean> {
     }
     return false;
   } catch (error) {
+    const rootCause = getRootCause(error);
+    const rootMsg =
+      rootCause !== error
+        ? ` (root cause: ${rootCause instanceof Error ? rootCause.message : String(rootCause)})`
+        : '';
     throw new MigrationError(
-      `Failed to check migrations table: ${error instanceof Error ? error.message : String(error)}`,
+      `Failed to check migrations table: ${error instanceof Error ? error.message : String(error)}${rootMsg}`,
       error
     );
   }
@@ -200,8 +213,13 @@ export async function checkMigrationStatus(
       applied,
     };
   } catch (error) {
+    const rootCause = getRootCause(error);
+    const rootMsg =
+      rootCause !== error
+        ? ` (root cause: ${rootCause instanceof Error ? rootCause.message : String(rootCause)})`
+        : '';
     throw new MigrationError(
-      `Failed to check migration status: ${error instanceof Error ? error.message : String(error)}`,
+      `Failed to check migration status: ${error instanceof Error ? error.message : String(error)}${rootMsg}`,
       error
     );
   }
@@ -283,15 +301,23 @@ export async function initializeDatabase(db: Database): Promise<void> {
 }
 
 /**
- * Seed initial data (default board only)
+ * Seed initial data (default board only).
  *
- * Note: Does NOT create a default admin user.
- * Admin users must be created explicitly via `agor user create-admin` or during `agor init`
+ * The caller may pass `createdBy` to stamp the default board with a real
+ * user_id. When omitted, the board is stamped with `LEGACY_ANONYMOUS_OWNER_ID`
+ * — a sentinel that the first-run admin bootstrap re-attributes to a real
+ * admin on the next daemon start.
+ *
+ * Admin users are NOT created here. They are created either by `agor init`
+ * (interactive) or by `bootstrapFirstRunAdmin` on first daemon start (default
+ * admin with generated password).
  */
-export async function seedInitialData(db: Database): Promise<void> {
+export async function seedInitialData(db: Database, createdBy?: string): Promise<void> {
   try {
     const { generateId } = await import('../lib/ids');
+    const { LEGACY_ANONYMOUS_OWNER_ID } = await import('./first-run-bootstrap');
     const now = new Date();
+    const owner = createdBy ?? LEGACY_ANONYMOUS_OWNER_ID;
 
     // 1. Check if default board exists (by slug to avoid duplicates)
     const existingBoard = await select(db).from(boards).where(eq(boards.slug, 'default')).one();
@@ -307,7 +333,7 @@ export async function seedInitialData(db: Database): Promise<void> {
           slug: 'default',
           created_at: now,
           updated_at: now,
-          created_by: 'anonymous',
+          created_by: owner,
           data: {
             description: 'Main board for all sessions',
             sessions: [],

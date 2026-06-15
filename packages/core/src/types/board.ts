@@ -1,6 +1,7 @@
 import type { AgenticToolName } from './agentic-tool';
+import type { BranchPermissionLevel } from './branch';
 import type { CardID } from './card';
-import type { ArtifactID, BoardID, WorktreeID } from './id';
+import type { ArtifactID, BoardID, BranchID } from './id';
 
 /**
  * Canvas position (x/y coordinates in board space)
@@ -15,12 +16,12 @@ export type BoardObjectType = 'text' | 'zone' | 'markdown' | 'app' | 'artifact';
 /**
  * Entity type discriminator for board objects
  */
-export type BoardEntityType = 'worktree' | 'card';
+export type BoardEntityType = 'branch' | 'card';
 
 /**
- * Positioned entity on a board (worktree or card)
+ * Positioned entity on a board (branch or card)
  *
- * Polymorphic placement: exactly one of worktree_id or card_id is set.
+ * Polymorphic placement: exactly one of branch_id or card_id is set.
  * The entity_type field indicates which one.
  */
 export interface BoardEntityObject {
@@ -30,8 +31,8 @@ export interface BoardEntityObject {
   /** Board this entity belongs to */
   board_id: BoardID;
 
-  /** Worktree reference (set when entity_type === 'worktree') */
-  worktree_id?: WorktreeID;
+  /** Branch reference (set when entity_type === 'branch') */
+  branch_id?: BranchID;
 
   /** Card reference (set when entity_type === 'card') */
   card_id?: CardID;
@@ -65,14 +66,14 @@ export interface TextBoardObject {
 }
 
 /**
- * Zone trigger behavior modes for worktree drops
+ * Zone trigger behavior modes for branch drops
  */
 export type ZoneTriggerBehavior = 'always_new' | 'show_picker';
 
 /**
- * Zone trigger configuration for worktree drops
+ * Zone trigger configuration for branch drops
  *
- * When a worktree is dropped on a zone with a trigger:
+ * When a branch is dropped on a zone with a trigger:
  * - 'always_new': Automatically create new root session and apply trigger
  * - 'show_picker': Open modal to select existing session or create new one
  */
@@ -153,6 +154,7 @@ export interface AppBoardObject {
   title: string;
   /** Optional description */
   description?: string;
+
   /** Sandpack template (default: 'react') */
   template: SandpackTemplate;
   /** File map: path -> code content */
@@ -193,6 +195,20 @@ export type BoardObject =
   | AppBoardObject
   | ArtifactBoardObject;
 
+export interface AssistantWelcomeNoteRequest {
+  /** Board to create/update the bundled assistant welcome note on. */
+  boardId?: BoardID | string;
+  /** Alias accepted by Feathers custom method callers. */
+  id?: BoardID | string;
+  /** User-provided assistant display name. */
+  assistantName: string;
+  /** Optional user-provided assistant emoji/icon. */
+  assistantEmoji?: string | null;
+}
+
+export type BoardAccessMode = 'private' | 'shared';
+export type BoardDefaultFsAccess = 'none' | 'read' | 'write';
+
 export interface Board {
   /** Unique board identifier (UUIDv7) */
   board_id: BoardID;
@@ -212,6 +228,7 @@ export interface Board {
   slug?: string;
 
   description?: string;
+  primary_assistant_id?: BranchID;
 
   /**
    * DEPRECATED: Sessions and layout are now tracked in board_objects table
@@ -243,6 +260,18 @@ export interface Board {
   /** User ID of the user who created this board */
   created_by: string;
 
+  /** Board-level visibility. Existing boards default/read as 'shared'. */
+  access_mode?: BoardAccessMode;
+
+  /** Default app-layer permission for new/aligned branches on this board. */
+  default_others_can?: BranchPermissionLevel;
+
+  /** Default filesystem access for new/aligned branches on this board. */
+  default_others_fs_access?: BoardDefaultFsAccess;
+
+  /** Default legacy session sharing behavior for new/aligned branches on this board. */
+  default_dangerously_allow_session_sharing?: boolean;
+
   /** Hex color for visual distinction */
   color?: string;
 
@@ -267,10 +296,12 @@ export interface Board {
   custom_context?: Record<string, unknown>;
 
   /**
-   * External/user-facing URL for viewing this board in the UI
+   * External/user-facing URL for viewing this board in the UI.
    *
-   * Computed property added by API hooks.
-   * Format: {baseUrl}/b/{boardId}/
+   * Computed property added by the repository layer.
+   * Format: `{baseUrl}/ui/b/{slug-or-shortId}/`
+   * Prefers the board's slug when set; falls back to the canonical
+   * short ID.
    */
   url: string;
 
@@ -287,7 +318,7 @@ export interface Board {
 /**
  * Portable board export format (shell only)
  *
- * Contains board metadata and annotations, but no worktrees or sessions.
+ * Contains board metadata and annotations, but no branches or sessions.
  * Can be serialized to YAML/JSON for sharing or archival.
  */
 export interface BoardExportBlob {
@@ -299,6 +330,10 @@ export interface BoardExportBlob {
   color?: string;
   background_color?: string;
   custom_css?: string;
+  access_mode?: BoardAccessMode;
+  default_others_can?: BranchPermissionLevel;
+  default_others_fs_access?: BoardDefaultFsAccess;
+  default_dangerously_allow_session_sharing?: boolean;
 
   // Annotations (zones, text, markdown)
   objects?: {

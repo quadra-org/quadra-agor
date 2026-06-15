@@ -10,23 +10,22 @@
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { generateId } from '@agor/core/db';
+import { generateId, shortId } from '@agor/core/db';
 import type { PermissionMode as ClaudeSDKPermissionMode } from '@agor/core/sdk';
 import { mapPermissionMode } from '@agor/core/utils/permission-mode-mapper';
 import type {
+  BranchRepository,
   MCPServerRepository,
   MessagesRepository,
   RepoRepository,
   SessionMCPServerRepository,
   SessionRepository,
-  WorktreeRepository,
 } from '../../db/feathers-repositories.js';
 import type { PermissionService } from '../../permissions/permission-service.js';
 import type { NormalizedSdkResponse, RawSdkResponse } from '../../types/sdk-response.js';
 // Removed import of calculateModelContextWindowUsage - inlined instead
 import type { TokenUsage } from '../../types/token-usage.js';
 import {
-  type Message,
   type MessageID,
   MessageRole,
   type MessageSource,
@@ -36,7 +35,16 @@ import {
   TaskStatus,
 } from '../../types.js';
 import { enrichToolResults, registerToolUses } from '../base/diff-enrichment.js';
-import type { ImportOptions, ITool, SessionData, ToolCapabilities } from '../base/index.js';
+import type {
+  ImportOptions,
+  ITool,
+  MessagesService,
+  SessionData,
+  SessionsPatchClient,
+  TasksService,
+  TasksStreamingService,
+  ToolCapabilities,
+} from '../base/index.js';
 import { loadClaudeSession } from './import/load-session.js';
 import { transcriptsToMessages } from './import/message-converter.js';
 import {
@@ -48,6 +56,16 @@ import {
 } from './message-builder.js';
 import type { ProcessedEvent } from './message-processor.js';
 import { ClaudePromptService } from './prompt-service.js';
+
+const DEBUG_CLAUDE_STREAMING =
+  process.env.AGOR_DEBUG_CLAUDE_STREAMING === '1' ||
+  process.env.DEBUG?.includes('claude-streaming');
+
+function claudeStreamingDebug(...args: unknown[]): void {
+  if (DEBUG_CLAUDE_STREAMING) {
+    console.debug(...args);
+  }
+}
 
 /**
  * Format a human-readable rate limit message for the conversation UI.
@@ -101,51 +119,11 @@ async function withFeathersSessionGuard<T>(
   // Check session exists before executing operation
   const sessionExists = await sessionsRepo?.findById(sessionId);
   if (!sessionExists) {
-    console.warn(
-      `⚠️  Session ${sessionId.substring(0, 8)} no longer exists, skipping guarded operation`
-    );
+    console.warn(`⚠️  Session ${shortId(sessionId)} no longer exists, skipping guarded operation`);
     return null;
   }
 
   return operation();
-}
-
-/**
- * Service interface for creating and updating messages via FeathersJS
- * This ensures WebSocket events are emitted when messages are created or updated
- */
-export interface MessagesService {
-  create(data: Partial<Message>): Promise<Message>;
-  patch(id: string, data: Partial<Message>): Promise<Message>;
-}
-
-/**
- * Service interface for updating tasks via FeathersJS
- * This ensures WebSocket events are emitted when tasks are updated
- * Note: emit() is called directly on the service (socket.io EventEmitter feature)
- */
-export interface TasksService {
-  // biome-ignore lint/suspicious/noExplicitAny: FeathersJS service returns dynamic task data
-  get(id: string): Promise<any>;
-  // biome-ignore lint/suspicious/noExplicitAny: FeathersJS service accepts partial task updates
-  patch(id: string, data: Partial<any>): Promise<any>;
-  emit(event: string, data: unknown): void;
-}
-
-export interface TasksStreamingService {
-  create(data: {
-    event: 'tool:start' | 'tool:complete' | 'thinking:chunk';
-    data: Record<string, unknown>;
-  }): Promise<unknown>;
-}
-
-/**
- * Service interface for updating sessions via FeathersJS
- * This ensures WebSocket events are emitted when sessions are updated (e.g., permission config)
- */
-export interface SessionsService {
-  // biome-ignore lint/suspicious/noExplicitAny: FeathersJS service accepts partial session updates
-  patch(id: string, data: Partial<any>): Promise<any>;
 }
 
 export class ClaudeTool implements ITool {
@@ -164,12 +142,11 @@ export class ClaudeTool implements ITool {
     permissionService?: PermissionService,
     private tasksService?: TasksService,
     private tasksStreamingService?: TasksStreamingService,
-    sessionsService?: SessionsService,
-    worktreesRepo?: WorktreeRepository,
+    sessionsService?: SessionsPatchClient,
+    branchesRepo?: BranchRepository,
     reposRepo?: RepoRepository,
     mcpEnabled?: boolean,
     _useNativeAuth?: boolean, // Claude supports `claude login` OAuth, but no special handling needed in tool
-    inputRequestService?: import('../../input-requests/input-request-service').InputRequestService,
     usersRepo?: import('../../db/feathers-repositories').UsersRepository
   ) {
     if (messagesRepo && sessionsRepo) {
@@ -182,11 +159,10 @@ export class ClaudeTool implements ITool {
         permissionService,
         tasksService,
         sessionsService,
-        worktreesRepo,
+        branchesRepo,
         reposRepo,
         messagesService,
         mcpEnabled,
-        inputRequestService,
         usersRepo
       );
     }
@@ -310,15 +286,18 @@ export class ClaudeTool implements ITool {
     const existingMessages = await this.messagesRepo.findBySessionId(sessionId);
     let nextIndex = existingMessages.length;
 
-    // Create user message
+    // Create user message (or reuse the daemon's pre-write — see Alt D in
+    // docs/never-lose-prompt-design.md). When the row is reused, advance
+    // nextIndex from the returned message's actual index.
     const userMessage = await createUserMessage(
       sessionId,
       prompt,
       taskId,
-      nextIndex++,
+      nextIndex,
       this.messagesService!,
-      messageSource
+      { messageSource, existingMessages }
     );
+    nextIndex = userMessage.index + 1;
 
     // Execute prompt via Agent SDK with streaming
     const assistantMessageIds: MessageID[] = [];
@@ -521,7 +500,7 @@ export class ClaudeTool implements ITool {
             currentThinkingMessageId = generateId() as MessageID;
             const thinkingStartTime = Date.now();
             const ttfb = thinkingStartTime - streamStartTime;
-            console.debug(`⏱️ [SDK] TTFB (thinking): ${ttfb}ms`);
+            claudeStreamingDebug(`⏱️ [SDK] TTFB (thinking): ${ttfb}ms`);
 
             if (streamingCallbacks.onThinkingStart) {
               // Note: budget is extracted from thinking block if available
@@ -749,7 +728,7 @@ export class ClaudeTool implements ITool {
           currentTextMessageId = generateId() as MessageID;
           firstTokenTime = Date.now();
           const ttfb = firstTokenTime - streamStartTime;
-          console.debug(`⏱️ [SDK] TTFB (text): ${ttfb}ms`);
+          claudeStreamingDebug(`⏱️ [SDK] TTFB (text): ${ttfb}ms`);
 
           if (streamingCallbacks) {
             await streamingCallbacks.onStreamStart(currentTextMessageId, {
@@ -779,7 +758,7 @@ export class ClaudeTool implements ITool {
           await streamingCallbacks.onStreamEnd(currentTextMessageId);
           const totalTime = streamEndTime - streamStartTime;
           const streamingTime = firstTokenTime ? streamEndTime - firstTokenTime : 0;
-          console.debug(
+          claudeStreamingDebug(
             `⏱️ [Streaming] Complete - TTFB: ${firstTokenTime ? firstTokenTime - streamStartTime : 0}ms, streaming: ${streamingTime}ms, total: ${totalTime}ms`
           );
         }
@@ -919,18 +898,16 @@ export class ClaudeTool implements ITool {
         const existingSession = await this.sessionsRepo.findById(sessionId);
         if (existingSession?.sdk_session_id) {
           if (existingSession.sdk_session_id === agentSessionId) {
-            console.log(
-              `💾 Agent SDK session_id unchanged (already ${agentSessionId.substring(0, 8)})`
-            );
+            console.log(`💾 Agent SDK session_id unchanged (already ${shortId(agentSessionId)})`);
           } else {
             console.warn(
-              `⚠️  Agent SDK returned new session_id ${agentSessionId.substring(0, 8)} but session already has ${existingSession.sdk_session_id.substring(0, 8)} — keeping original (sdk_session_id is immutable)`
+              `⚠️  Agent SDK returned new session_id ${shortId(agentSessionId)} but session already has ${shortId(existingSession.sdk_session_id)} — keeping original (sdk_session_id is immutable)`
             );
           }
           return;
         }
 
-        console.log(`📝 Setting sdk_session_id for first time: ${agentSessionId.substring(0, 8)}`);
+        console.log(`📝 Setting sdk_session_id for first time: ${shortId(agentSessionId)}`);
         const updated = await this.sessionsRepo.update(sessionId, {
           sdk_session_id: agentSessionId,
         });
@@ -995,15 +972,17 @@ export class ClaudeTool implements ITool {
     const existingMessages = await this.messagesRepo.findBySessionId(sessionId);
     let nextIndex = existingMessages.length;
 
-    // Create user message
+    // Create user message (or reuse the daemon's pre-write — see Alt D in
+    // docs/never-lose-prompt-design.md).
     const userMessage = await createUserMessage(
       sessionId,
       prompt,
       taskId,
-      nextIndex++,
+      nextIndex,
       this.messagesService!,
-      messageSource
+      { messageSource, existingMessages }
     );
+    nextIndex = userMessage.index + 1;
 
     // Execute prompt via Agent SDK
     const assistantMessageIds: MessageID[] = [];

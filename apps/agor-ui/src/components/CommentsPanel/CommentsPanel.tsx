@@ -2,10 +2,10 @@ import type {
   AgorClient,
   BoardComment,
   BoardObject,
+  Branch,
   CommentReaction,
   ReactionSummary,
   User,
-  Worktree,
 } from '@agor-live/client';
 import { groupReactions, isThreadRoot } from '@agor-live/client';
 import {
@@ -23,7 +23,6 @@ import {
   Badge,
   Button,
   Collapse,
-  List,
   Popover,
   Space,
   Spin,
@@ -33,10 +32,12 @@ import {
   theme,
 } from 'antd';
 import React, { useEffect, useMemo, useState } from 'react';
+import { useMutationGate } from '../../contexts/ConnectionContext';
 import { AgorAvatar } from '../AgorAvatar';
 import { AutocompleteTextarea } from '../AutocompleteTextarea';
 import { AgorEmojiPicker } from '../EmojiPickerInput';
 import { MarkdownRenderer } from '../MarkdownRenderer';
+import { MetaRow } from '../MetaRow';
 import { ZONE_CONTENT_OPACITY } from '../SessionCanvas/canvas/BoardObjectNodes';
 
 const { Text, Title } = Typography;
@@ -48,7 +49,7 @@ export interface CommentsPanelProps {
   userById: Map<string, User>;
   currentUserId: string;
   boardObjects?: Record<string, BoardObject>; // For zone names
-  worktreeById?: Map<string, Worktree>; // For worktree names
+  branchById?: Map<string, Branch>; // For branch names
   loading?: boolean;
   collapsed?: boolean;
   onToggleCollapse?: () => void;
@@ -177,9 +178,8 @@ const ReplyItem: React.FC<{
   const isReplyCurrentUser = reply.created_by === currentUserId;
 
   return (
-    <List.Item
+    <div
       style={{
-        borderBottom: 'none',
         padding: '4px 0',
       }}
     >
@@ -188,7 +188,7 @@ const ReplyItem: React.FC<{
         onMouseEnter={() => setReplyHovered(true)}
         onMouseLeave={() => setReplyHovered(false)}
       >
-        <List.Item.Meta
+        <MetaRow
           avatar={<AgorAvatar>{replyUser?.emoji || '👤'}</AgorAvatar>}
           title={
             <Space size={4}>
@@ -196,7 +196,12 @@ const ReplyItem: React.FC<{
                 {replyUser?.name || 'Anonymous'}
               </Text>
               <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
-                {new Date(reply.created_at).toLocaleTimeString()}
+                {new Date(reply.created_at).toLocaleString(undefined, {
+                  month: 'short',
+                  day: 'numeric',
+                  hour: 'numeric',
+                  minute: '2-digit',
+                })}
               </Text>
             </Space>
           }
@@ -254,7 +259,7 @@ const ReplyItem: React.FC<{
           </div>
         )}
       </div>
-    </List.Item>
+    </div>
   );
 };
 
@@ -294,7 +299,7 @@ const CommentThread: React.FC<{
   const isCurrentUser = comment.created_by === currentUserId;
 
   return (
-    <List.Item
+    <div
       ref={scrollRef}
       style={{
         borderBottom: `1px solid ${token.colorBorder}`,
@@ -311,7 +316,7 @@ const CommentThread: React.FC<{
         onMouseLeave={() => setIsHovered(false)}
       >
         {/* Thread Root */}
-        <List.Item.Meta
+        <MetaRow
           avatar={<AgorAvatar>{user?.emoji || '👤'}</AgorAvatar>}
           title={
             <Space size={4}>
@@ -319,7 +324,12 @@ const CommentThread: React.FC<{
                 {user?.name || 'Anonymous'}
               </Text>
               <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
-                {new Date(comment.created_at).toLocaleTimeString()}
+                {new Date(comment.created_at).toLocaleString(undefined, {
+                  month: 'short',
+                  day: 'numeric',
+                  hour: 'numeric',
+                  minute: '2-digit',
+                })}
               </Text>
               {comment.edited && (
                 <Text type="secondary" style={{ fontSize: token.fontSizeSM, fontStyle: 'italic' }}>
@@ -433,18 +443,16 @@ const CommentThread: React.FC<{
               paddingLeft: 8,
             }}
           >
-            <List
-              dataSource={replies}
-              renderItem={(reply) => (
-                <ReplyItem
-                  reply={reply}
-                  userById={userById}
-                  currentUserId={currentUserId}
-                  onToggleReaction={onToggleReaction}
-                  onDelete={onDelete}
-                />
-              )}
-            />
+            {replies.map((reply) => (
+              <ReplyItem
+                key={reply.comment_id}
+                reply={reply}
+                userById={userById}
+                currentUserId={currentUserId}
+                onToggleReaction={onToggleReaction}
+                onDelete={onDelete}
+              />
+            ))}
           </div>
         )}
 
@@ -495,7 +503,7 @@ const CommentThread: React.FC<{
           </div>
         )}
       </div>
-    </List.Item>
+    </div>
   );
 };
 
@@ -542,7 +550,7 @@ export const CommentsPanel: React.FC<CommentsPanelProps> = ({
   userById,
   currentUserId,
   boardObjects = {},
-  worktreeById,
+  branchById,
   loading = false,
   collapsed = false,
   onToggleCollapse,
@@ -557,6 +565,31 @@ export const CommentsPanel: React.FC<CommentsPanelProps> = ({
   const { token } = theme.useToken();
   const [filter, setFilter] = useState<FilterMode>('active');
   const [commentInputValue, setCommentInputValue] = useState('');
+
+  // Chokepoint: every comment mutation flows through these wrapped callbacks
+  // so we can short-circuit during disconnect / reconnect-grace / out-of-sync
+  // without sprinkling `disabled` checks across every nested button. The bottom
+  // send button still also flips `disabled` for visible feedback; threaded
+  // action buttons rely on the navbar/footer connection indicator.
+  const mutationGate = useMutationGate();
+  // Wrap a callback so it no-ops when the mutation gate is closed. Preserves
+  // `undefined` when the underlying optional callback wasn't supplied.
+  function guarded<Args extends unknown[]>(fn: (...args: Args) => void): (...args: Args) => void;
+  function guarded<Args extends unknown[]>(
+    fn: ((...args: Args) => void) | undefined
+  ): ((...args: Args) => void) | undefined;
+  function guarded<Args extends unknown[]>(fn: ((...args: Args) => void) | undefined) {
+    if (!fn) return undefined;
+    return (...args: Args) => {
+      if (!mutationGate.canMutate) return;
+      fn(...args);
+    };
+  }
+  const sendComment = guarded(onSendComment);
+  const replyComment = guarded(onReplyComment);
+  const resolveComment = guarded(onResolveComment);
+  const toggleReaction = guarded(onToggleReaction);
+  const deleteComment = guarded(onDeleteComment);
 
   // Get current user's name and email for mention detection
   const currentUser = currentUserId ? userById.get(currentUserId) : undefined;
@@ -608,12 +641,12 @@ export const CommentsPanel: React.FC<CommentsPanelProps> = ({
       .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
   }, [threadRoots, filter]);
 
-  // Group filtered threads by scope (zone, worktree, or board-level)
+  // Group filtered threads by scope (zone, branch, or board-level)
   const groupedThreads = useMemo(() => {
     const groups: Record<
       string,
       {
-        type: 'zone' | 'worktree' | 'board';
+        type: 'zone' | 'branch' | 'board';
         label: string;
         color?: string;
         threads: BoardComment[];
@@ -623,10 +656,10 @@ export const CommentsPanel: React.FC<CommentsPanelProps> = ({
     for (const thread of filteredThreads) {
       let groupKey = 'board';
       let groupLabel = 'Board';
-      let groupType: 'zone' | 'worktree' | 'board' = 'board';
+      let groupType: 'zone' | 'branch' | 'board' = 'board';
       let groupColor: string | undefined;
 
-      // Check if comment has relative positioning (pinned to zone/worktree)
+      // Check if comment has relative positioning (pinned to zone/branch)
       if (thread.position?.relative) {
         const { parent_id, parent_type } = thread.position.relative;
 
@@ -637,18 +670,18 @@ export const CommentsPanel: React.FC<CommentsPanelProps> = ({
           groupLabel = zone && 'label' in zone ? zone.label : 'Zone';
           groupColor = zone && 'color' in zone ? zone.color : undefined;
           groupType = 'zone';
-        } else if (parent_type === 'worktree') {
-          groupKey = `worktree-${parent_id}`;
-          const worktree = worktreeById?.get(parent_id);
-          groupLabel = worktree ? worktree.name : 'Unknown Worktree';
-          groupType = 'worktree';
+        } else if (parent_type === 'branch') {
+          groupKey = `branch-${parent_id}`;
+          const branch = branchById?.get(parent_id);
+          groupLabel = branch ? branch.name : 'Unknown Branch';
+          groupType = 'branch';
         }
-      } else if (thread.worktree_id) {
-        // Check for FK-based worktree attachment
-        groupKey = `worktree-${thread.worktree_id}`;
-        const worktree = worktreeById?.get(thread.worktree_id);
-        groupLabel = worktree ? worktree.name : 'Unknown Worktree';
-        groupType = 'worktree';
+      } else if (thread.branch_id) {
+        // Check for FK-based branch attachment
+        groupKey = `branch-${thread.branch_id}`;
+        const branch = branchById?.get(thread.branch_id);
+        groupLabel = branch ? branch.name : 'Unknown Branch';
+        groupType = 'branch';
       }
 
       if (!groups[groupKey]) {
@@ -664,15 +697,15 @@ export const CommentsPanel: React.FC<CommentsPanelProps> = ({
     }
 
     return groups;
-  }, [filteredThreads, boardObjects, worktreeById]);
+  }, [filteredThreads, boardObjects, branchById]);
 
-  // Sort groups by scope hierarchy: Board → Zones → Worktrees (larger to smaller)
+  // Sort groups by scope hierarchy: Board → Zones → Branches (larger to smaller)
   const sortedGroupEntries = useMemo(() => {
     const entries = Object.entries(groupedThreads);
 
     return entries.sort(([, a], [, b]) => {
-      // Type priority: board (0) < zone (1) < worktree (2)
-      const typeOrder = { board: 0, zone: 1, worktree: 2 };
+      // Type priority: board (0) < zone (1) < branch (2)
+      const typeOrder = { board: 0, zone: 1, branch: 2 };
       const aOrder = typeOrder[a.type];
       const bOrder = typeOrder[b.type];
 
@@ -784,7 +817,7 @@ export const CommentsPanel: React.FC<CommentsPanelProps> = ({
       >
         {loading ? (
           <div style={{ textAlign: 'center', padding: 32 }}>
-            <Spin tip="Loading comments..." />
+            <Spin description="Loading comments..." />
           </div>
         ) : Object.keys(groupedThreads).length === 0 ? (
           <div
@@ -824,7 +857,7 @@ export const CommentsPanel: React.FC<CommentsPanelProps> = ({
                       }}
                     />
                   )}
-                  {group.type === 'worktree' && (
+                  {group.type === 'branch' && (
                     <BranchesOutlined style={{ fontSize: 14, color: token.colorPrimary }} />
                   )}
                   <Text strong>{group.label}</Text>
@@ -839,9 +872,8 @@ export const CommentsPanel: React.FC<CommentsPanelProps> = ({
                 </div>
               ),
               children: (
-                <List
-                  dataSource={group.threads}
-                  renderItem={(thread) => {
+                <>
+                  {group.threads.map((thread) => {
                     // Create or get ref for this thread
                     if (!commentRefs.current[thread.comment_id]) {
                       commentRefs.current[thread.comment_id] = React.createRef<HTMLDivElement>();
@@ -853,21 +885,22 @@ export const CommentsPanel: React.FC<CommentsPanelProps> = ({
 
                     return (
                       <CommentThread
+                        key={thread.comment_id}
                         comment={thread}
                         replies={repliesByParent[thread.comment_id] || []}
                         userById={userById}
                         currentUserId={currentUserId}
-                        onReply={onReplyComment}
-                        onResolve={onResolveComment}
-                        onToggleReaction={onToggleReaction}
-                        onDelete={onDeleteComment}
+                        onReply={replyComment}
+                        onResolve={resolveComment}
+                        onToggleReaction={toggleReaction}
+                        onDelete={deleteComment}
                         isHighlighted={isHighlighted}
                         scrollRef={commentRefs.current[thread.comment_id]}
                         client={client}
                       />
                     );
-                  }}
-                />
+                  })}
+                </>
               ),
             }))}
           />
@@ -892,30 +925,39 @@ export const CommentsPanel: React.FC<CommentsPanelProps> = ({
             onKeyPress={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
-                if (commentInputValue.trim()) {
-                  onSendComment(commentInputValue);
+                if (commentInputValue.trim() && mutationGate.canMutate) {
+                  sendComment(commentInputValue);
                   setCommentInputValue('');
                 }
               }
             }}
-            placeholder="Add a comment... (type @ for autocomplete)"
+            placeholder={
+              mutationGate.canMutate
+                ? 'Add a comment... (type @ for autocomplete)'
+                : (mutationGate.message ?? 'Add a comment...')
+            }
             autoSize={{ minRows: 1, maxRows: 4 }}
             client={client}
             sessionId={null}
             userById={userById}
           />
         </div>
-        <Button
-          type="primary"
-          icon={<SendOutlined />}
-          onClick={() => {
-            if (commentInputValue.trim()) {
-              onSendComment(commentInputValue);
-              setCommentInputValue('');
-            }
-          }}
-          disabled={!commentInputValue.trim()}
-        />
+        <Tooltip
+          title={mutationGate.canMutate ? '' : (mutationGate.message ?? '')}
+          placement="topRight"
+        >
+          <Button
+            type="primary"
+            icon={<SendOutlined />}
+            onClick={() => {
+              if (commentInputValue.trim()) {
+                sendComment(commentInputValue);
+                setCommentInputValue('');
+              }
+            }}
+            disabled={!commentInputValue.trim() || !mutationGate.canMutate}
+          />
+        </Tooltip>
       </div>
     </div>
   );

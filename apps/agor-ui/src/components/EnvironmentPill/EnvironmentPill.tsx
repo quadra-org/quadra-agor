@@ -1,4 +1,4 @@
-import type { Repo, Worktree } from '@agor-live/client';
+import type { Branch, Repo } from '@agor-live/client';
 import {
   CheckCircleOutlined,
   CloseCircleOutlined,
@@ -11,38 +11,53 @@ import {
   WarningOutlined,
 } from '@ant-design/icons';
 import { Button, Space, Spin, Tooltip, theme } from 'antd';
+import { useConfirmNukeEnvironment } from '../../hooks/useConfirmNukeEnvironment';
 import { getEffectiveEnv } from '../../utils/environmentConfig';
 import { getEnvironmentState } from '../../utils/environmentState';
 import { Tag } from '../Tag';
 
 interface EnvironmentPillProps {
   repo: Repo; // Need repo for environment_config
-  worktree: Worktree; // Has environment_instance (runtime state)
-  onEdit?: () => void; // Opens WorktreeModal → Environment tab
-  onStartEnvironment?: (worktreeId: string) => void;
-  onStopEnvironment?: (worktreeId: string) => void;
-  onNukeEnvironment?: (worktreeId: string) => void;
-  onViewLogs?: (worktreeId: string) => void;
+  branch: Branch; // Has environment_instance (runtime state)
+  onEdit?: () => void; // Opens BranchModal → Environment tab
+  onStartEnvironment?: (branchId: string) => void;
+  onStopEnvironment?: (branchId: string) => void;
+  onNukeEnvironment?: (branchId: string) => void;
+  onViewLogs?: (branchId: string) => void;
+  canControlEnvironment?: boolean;
   connectionDisabled?: boolean; // Disable actions when disconnected
+  /** Whether to show the destructive Nuke action when available. Defaults to true. */
+  showNukeEnvironment?: boolean;
 }
 
 export function EnvironmentPill({
   repo,
-  worktree,
+  branch,
   onEdit,
   onStartEnvironment,
   onStopEnvironment,
   onNukeEnvironment,
   onViewLogs,
+  canControlEnvironment,
   connectionDisabled = false,
+  showNukeEnvironment = true,
 }: EnvironmentPillProps) {
   const { token } = theme.useToken();
+  const confirmNuke = useConfirmNukeEnvironment();
   const effectiveEnv = getEffectiveEnv(repo);
   const hasConfig = effectiveEnv.hasConfig;
-  const env = worktree.environment_instance;
+  const env = branch.environment_instance;
+  // If a parent has loaded effective branch access (e.g. BranchModal), honor
+  // that explicit decision. Otherwise do not try to infer from direct owners or
+  // `others_can`: group grants are not present on the branch payload, and the
+  // daemon is the source of truth for environment authorization.
+  const resolvedCanControlEnvironment = canControlEnvironment ?? true;
+  const controlDisabledTooltip = resolvedCanControlEnvironment
+    ? undefined
+    : "Requires branch 'all' permission or admin access";
 
   // Get static app_url (user-editable, initialized from template)
-  const environmentUrl = worktree.app_url;
+  const environmentUrl = branch.app_url;
 
   // Case 1: No config at all - show grayed discovery pill
   if (!hasConfig) {
@@ -107,13 +122,19 @@ export function EnvironmentPill({
   const canStop = status === 'running' || status === 'starting';
   const startDisabled =
     connectionDisabled ||
+    !resolvedCanControlEnvironment ||
     !hasConfig ||
     !onStartEnvironment ||
     isStarting ||
     isStopping ||
     isRunning;
   const stopDisabled =
-    connectionDisabled || !hasConfig || !onStopEnvironment || isStopping || !canStop;
+    connectionDisabled ||
+    !resolvedCanControlEnvironment ||
+    !hasConfig ||
+    !onStopEnvironment ||
+    isStopping ||
+    !canStop;
 
   // Build helpful tooltip based on inferred state
   const getTooltipText = () => {
@@ -238,15 +259,21 @@ export function EnvironmentPill({
             }}
           >
             {onStartEnvironment && (
-              <Tooltip title={status === 'running' ? 'Environment running' : 'Start environment'}>
+              <Tooltip
+                title={
+                  controlDisabledTooltip ??
+                  (status === 'running' ? 'Environment running' : 'Start environment')
+                }
+              >
                 <Button
                   type="text"
                   size="small"
+                  aria-label="Start environment"
                   icon={<PlayCircleOutlined />}
                   onClick={(event) => {
                     event.stopPropagation();
                     if (!startDisabled) {
-                      onStartEnvironment(worktree.worktree_id);
+                      onStartEnvironment(branch.branch_id);
                     }
                   }}
                   disabled={startDisabled}
@@ -262,23 +289,25 @@ export function EnvironmentPill({
             {onStopEnvironment && (
               <Tooltip
                 title={
-                  status === 'running'
+                  controlDisabledTooltip ??
+                  (status === 'running'
                     ? 'Stop environment'
                     : status === 'starting'
                       ? 'Stop environment (cancel startup)'
                       : status === 'stopping'
                         ? 'Environment is stopping'
-                        : 'Environment not running'
+                        : 'Environment not running')
                 }
               >
                 <Button
                   type="text"
                   size="small"
+                  aria-label="Stop environment"
                   icon={<StopOutlined />}
                   onClick={(event) => {
                     event.stopPropagation();
                     if (!stopDisabled) {
-                      onStopEnvironment(worktree.worktree_id);
+                      onStopEnvironment(branch.branch_id);
                     }
                   }}
                   disabled={stopDisabled}
@@ -294,20 +323,24 @@ export function EnvironmentPill({
             {onViewLogs && (
               <Tooltip
                 title={
-                  !effectiveEnv.logs ? 'Configure logs command to enable' : 'View environment logs'
+                  controlDisabledTooltip ??
+                  (!effectiveEnv.logs
+                    ? 'Configure logs command to enable'
+                    : 'View environment logs')
                 }
               >
                 <Button
                   type="text"
                   size="small"
+                  aria-label="View environment logs"
                   icon={<FileTextOutlined />}
                   onClick={(event) => {
                     event.stopPropagation();
-                    if (effectiveEnv.logs) {
-                      onViewLogs(worktree.worktree_id);
+                    if (resolvedCanControlEnvironment && effectiveEnv.logs) {
+                      onViewLogs(branch.branch_id);
                     }
                   }}
-                  disabled={!effectiveEnv.logs}
+                  disabled={!resolvedCanControlEnvironment || !effectiveEnv.logs}
                   style={{
                     height: 22,
                     width: 22,
@@ -317,18 +350,26 @@ export function EnvironmentPill({
                 />
               </Tooltip>
             )}
-            {onNukeEnvironment && worktree.nuke_command && (
-              <Tooltip title="Nuke environment (destructive - removes all data and volumes)">
+            {showNukeEnvironment && onNukeEnvironment && branch.nuke_command && (
+              <Tooltip
+                title={
+                  controlDisabledTooltip ??
+                  'Nuke environment (destructive - removes all data and volumes)'
+                }
+              >
                 <Button
                   type="text"
                   size="small"
                   danger
+                  aria-label="Nuke environment"
                   icon={<FireOutlined />}
                   onClick={(event) => {
                     event.stopPropagation();
-                    onNukeEnvironment(worktree.worktree_id);
+                    if (resolvedCanControlEnvironment && !connectionDisabled) {
+                      confirmNuke(() => onNukeEnvironment(branch.branch_id));
+                    }
                   }}
-                  disabled={connectionDisabled}
+                  disabled={connectionDisabled || !resolvedCanControlEnvironment}
                   style={{
                     height: 22,
                     width: 22,

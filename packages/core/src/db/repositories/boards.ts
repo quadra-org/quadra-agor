@@ -4,23 +4,69 @@
  * Type-safe CRUD operations for boards with short ID support.
  */
 
-import type { Board, BoardExportBlob, BoardObject, UUID } from '@agor/core/types';
-import { WORKTREE_PERMISSION_LEVELS } from '@agor/core/types';
-import { and, eq, exists, inArray, isNotNull, like, ne, or, sql } from 'drizzle-orm';
+import type {
+  Board,
+  BoardAccessMode,
+  BoardExportBlob,
+  BoardObject,
+  Branch,
+  BranchPermissionLevel,
+  UUID,
+} from '@agor/core/types';
+import { isAssistant } from '@agor/core/types';
+import { and, eq, exists, isNull, like, ne, or, sql } from 'drizzle-orm';
 import * as yaml from 'js-yaml';
 import { getBaseUrl } from '../../config/config-manager';
-import { formatShortId, generateId } from '../../lib/ids';
+import { generateId } from '../../lib/ids';
 import { generateSlug } from '../../lib/slugs';
 import { getBoardUrl } from '../../utils/url';
 import type { Database } from '../client';
-import { deleteFrom, insert, select, update } from '../database-wrapper';
-import { type BoardInsert, type BoardRow, boards, worktreeOwners, worktrees } from '../schema';
+import { deleteFrom, insert, jsonExtract, select, update } from '../database-wrapper';
+import {
+  type BoardInsert,
+  type BoardRow,
+  boardGroupGrants,
+  boardOwners,
+  boards,
+  branches,
+  branchOwners,
+  groupMemberships,
+  groups,
+} from '../schema';
 import {
   AmbiguousIdError,
   type BaseRepository,
   EntityNotFoundError,
+  RESOLVE_SHORT_ID_FETCH_LIMIT,
   RepositoryError,
+  resolveByShortIdPrefix,
 } from './base';
+import { visibleBranchAccessCondition } from './branch-access';
+import { BranchRepository } from './branches';
+
+const BOARD_ACCESS_MODES = ['private', 'shared'] as const;
+const BOARD_DEFAULT_FS_ACCESS = ['none', 'read', 'write'] as const;
+const BOARD_DEFAULT_OTHERS_CAN = ['none', 'view', 'session', 'prompt', 'all'] as const;
+
+function validateBoardPermissionDefaults(board: Partial<Board>): void {
+  if (board.access_mode !== undefined && !BOARD_ACCESS_MODES.includes(board.access_mode)) {
+    throw new RepositoryError(`Invalid board access_mode: ${board.access_mode}`);
+  }
+  if (
+    board.default_others_can !== undefined &&
+    !BOARD_DEFAULT_OTHERS_CAN.includes(board.default_others_can)
+  ) {
+    throw new RepositoryError(`Invalid board default_others_can: ${board.default_others_can}`);
+  }
+  if (
+    board.default_others_fs_access !== undefined &&
+    !BOARD_DEFAULT_FS_ACCESS.includes(board.default_others_fs_access)
+  ) {
+    throw new RepositoryError(
+      `Invalid board default_others_fs_access: ${board.default_others_fs_access}`
+    );
+  }
+}
 
 /**
  * Board repository implementation
@@ -43,6 +89,10 @@ export class BoardRepository implements BaseRepository<Board, Partial<Board>> {
       custom_css?: string;
       objects?: Record<string, BoardObject>;
       custom_context?: Record<string, unknown>;
+      access_mode?: BoardAccessMode;
+      default_others_can?: BranchPermissionLevel;
+      default_others_fs_access?: 'none' | 'read' | 'write';
+      default_dangerously_allow_session_sharing?: boolean;
     };
 
     const boardId = row.board_id as UUID;
@@ -53,6 +103,8 @@ export class BoardRepository implements BaseRepository<Board, Partial<Board>> {
       board_id: boardId,
       name: row.name,
       slug,
+      primary_assistant_id:
+        (row.primary_assistant_id as Board['primary_assistant_id']) ?? undefined,
       created_at: new Date(row.created_at).toISOString(),
       last_updated: row.updated_at
         ? new Date(row.updated_at).toISOString()
@@ -63,6 +115,11 @@ export class BoardRepository implements BaseRepository<Board, Partial<Board>> {
       archived_at: row.archived_at ? new Date(row.archived_at).toISOString() : undefined,
       archived_by: row.archived_by ?? undefined,
       ...data,
+      access_mode: data.access_mode ?? 'shared',
+      default_others_can: data.default_others_can ?? 'session',
+      default_others_fs_access: data.default_others_fs_access ?? 'read',
+      default_dangerously_allow_session_sharing:
+        data.default_dangerously_allow_session_sharing ?? false,
     };
   }
 
@@ -70,18 +127,28 @@ export class BoardRepository implements BaseRepository<Board, Partial<Board>> {
    * Convert Board to database insert format
    */
   private boardToInsert(board: Partial<Board>): BoardInsert {
+    validateBoardPermissionDefaults(board);
     const now = Date.now();
     const boardId = board.board_id ?? generateId();
+    if (!board.created_by) {
+      throw new RepositoryError('Board must have a created_by');
+    }
 
     return {
       board_id: boardId,
       name: board.name ?? 'Untitled Board',
       slug: board.slug !== undefined ? board.slug : null,
+      primary_assistant_id: board.primary_assistant_id ?? null,
       created_at: new Date(board.created_at ?? now),
       updated_at: board.last_updated ? new Date(board.last_updated) : new Date(now),
-      created_by: board.created_by ?? 'anonymous',
+      created_by: board.created_by,
       data: {
         description: board.description,
+        access_mode: board.access_mode ?? 'shared',
+        default_others_can: board.default_others_can ?? 'session',
+        default_others_fs_access: board.default_others_fs_access ?? 'read',
+        default_dangerously_allow_session_sharing:
+          board.default_dangerously_allow_session_sharing ?? false,
         color: board.color,
         icon: board.icon,
         background_color: board.background_color,
@@ -92,34 +159,26 @@ export class BoardRepository implements BaseRepository<Board, Partial<Board>> {
     };
   }
 
-  /**
-   * Resolve short ID to full ID
-   */
-  private async resolveId(id: string): Promise<string> {
-    // If already a full UUID, return as-is
-    if (id.length === 36 && id.includes('-')) {
-      return id;
-    }
-
-    // Short ID - need to resolve
-    const normalized = id.replace(/-/g, '').toLowerCase();
-    const pattern = `${normalized}%`;
-
-    const results = await select(this.db).from(boards).where(like(boards.board_id, pattern)).all();
-
-    if (results.length === 0) {
-      throw new EntityNotFoundError('Board', id);
-    }
-
-    if (results.length > 1) {
-      throw new AmbiguousIdError(
-        'Board',
-        id,
-        results.map((r: { board_id: string }) => formatShortId(r.board_id as UUID))
+  private rejectGenericPrimaryAssistantWrite(data: Partial<Board>, operation: string): void {
+    if (Object.hasOwn(data, 'primary_assistant_id')) {
+      throw new RepositoryError(
+        `Cannot ${operation} primary_assistant_id via generic board writes; use setPrimaryAssistant() or clearPrimaryAssistant()`
       );
     }
+  }
 
-    return results[0].board_id as UUID;
+  /**
+   * Resolve short ID to full ID via the centralized helper.
+   */
+  private async resolveId(id: string): Promise<string> {
+    return resolveByShortIdPrefix(id, 'Board', async (pattern) => {
+      const rows = await select(this.db)
+        .from(boards)
+        .where(like(boards.board_id, pattern))
+        .limit(RESOLVE_SHORT_ID_FETCH_LIMIT)
+        .all();
+      return rows.map((r: { board_id: string }) => r.board_id);
+    });
   }
 
   /**
@@ -169,6 +228,7 @@ export class BoardRepository implements BaseRepository<Board, Partial<Board>> {
    */
   async create(data: Partial<Board>): Promise<Board> {
     try {
+      this.rejectGenericPrimaryAssistantWrite(data, 'set');
       const boardId = data.board_id ?? generateId();
       const baseUrl = await getBaseUrl();
       let finalSlug: string | undefined;
@@ -283,54 +343,152 @@ export class BoardRepository implements BaseRepository<Board, Partial<Board>> {
   }
 
   /**
-   * Find the ids of boards visible to a user under worktree RBAC.
+   * Find the ids of boards visible to a user under branch RBAC.
    *
    * A board is visible if either:
    * - The user created it (self-created boards are always visible, even when
-   *   they carry no worktrees yet), OR
-   * - At least one worktree on the board is accessible to the user (owner
-   *   row, or `others_can` permits at least 'view').
+   *   they carry no branches yet), OR
+   * - At least one branch on the board is accessible to the user, OR
+   * - The board's primary assistant branch is accessible to the user, even if
+   *   that assistant branch currently lives on another board.
    *
    * Implemented as a single correlated `EXISTS` subquery against `boards` so
    * each board row is emitted at most once — no `DISTINCT` or `UNION` needed.
    * Portable SQL: `EXISTS`, `LEFT JOIN`, `IN`, `OR`, `IS NOT NULL` behave
    * identically on SQLite and Postgres, and both planners short-circuit the
-   * semi-join on the first qualifying worktree per board.
+   * semi-join on the first qualifying branch per board.
    *
-   * Should only be called when worktree RBAC is enabled.
+   * Should only be called when branch RBAC is enabled.
    *
    * @param userId - User ID to check board visibility for
    * @returns Array of board ids the user can see
    */
   async findVisibleBoardIds(userId: UUID): Promise<string[]> {
-    const permissiveLevels = WORKTREE_PERMISSION_LEVELS.filter((l) => l !== 'none');
     // Raw drizzle builder for the EXISTS subquery — `exists()` expects a
     // drizzle SelectQueryBuilder, not the cross-dialect wrapper shape, and
     // the subquery doesn't need `.all()` / `.one()` execution methods.
-    const accessibleWorktreeExists = exists(
+    const accessibleBranchExists = exists(
       // biome-ignore lint/suspicious/noExplicitAny: Drizzle select has complex cross-dialect overloads
       (this.db as any)
         .select({ _: sql`1` })
-        .from(worktrees)
+        .from(branches)
         .leftJoin(
-          worktreeOwners,
-          and(
-            eq(worktreeOwners.worktree_id, worktrees.worktree_id),
-            eq(worktreeOwners.user_id, userId)
-          )
+          branchOwners,
+          and(eq(branchOwners.branch_id, branches.branch_id), eq(branchOwners.user_id, userId))
+        )
+        .where(
+          and(eq(branches.board_id, boards.board_id), visibleBranchAccessCondition(this.db, userId))
+        )
+    );
+    const accessiblePrimaryAssistantExists = exists(
+      // biome-ignore lint/suspicious/noExplicitAny: Drizzle select has complex cross-dialect overloads
+      (this.db as any)
+        .select({ _: sql`1` })
+        .from(branches)
+        .leftJoin(
+          branchOwners,
+          and(eq(branchOwners.branch_id, branches.branch_id), eq(branchOwners.user_id, userId))
         )
         .where(
           and(
-            eq(worktrees.board_id, boards.board_id),
-            or(isNotNull(worktreeOwners.user_id), inArray(worktrees.others_can, permissiveLevels))
+            eq(branches.branch_id, boards.primary_assistant_id),
+            visibleBranchAccessCondition(this.db, userId)
           )
         )
     );
     const rows = await select(this.db, { board_id: boards.board_id })
       .from(boards)
-      .where(or(eq(boards.created_by, userId), accessibleWorktreeExists))
+      .where(
+        or(
+          eq(boards.created_by, userId),
+          exists(
+            // biome-ignore lint/suspicious/noExplicitAny: Drizzle select has complex cross-dialect overloads
+            (this.db as any)
+              .select({ _: sql`1` })
+              .from(boardOwners)
+              .where(
+                and(eq(boardOwners.board_id, boards.board_id), eq(boardOwners.user_id, userId))
+              )
+          ),
+          sql`coalesce(${jsonExtract(this.db, boards.data, 'access_mode')}, 'shared') = 'shared'`,
+          accessibleBranchExists,
+          accessiblePrimaryAssistantExists
+        )
+      )
       .all();
     return rows.map((r: { board_id: string }) => r.board_id);
+  }
+
+  async isOwner(boardId: string, userId: UUID): Promise<boolean> {
+    const row = await select(this.db)
+      .from(boardOwners)
+      .where(and(eq(boardOwners.board_id, boardId), eq(boardOwners.user_id, userId)))
+      .one();
+    return row != null;
+  }
+
+  async canMutate(boardId: string, userId: UUID): Promise<boolean> {
+    const board = await this.findById(boardId);
+    if (!board) throw new EntityNotFoundError('Board', boardId);
+    if (board.created_by === userId) return true;
+    if (await this.isOwner(board.board_id, userId)) return true;
+    if (board.access_mode === 'private') return false;
+
+    const row = await select(this.db)
+      .from(boardGroupGrants)
+      .innerJoin(
+        groupMemberships,
+        and(
+          eq(groupMemberships.group_id, boardGroupGrants.group_id),
+          eq(groupMemberships.user_id, userId)
+        )
+      )
+      .innerJoin(
+        groups,
+        and(eq(groups.group_id, boardGroupGrants.group_id), eq(groups.archived, false))
+      )
+      .where(and(eq(boardGroupGrants.board_id, board.board_id), eq(boardGroupGrants.can, 'all')))
+      .one();
+
+    return row != null;
+  }
+
+  async canView(boardId: string, userId: UUID): Promise<boolean> {
+    const board = await this.findById(boardId);
+    if (!board) throw new EntityNotFoundError('Board', boardId);
+    if (board.access_mode === 'shared') return true;
+    return (await this.findVisibleBoardIds(userId)).includes(board.board_id);
+  }
+
+  async getOwners(boardId: string): Promise<UUID[]> {
+    const board = await this.findById(boardId);
+    if (!board) throw new EntityNotFoundError('Board', boardId);
+    const rows = await select(this.db)
+      .from(boardOwners)
+      .where(eq(boardOwners.board_id, board.board_id))
+      .all();
+    return rows.map((row: { user_id: string }) => row.user_id as UUID);
+  }
+
+  async addOwner(boardId: string, userId: UUID): Promise<void> {
+    const board = await this.findById(boardId);
+    if (!board) throw new EntityNotFoundError('Board', boardId);
+    if (await this.isOwner(board.board_id, userId)) return;
+    await insert(this.db, boardOwners)
+      .values({
+        board_id: board.board_id,
+        user_id: userId,
+        created_at: new Date(),
+      })
+      .run();
+  }
+
+  async removeOwner(boardId: string, userId: UUID): Promise<void> {
+    const board = await this.findById(boardId);
+    if (!board) throw new EntityNotFoundError('Board', boardId);
+    await deleteFrom(this.db, boardOwners)
+      .where(and(eq(boardOwners.board_id, board.board_id), eq(boardOwners.user_id, userId)))
+      .run();
   }
 
   /**
@@ -338,6 +496,7 @@ export class BoardRepository implements BaseRepository<Board, Partial<Board>> {
    */
   async update(id: string, updates: Partial<Board>): Promise<Board> {
     try {
+      this.rejectGenericPrimaryAssistantWrite(updates, 'set');
       const fullId = await this.resolveId(id);
 
       // Get current board to merge updates
@@ -369,6 +528,7 @@ export class BoardRepository implements BaseRepository<Board, Partial<Board>> {
       const setData: Record<string, unknown> = {
         name: insertData.name,
         slug: insertData.slug,
+        primary_assistant_id: insertData.primary_assistant_id,
         updated_at: new Date(),
         data: insertData.data,
       };
@@ -422,6 +582,178 @@ export class BoardRepository implements BaseRepository<Board, Partial<Board>> {
   }
 
   /**
+   * Get the branch designated as this board's primary assistant.
+   */
+  async getPrimaryAssistant(boardId: string): Promise<Branch | null> {
+    try {
+      const board = await this.findById(boardId);
+      if (!board?.primary_assistant_id) return null;
+
+      const branchRepo = new BranchRepository(this.db);
+      return branchRepo.findById(board.primary_assistant_id);
+    } catch (error) {
+      if (error instanceof EntityNotFoundError) return null;
+      if (error instanceof AmbiguousIdError) throw error;
+      throw new RepositoryError(
+        `Failed to get primary assistant: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Set a board's primary assistant after validating that the branch is an
+   * assistant branch already attached to the board.
+   */
+  async setPrimaryAssistant(boardId: string, branchId: string): Promise<Board> {
+    try {
+      const fullBoardId = await this.resolveId(boardId);
+      const board = await this.findById(fullBoardId);
+      if (!board) throw new EntityNotFoundError('Board', boardId);
+
+      const branch = await this.getValidatedPrimaryAssistantBranch(fullBoardId, branchId);
+
+      await update(this.db, boards)
+        .set({
+          primary_assistant_id: branch.branch_id,
+          updated_at: new Date(),
+        })
+        .where(eq(boards.board_id, fullBoardId))
+        .run();
+
+      const updated = await this.findById(fullBoardId);
+      if (!updated) throw new RepositoryError('Failed to retrieve updated board');
+      return updated;
+    } catch (error) {
+      if (error instanceof RepositoryError) throw error;
+      if (error instanceof EntityNotFoundError) throw error;
+      if (error instanceof AmbiguousIdError) throw error;
+      throw new RepositoryError(
+        `Failed to set primary assistant: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Set a board's primary assistant only when it is currently unset.
+   *
+   * Returns the updated board when this call wins the race, or null when the
+   * board already had a primary assistant by the time the conditional update
+   * ran. The same branch/board/assistant invariants as setPrimaryAssistant()
+   * are validated before attempting the conditional write.
+   */
+  async setPrimaryAssistantIfUnset(boardId: string, branchId: string): Promise<Board | null> {
+    try {
+      const fullBoardId = await this.resolveId(boardId);
+      const branch = await this.getValidatedPrimaryAssistantBranch(fullBoardId, branchId);
+
+      const result = await update(this.db, boards)
+        .set({
+          primary_assistant_id: branch.branch_id,
+          updated_at: new Date(),
+        })
+        .where(and(eq(boards.board_id, fullBoardId), isNull(boards.primary_assistant_id)))
+        .run();
+
+      if (result.rowsAffected === 0) return null;
+
+      const updated = await this.findById(fullBoardId);
+      if (!updated) throw new RepositoryError('Failed to retrieve updated board');
+      return updated;
+    } catch (error) {
+      if (error instanceof RepositoryError) throw error;
+      if (error instanceof EntityNotFoundError) throw error;
+      if (error instanceof AmbiguousIdError) throw error;
+      throw new RepositoryError(
+        `Failed to set primary assistant if unset: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Clear a board's primary assistant only if it still points at branchId.
+   *
+   * This keeps board metadata consistent when an assistant branch is moved off
+   * a board without clearing a newer primary assistant assignment by mistake.
+   */
+  async clearPrimaryAssistantIfMatches(boardId: string, branchId: string): Promise<Board | null> {
+    try {
+      const fullBoardId = await this.resolveId(boardId);
+      const branch = await new BranchRepository(this.db).findById(branchId);
+      if (!branch) throw new EntityNotFoundError('Branch', branchId);
+
+      const result = await update(this.db, boards)
+        .set({ primary_assistant_id: null, updated_at: new Date() })
+        .where(
+          and(eq(boards.board_id, fullBoardId), eq(boards.primary_assistant_id, branch.branch_id))
+        )
+        .run();
+
+      if (result.rowsAffected === 0) return null;
+
+      const updated = await this.findById(fullBoardId);
+      if (!updated) throw new EntityNotFoundError('Board', boardId);
+      return updated;
+    } catch (error) {
+      if (error instanceof RepositoryError) throw error;
+      if (error instanceof EntityNotFoundError) throw error;
+      if (error instanceof AmbiguousIdError) throw error;
+      throw new RepositoryError(
+        `Failed to clear primary assistant if matched: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Clear a board's primary assistant pointer without deleting either entity.
+   */
+  async clearPrimaryAssistant(boardId: string): Promise<Board> {
+    try {
+      const fullBoardId = await this.resolveId(boardId);
+      await update(this.db, boards)
+        .set({ primary_assistant_id: null, updated_at: new Date() })
+        .where(eq(boards.board_id, fullBoardId))
+        .run();
+
+      const updated = await this.findById(fullBoardId);
+      if (!updated) throw new EntityNotFoundError('Board', boardId);
+      return updated;
+    } catch (error) {
+      if (error instanceof RepositoryError) throw error;
+      if (error instanceof EntityNotFoundError) throw error;
+      if (error instanceof AmbiguousIdError) throw error;
+      throw new RepositoryError(
+        `Failed to clear primary assistant: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  private async getValidatedPrimaryAssistantBranch(
+    fullBoardId: string,
+    branchId: string
+  ): Promise<Branch> {
+    const branchRepo = new BranchRepository(this.db);
+    const branch = await branchRepo.findById(branchId);
+    if (!branch) throw new EntityNotFoundError('Branch', branchId);
+
+    if (branch.board_id !== fullBoardId) {
+      throw new RepositoryError('Primary assistant branch must belong to the board');
+    }
+    if (!isAssistant(branch)) {
+      throw new RepositoryError('Primary assistant branch must be an assistant branch');
+    }
+    if (branch.archived) {
+      throw new RepositoryError('Primary assistant branch must be active');
+    }
+
+    return branch;
+  }
+
+  /**
    * DEPRECATED: Add session to board
    * Use board-objects service instead
    */
@@ -448,13 +780,16 @@ export class BoardRepository implements BaseRepository<Board, Partial<Board>> {
         return defaultBoard;
       }
 
-      // Create default board
+      // Create default board with the legacy sentinel; the first-run admin
+      // bootstrap re-attributes it to the bootstrapped admin on next start.
+      const { LEGACY_ANONYMOUS_OWNER_ID } = await import('../first-run-bootstrap');
       return this.create({
         name: 'Main Board',
         slug: 'default',
         description: 'Main board for all sessions',
         color: '#1677ff',
         icon: '⭐',
+        created_by: LEGACY_ANONYMOUS_OWNER_ID,
       });
     } catch (error) {
       throw new RepositoryError(
@@ -595,6 +930,10 @@ export class BoardRepository implements BaseRepository<Board, Partial<Board>> {
       color: board.color,
       background_color: board.background_color,
       custom_css: board.custom_css,
+      access_mode: board.access_mode,
+      default_others_can: board.default_others_can,
+      default_others_fs_access: board.default_others_fs_access,
+      default_dangerously_allow_session_sharing: board.default_dangerously_allow_session_sharing,
       objects: board.objects,
       custom_context: board.custom_context,
     };
@@ -619,6 +958,10 @@ export class BoardRepository implements BaseRepository<Board, Partial<Board>> {
       background_color: blob.background_color,
       objects: blob.objects,
       custom_context: blob.custom_context,
+      access_mode: blob.access_mode,
+      default_others_can: blob.default_others_can,
+      default_others_fs_access: blob.default_others_fs_access,
+      default_dangerously_allow_session_sharing: blob.default_dangerously_allow_session_sharing,
       created_by: userId,
     });
   }
@@ -685,6 +1028,10 @@ export class BoardRepository implements BaseRepository<Board, Partial<Board>> {
       background_color: blob.background_color,
       objects: blob.objects,
       custom_context: blob.custom_context,
+      access_mode: blob.access_mode,
+      default_others_can: blob.default_others_can,
+      default_others_fs_access: blob.default_others_fs_access,
+      default_dangerously_allow_session_sharing: blob.default_dangerously_allow_session_sharing,
       created_by: userId,
     });
   }

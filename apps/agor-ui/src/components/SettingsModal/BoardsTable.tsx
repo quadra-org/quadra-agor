@@ -1,10 +1,19 @@
-import type { AgorClient, Board, Session, Worktree } from '@agor-live/client';
+import type {
+  AgorClient,
+  Board,
+  BoardGroupGrantWithGroup,
+  Branch,
+  BranchFsAccessLevel,
+  BranchPermissionLevel,
+  Group,
+  Session,
+  User,
+  UUID,
+} from '@agor-live/client';
 import {
-  CodeSandboxOutlined,
   CopyOutlined,
   DeleteOutlined,
   DownloadOutlined,
-  DropboxOutlined,
   EditOutlined,
   PlusOutlined,
   UploadOutlined,
@@ -21,19 +30,21 @@ import {
   Table,
   Tooltip,
   Typography,
-  theme,
 } from 'antd';
 import { useMemo, useState } from 'react';
 import { mapToSortedArray } from '@/utils/mapHelpers';
 import { useThemedMessage } from '@/utils/message';
+import { filterBySettingsSearch } from '@/utils/settingsSearch';
+import { ArchiveToggleButton } from '../ArchiveButton';
 import { BoardFormFields, extractBoardFormValues, isCustomCSS } from '../forms/BoardFormFields';
+import { HighlightMatch } from '../HighlightMatch';
 import { JSONEditor, validateJSON } from '../JSONEditor';
 
 interface BoardsTableProps {
   client: AgorClient | null;
   boardById: Map<string, Board>;
-  sessionsByWorktree: Map<string, Session[]>;
-  worktreeById: Map<string, Worktree>;
+  sessionsByBranch: Map<string, Session[]>;
+  branchById: Map<string, Branch>;
   onCreate?: (board: Partial<Board>) => void;
   onUpdate?: (boardId: string, updates: Partial<Board>) => void;
   onDelete?: (boardId: string) => void;
@@ -44,8 +55,8 @@ interface BoardsTableProps {
 export const BoardsTable: React.FC<BoardsTableProps> = ({
   client,
   boardById,
-  sessionsByWorktree,
-  worktreeById,
+  sessionsByBranch,
+  branchById,
   onCreate,
   onUpdate,
   onDelete,
@@ -54,35 +65,82 @@ export const BoardsTable: React.FC<BoardsTableProps> = ({
 }) => {
   const { modal } = App.useApp();
   const { showSuccess, showError } = useThemedMessage();
-  const { token } = theme.useToken();
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [editModalOpen, setEditModalOpen] = useState(false);
   const [editingBoard, setEditingBoard] = useState<Board | null>(null);
+  const [rbacEnabled, setRbacEnabled] = useState(false);
+  const [allUsers, setAllUsers] = useState<User[]>([]);
+  const [allGroups, setAllGroups] = useState<Group[]>([]);
   const [archiveFilter, setArchiveFilter] = useState<'active' | 'archived' | 'all'>('active');
-  const [hoveredArchiveButton, setHoveredArchiveButton] = useState<string | null>(null);
+  const [searchTerm, setSearchTerm] = useState('');
   const [form] = Form.useForm();
 
-  // Calculate session count per board (worktree-centric model)
+  // Calculate session count per board (branch-centric model)
   const boardSessionCounts = useMemo(() => {
     const counts = new Map<string, number>();
 
     for (const board of boardById.values()) {
-      const boardWorktreeIds: string[] = [];
-      for (const worktree of worktreeById.values()) {
-        if (worktree.board_id === board.board_id) {
-          boardWorktreeIds.push(worktree.worktree_id);
+      const boardBranchIds: string[] = [];
+      for (const branch of branchById.values()) {
+        if (branch.board_id === board.board_id) {
+          boardBranchIds.push(branch.branch_id);
         }
       }
 
-      const sessionCount = boardWorktreeIds.flatMap(
-        (worktreeId) => sessionsByWorktree.get(worktreeId) || []
+      const sessionCount = boardBranchIds.flatMap(
+        (branchId) => sessionsByBranch.get(branchId) || []
       ).length;
 
       counts.set(board.board_id, sessionCount);
     }
 
     return counts;
-  }, [boardById, sessionsByWorktree, worktreeById]);
+  }, [boardById, sessionsByBranch, branchById]);
+
+  const syncBoardPermissions = async (boardId: string) => {
+    if (!client || !rbacEnabled) return;
+    const boardUuid = boardId as UUID;
+    const values = form.getFieldsValue(true);
+    const isPrivate = values.access_mode === 'private';
+    const desiredOwnerIds = (values.owner_ids || []) as UUID[];
+    const desiredGrants = (isPrivate ? [] : values.board_group_grants || []) as Array<{
+      group_id: string;
+      can: BranchPermissionLevel;
+      fs_access?: BranchFsAccessLevel;
+    }>;
+
+    const currentOwners = (await client
+      .service('boards/:id/owners')
+      .find({ route: { id: boardUuid } })) as User[];
+    const currentOwnerIds = currentOwners.map((u) => u.user_id as UUID);
+    await Promise.all([
+      ...desiredOwnerIds
+        .filter((id) => !currentOwnerIds.includes(id))
+        .map((user_id) =>
+          client.service('boards/:id/owners').create({ user_id }, { route: { id: boardUuid } })
+        ),
+      ...currentOwnerIds
+        .filter((id) => !desiredOwnerIds.includes(id))
+        .map((id) => client.service('boards/:id/owners').remove(id, { route: { id: boardUuid } })),
+    ]);
+
+    const currentGrants = (await client
+      .service('boards/:id/group-grants')
+      .find({ route: { id: boardUuid } })) as BoardGroupGrantWithGroup[];
+    const desiredByGroup = new Map(desiredGrants.map((grant) => [grant.group_id, grant]));
+    await Promise.all([
+      ...desiredGrants.map((grant) =>
+        client.service('boards/:id/group-grants').create(grant, { route: { id: boardUuid } })
+      ),
+      ...currentGrants
+        .filter((grant) => !desiredByGroup.has(grant.group_id))
+        .map((grant) =>
+          client.service('boards/:id/group-grants').remove(grant.group_id, {
+            route: { id: boardUuid },
+          })
+        ),
+    ]);
+  };
 
   const handleCreate = () => {
     // Validate all fields (not just 'name') so custom_context JSON rules run.
@@ -99,14 +157,53 @@ export const BoardsTable: React.FC<BoardsTableProps> = ({
       });
   };
 
-  const handleEdit = (board: Board) => {
+  const handleEdit = async (board: Board) => {
     setEditingBoard(board);
+    let ownerIds: string[] = [];
+    let boardGroupGrants: Array<{ group_id: string; can: string; fs_access?: string }> = [];
+    if (client) {
+      try {
+        const [users, groups, owners, grants] = await Promise.all([
+          client.service('users').findAll({}),
+          client.service('groups').findAll({ query: { archived: false } }),
+          client.service('boards/:id/owners').find({ route: { id: board.board_id } }),
+          client.service('boards/:id/group-grants').find({ route: { id: board.board_id } }),
+        ]);
+        setRbacEnabled(true);
+        setAllUsers(users as User[]);
+        setAllGroups(groups as Group[]);
+        ownerIds = (owners as User[]).map((user) => user.user_id);
+        if (ownerIds.length === 0 && board.created_by) {
+          ownerIds = [board.created_by];
+        }
+        boardGroupGrants = (
+          grants as Array<{ group_id: string; can: string; fs_access?: string }>
+        ).map((grant) => ({
+          group_id: grant.group_id,
+          can: grant.can,
+          fs_access: grant.fs_access,
+        }));
+      } catch (error) {
+        setRbacEnabled(false);
+        setAllUsers([]);
+        setAllGroups([]);
+        console.warn('Board RBAC metadata unavailable:', error);
+      }
+    }
     form.setFieldsValue({
       name: board.name,
       icon: board.icon,
       description: board.description,
       background_color: board.background_color,
       custom_css: board.custom_css,
+      access_mode: board.access_mode || 'shared',
+      default_others_can: board.default_others_can || 'session',
+      default_others_fs_access: board.default_others_fs_access || 'read',
+      default_dangerously_allow_session_sharing: Boolean(
+        board.default_dangerously_allow_session_sharing
+      ),
+      owner_ids: ownerIds,
+      board_group_grants: boardGroupGrants,
       custom_context: board.custom_context ? JSON.stringify(board.custom_context, null, 2) : '',
     });
     setEditModalOpen(true);
@@ -118,7 +215,15 @@ export const BoardsTable: React.FC<BoardsTableProps> = ({
     form
       .validateFields()
       .then(() => {
+        const values = form.getFieldsValue(true);
+        if (values.access_mode === 'private' && (values.owner_ids || []).length !== 1) {
+          showError('Private boards must have exactly one private user');
+          return;
+        }
         onUpdate?.(editingBoard.board_id, extractBoardFormValues(form));
+        syncBoardPermissions(editingBoard.board_id).catch((error) => {
+          showError(`Failed to update board permissions: ${error.message}`);
+        });
         form.resetFields();
         setEditModalOpen(false);
         setEditingBoard(null);
@@ -239,6 +344,23 @@ export const BoardsTable: React.FC<BoardsTableProps> = ({
     </Form.Item>
   );
 
+  const boards = useMemo(() => {
+    const filteredByArchive = mapToSortedArray(boardById, (a, b) =>
+      a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+    ).filter((board) => {
+      if (archiveFilter === 'active') return !board.archived;
+      if (archiveFilter === 'archived') return board.archived;
+      return true;
+    });
+
+    return filterBySettingsSearch(filteredByArchive, searchTerm, [
+      (board) => board.name,
+      (board) => board.slug,
+      (board) => board.description,
+      (board) => board.board_id,
+    ]);
+  }, [boardById, archiveFilter, searchTerm]);
+
   const columns = [
     {
       title: 'Icon',
@@ -251,12 +373,17 @@ export const BoardsTable: React.FC<BoardsTableProps> = ({
       title: 'Name',
       dataIndex: 'name',
       key: 'name',
+      render: (name: string) => <HighlightMatch text={name} query={searchTerm} />,
     },
     {
       title: 'Description',
       dataIndex: 'description',
       key: 'description',
-      render: (desc: string) => <Typography.Text type="secondary">{desc || '—'}</Typography.Text>,
+      render: (desc: string) => (
+        <Typography.Text type="secondary">
+          {desc ? <HighlightMatch text={desc} query={searchTerm} /> : '—'}
+        </Typography.Text>
+      ),
     },
     {
       title: 'Sessions',
@@ -270,34 +397,18 @@ export const BoardsTable: React.FC<BoardsTableProps> = ({
       width: 280,
       render: (_: unknown, board: Board) => (
         <Space size="small">
-          <Tooltip title={board.archived ? 'Archived • Click to unarchive' : 'Click to archive'}>
-            <Button
-              type="text"
-              size="small"
-              icon={
-                hoveredArchiveButton === board.board_id ? (
-                  board.archived ? (
-                    <DropboxOutlined style={{ color: token.colorSuccess }} />
-                  ) : (
-                    <CodeSandboxOutlined style={{ color: token.colorWarning }} />
-                  )
-                ) : board.archived ? (
-                  <CodeSandboxOutlined style={{ color: token.colorWarning }} />
-                ) : (
-                  <DropboxOutlined style={{ color: token.colorTextSecondary }} />
-                )
+          <ArchiveToggleButton
+            archived={Boolean(board.archived)}
+            tooltip={board.archived ? 'Archived • Click to unarchive' : 'Archive board'}
+            stopPropagation={false}
+            onToggle={(nextArchived) => {
+              if (nextArchived) {
+                onArchive?.(board.board_id);
+              } else {
+                onUnarchive?.(board.board_id);
               }
-              onMouseEnter={() => setHoveredArchiveButton(board.board_id)}
-              onMouseLeave={() => setHoveredArchiveButton(null)}
-              onClick={() => {
-                if (board.archived) {
-                  onUnarchive?.(board.board_id);
-                } else {
-                  onArchive?.(board.board_id);
-                }
-              }}
-            />
-          </Tooltip>
+            }}
+          />
           <Tooltip title="Clone board (zones, configuration, and positions only)">
             <Button
               type="text"
@@ -363,6 +474,13 @@ export const BoardsTable: React.FC<BoardsTableProps> = ({
               { value: 'archived', label: 'Archived' },
             ]}
           />
+          <Input
+            allowClear
+            placeholder="Search name, slug, description, or ID"
+            value={searchTerm}
+            onChange={(event) => setSearchTerm(event.target.value)}
+            style={{ width: 300 }}
+          />
           <Button icon={<UploadOutlined />} onClick={handleImportClick}>
             Import Board
           </Button>
@@ -373,13 +491,7 @@ export const BoardsTable: React.FC<BoardsTableProps> = ({
       </div>
 
       <Table
-        dataSource={mapToSortedArray(boardById, (a, b) =>
-          a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
-        ).filter((board) => {
-          if (archiveFilter === 'active') return !board.archived;
-          if (archiveFilter === 'archived') return board.archived;
-          return true; // 'all'
-        })}
+        dataSource={boards}
         columns={columns}
         rowKey="board_id"
         pagination={false}
@@ -393,6 +505,7 @@ export const BoardsTable: React.FC<BoardsTableProps> = ({
       <Modal
         title="Create Board"
         open={createModalOpen}
+        width={760}
         onOk={handleCreate}
         onCancel={() => {
           form.resetFields();
@@ -409,6 +522,7 @@ export const BoardsTable: React.FC<BoardsTableProps> = ({
       <Modal
         title="Edit Board"
         open={editModalOpen}
+        width={760}
         onOk={handleUpdate}
         onCancel={() => {
           form.resetFields();
@@ -427,6 +541,9 @@ export const BoardsTable: React.FC<BoardsTableProps> = ({
             initialCustomCSS={
               isCustomCSS(editingBoard?.background_color) || Boolean(editingBoard?.custom_css)
             }
+            rbacEnabled={rbacEnabled}
+            allUsers={allUsers}
+            allGroups={allGroups}
           />
         </Form>
       </Modal>

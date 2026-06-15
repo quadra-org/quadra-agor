@@ -7,6 +7,7 @@
  * - sdk_event → Shows unhandled SDK events (blacklist approach: surface by default)
  */
 
+import { shouldHidePersistedClaudeSdkEvent } from '@agor/core/client/claude-system-suppression';
 import type { Message } from '@agor-live/client';
 import { ClockCircleOutlined, InfoCircleOutlined, WarningOutlined } from '@ant-design/icons';
 import { Space, Typography, theme } from 'antd';
@@ -32,6 +33,13 @@ export const RateLimitBlock: React.FC<RateLimitBlockProps> = ({ message, agentic
   const block = rateLimitBlock || apiWaitBlock || sdkEventBlock;
   if (!block) return null;
 
+  // Defensive filter for sdk_event rows already in the DB. The server-side
+  // suppression in message-processor.ts is forward-only; the shared helper
+  // keeps both sides honest. See @agor/core/client/claude-system-suppression.
+  if (shouldHidePersistedClaudeSdkEvent(block)) {
+    return null;
+  }
+
   const text = ('text' in block ? block.text : '') as string;
   const isRateLimit = block.type === 'rate_limit';
   const isSdkEvent = block.type === 'sdk_event';
@@ -55,7 +63,7 @@ export const RateLimitBlock: React.FC<RateLimitBlockProps> = ({ message, agentic
   );
 
   const formattedContent = (
-    <Space direction="vertical" size="small" style={{ width: '100%' }}>
+    <Space orientation="vertical" size="small" style={{ width: '100%' }}>
       <Space>
         {icon}
         <Text type="secondary">{text}</Text>

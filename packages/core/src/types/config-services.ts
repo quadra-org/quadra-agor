@@ -21,14 +21,14 @@ export const SERVICE_TIER_RANK: Record<ServiceTier, number> = {
 };
 
 /**
- * The 13 service groups configurable in config.yaml under `services:`.
+ * The 15 service groups configurable in config.yaml under `services:`.
  * All default to 'on' for backward compatibility.
  */
 export interface DaemonServicesConfig {
   /** sessions, tasks, messages — the prompt loop */
   core?: ServiceTier;
-  /** worktree CRUD + board placement */
-  worktrees?: ServiceTier;
+  /** branch CRUD + board placement */
+  branches?: ServiceTier;
   /** repository management */
   repos?: ServiceTier;
   /** user accounts + auth */
@@ -51,6 +51,8 @@ export interface DaemonServicesConfig {
   mcp_servers?: ServiceTier;
   /** usage analytics */
   leaderboard?: ServiceTier;
+  /** DB-backed Knowledge documents, search, history, and graph links */
+  knowledge?: ServiceTier;
   /** Serve UI bundle and static assets (default: on). Set to 'off' for headless/executor pods. */
   static_files?: 'on' | 'off';
 }
@@ -63,7 +65,7 @@ export type ServiceGroupName = Exclude<keyof DaemonServicesConfig, 'static_files
 /** All service group names as an array (useful for iteration) */
 export const SERVICE_GROUP_NAMES: ServiceGroupName[] = [
   'core',
-  'worktrees',
+  'branches',
   'repos',
   'users',
   'boards',
@@ -75,16 +77,17 @@ export const SERVICE_GROUP_NAMES: ServiceGroupName[] = [
   'file_browser',
   'mcp_servers',
   'leaderboard',
+  'knowledge',
 ];
 
 /**
  * Allowed tiers per service group.
- * Core infrastructure services (core, worktrees, repos, users) cannot be turned off —
+ * Core infrastructure services (core, branches, repos, users) cannot be turned off —
  * the daemon doesn't function without them.
  */
 export const ALLOWED_SERVICE_TIERS: Record<ServiceGroupName, readonly ServiceTier[]> = {
   core: ['on', 'readonly', 'internal'],
-  worktrees: ['on', 'readonly', 'internal'],
+  branches: ['on', 'readonly', 'internal'],
   repos: ['on', 'readonly', 'internal'],
   users: ['on', 'readonly', 'internal'],
   boards: ['on', 'readonly', 'internal', 'off'],
@@ -96,18 +99,19 @@ export const ALLOWED_SERVICE_TIERS: Record<ServiceGroupName, readonly ServiceTie
   file_browser: ['on', 'readonly', 'internal', 'off'],
   mcp_servers: ['on', 'readonly', 'internal', 'off'],
   leaderboard: ['on', 'readonly', 'internal', 'off'],
+  knowledge: ['on', 'readonly', 'internal', 'off'],
 };
 
 /**
  * Cross-service dependency declarations.
  *
  * Key = service group, Value = groups it depends on (must be at least 'internal').
- * e.g., core depends on users (sessions→users.get) and worktrees (sessions→worktrees.get)
+ * e.g., core depends on users (sessions→users.get) and branches (sessions→branches.get)
  */
 export const SERVICE_DEPENDENCIES: Partial<Record<ServiceGroupName, ServiceGroupName[]>> = {
-  core: ['users', 'worktrees'],
-  scheduler: ['core', 'worktrees'],
-  gateway: ['core', 'worktrees'],
+  core: ['users', 'branches'],
+  scheduler: ['core', 'branches'],
+  gateway: ['core', 'branches'],
 };
 
 /**
@@ -120,15 +124,17 @@ export const DEFAULT_SERVICE_TIER: ServiceTier = 'on';
  * Used for conditional MCP tool registration.
  */
 export const SERVICE_GROUP_TO_MCP_DOMAINS: Partial<Record<ServiceGroupName, string[]>> = {
-  core: ['sessions'],
-  worktrees: ['worktrees', 'environment'],
+  core: ['sessions', 'widgets'],
+  branches: ['branches', 'environment'],
   repos: ['repos'],
   users: ['users'],
   boards: ['boards'],
   cards: ['cards'],
-  artifacts: ['artifacts'],
+  artifacts: ['artifacts', 'proxies'],
   mcp_servers: ['mcp-servers'],
   leaderboard: ['analytics'],
+  scheduler: ['schedules'],
+  knowledge: ['knowledge'],
 };
 
 /**

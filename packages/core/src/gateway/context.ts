@@ -96,5 +96,5 @@ export function formatGatewayContext(ctx: GatewayContext): string {
     return '';
   }
 
-  return lines.join('\n') + '\n\n';
+  return `${lines.join('\n')}\n\n`;
 }

@@ -7,6 +7,14 @@ echo "🚀 Starting Agor development environment..."
 # No pnpm install needed at runtime - this is the key to fast startups!
 echo "✅ Using pre-built dependencies from Docker image"
 
+# Mark /app as a safe git directory for non-branch clones (where the
+# bind-mounted source tree is owned by the host UID and trips git's
+# "dubious ownership" guard inside the container). Harmless in Agor's
+# branch-managed setup, where /app/.git is a FILE pointing to a host-only
+# gitdir that can't be resolved from inside the container at all — those
+# setups feed AGOR_BUILD_SHA via env from .agor.yml's start command instead.
+git config --global --add safe.directory /app 2>/dev/null || true
+
 # Fix home directory permissions (volumes may have wrong UID/GID from previous builds)
 echo "🔧 Fixing home directory permissions..."
 mkdir -p /home/agor/.agor /home/agor/.cache
@@ -19,23 +27,26 @@ echo "✅ Home directory permissions fixed"
 
 # Fix build directory permissions (clean stale dist files with wrong ownership)
 echo "🔧 Ensuring write access for build tools..."
+DIST_DIRS="/app/packages/core/dist /app/packages/executor/dist /app/packages/client/dist /app/apps/agor-daemon/dist /app/apps/agor-cli/dist /app/apps/agor-ui/dist"
 if sudo -n true 2>/dev/null; then
-  # Clean and recreate dist directories with correct ownership
-  # This prevents EACCES errors when tsup tries to unlink old files
-  sudo -n rm -rf /app/packages/*/dist /app/apps/*/dist 2>/dev/null || true
-  sudo -n mkdir -p /app/packages/core/dist /app/packages/executor/dist /app/apps/agor-daemon/dist /app/apps/agor-cli/dist /app/apps/agor-ui/dist
+  # Clean and recreate dist directories with correct ownership.
+  # Use the explicit workspace list instead of /app/packages/*/dist globs:
+  # under `set -e`, an unmatched glob is passed literally to chown and aborts
+  # startup before the initial builds have a chance to create dist outputs.
+  sudo -n rm -rf $DIST_DIRS 2>/dev/null || true
+  sudo -n mkdir -p $DIST_DIRS
 
   # Chown all package/app directories (non-recursive for speed)
   sudo -n chown agor:agor /app/packages/* /app/apps/* 2>/dev/null || true
 
   # Chown dist directories recursively (in case they have nested files)
-  sudo -n chown -R agor:agor /app/packages/*/dist /app/apps/*/dist
+  sudo -n chown -R agor:agor $DIST_DIRS
 
   echo "✅ Build directories ready"
 else
   # Fallback: try without sudo (might work depending on host permissions)
-  rm -rf /app/packages/*/dist /app/apps/*/dist 2>/dev/null || true
-  mkdir -p /app/packages/*/dist /app/apps/*/dist 2>/dev/null || true
+  rm -rf $DIST_DIRS 2>/dev/null || true
+  mkdir -p $DIST_DIRS 2>/dev/null || true
   echo "⚠️  Build directories created (sudo not available, may have permission issues)"
 fi
 
@@ -149,15 +160,15 @@ fi
 if [ "$AGOR_SET_RBAC_FLAG" = "true" ] || [ -n "$AGOR_SET_UNIX_MODE" ]; then
   echo "🔐 Configuring RBAC settings..."
 
-  # Enable worktree RBAC if flag is set
+  # Enable branch RBAC if flag is set
   if [ "$AGOR_SET_RBAC_FLAG" = "true" ]; then
-    if ! grep -q "worktree_rbac" /home/agor/.agor/config.yaml 2>/dev/null; then
-      sed -i '/^execution:/a\  worktree_rbac: true' /home/agor/.agor/config.yaml
-      echo "✅ Worktree RBAC enabled"
+    if ! grep -q "branch_rbac" /home/agor/.agor/config.yaml 2>/dev/null; then
+      sed -i '/^execution:/a\  branch_rbac: true' /home/agor/.agor/config.yaml
+      echo "✅ Branch RBAC enabled"
     else
       # Update existing value to true
-      sed -i 's/worktree_rbac:.*/worktree_rbac: true/' /home/agor/.agor/config.yaml
-      echo "✅ Worktree RBAC updated to enabled"
+      sed -i 's/branch_rbac:.*/branch_rbac: true/' /home/agor/.agor/config.yaml
+      echo "✅ Branch RBAC updated to enabled"
     fi
   fi
 
@@ -186,9 +197,19 @@ if [ "$AGOR_SET_RBAC_FLAG" = "true" ] || [ -n "$AGOR_SET_UNIX_MODE" ]; then
 fi
 
 # Always create/update admin user (safe: only upserts)
-echo "👤 Ensuring default admin user exists..."
-ADMIN_OUTPUT=$(pnpm --filter @agor/cli exec tsx bin/dev.ts user create-admin --force 2>&1)
+echo "👤 Ensuring development admin user exists..."
+ADMIN_OUTPUT=$(pnpm --filter @agor/cli exec tsx bin/dev.ts user create-admin --dev-default 2>&1)
 echo "$ADMIN_OUTPUT"
+
+# In strict mode the daemon validates that a session creator's unix_username exists as a
+# real OS account before spawning the executor. The admin DB user is created above via the
+# CLI (direct DB write, no Feathers hook), so the normal after-create hook that calls
+# unix.sync-user never fires. Provision the OS account explicitly here while we still have
+# a clean pre-daemon window and sudoers access.
+if [ "$AGOR_SET_UNIX_MODE" = "strict" ]; then
+  echo "🔒 Provisioning bootstrap admin OS user (strict mode)..."
+  pnpm agor admin ensure-user --username admin || echo "⚠️  Could not provision admin OS user — check sudoers"
+fi
 
 # Get FULL admin user UUID from database (the CLI only shows short ID)
 # Use dedicated script to query the database
@@ -217,7 +238,7 @@ fi
 
 # Create RBAC test users if enabled (PostgreSQL + RBAC mode)
 if [ "$CREATE_RBAC_TEST_USERS" = "true" ]; then
-  echo "👥 Creating RBAC test users and worktrees..."
+  echo "👥 Creating RBAC test users and branches..."
   pnpm tsx scripts/create-rbac-test-users.ts
 fi
 

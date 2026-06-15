@@ -13,13 +13,13 @@
 import { execSync } from 'node:child_process';
 import { generateId } from '@agor/core/db';
 import type {
+  BranchRepository,
   MCPServerRepository,
   MessagesRepository,
   RepoRepository,
   SessionMCPServerRepository,
   SessionRepository,
   UsersRepository,
-  WorktreeRepository,
 } from '../../db/feathers-repositories.js';
 import type { NormalizedSdkResponse, RawSdkResponse } from '../../types/sdk-response.js';
 import type { TokenUsage } from '../../types/token-usage.js';
@@ -33,9 +33,15 @@ import {
   type TaskID,
 } from '../../types.js';
 import { enrichContentBlocks } from '../base/diff-enrichment.js';
-import type { ITool, StreamingCallbacks, ToolCapabilities } from '../base/index.js';
-import type { MessagesService, TasksService } from '../claude/claude-tool.js';
-import { DEFAULT_GEMINI_MODEL } from './models.js';
+import type {
+  ITool,
+  MessagesService,
+  StreamingCallbacks,
+  TasksService,
+  ToolCapabilities,
+} from '../base/index.js';
+import { buildAssistantMessageMetadata, patchTaskModelIfKnown } from '../base/model-recording.js';
+import { createUserMessage } from '../claude/message-builder.js';
 import { GeminiPromptService } from './prompt-service.js';
 
 interface GeminiExecutionResult {
@@ -60,7 +66,7 @@ export class GeminiTool implements ITool {
     apiKey?: string,
     private messagesService?: MessagesService,
     private tasksService?: TasksService,
-    worktreesRepo?: WorktreeRepository,
+    branchesRepo?: BranchRepository,
     reposRepo?: RepoRepository,
     mcpServerRepo?: MCPServerRepository,
     sessionMCPRepo?: SessionMCPServerRepository,
@@ -73,13 +79,14 @@ export class GeminiTool implements ITool {
         messagesRepo,
         sessionsRepo,
         apiKey,
-        worktreesRepo,
+        branchesRepo,
         reposRepo,
         mcpServerRepo,
         sessionMCPRepo,
         mcpEnabled,
         useNativeAuth,
-        usersRepo
+        usersRepo,
+        this.tasksService
       );
     }
   }
@@ -140,14 +147,17 @@ export class GeminiTool implements ITool {
     const existingMessages = await this.messagesRepo.findBySessionId(sessionId);
     let nextIndex = existingMessages.length;
 
-    // Create user message
-    const userMessage = await this.createUserMessage(
+    // Create user message (or reuse the daemon's pre-write — see Alt D in
+    // docs/never-lose-prompt-design.md).
+    const userMessage = await createUserMessage(
       sessionId,
       prompt,
       taskId,
-      nextIndex++,
-      messageSource
+      nextIndex,
+      this.messagesService!,
+      { messageSource, existingMessages }
     );
+    nextIndex = userMessage.index + 1;
 
     // Execute prompt via Gemini SDK with streaming
     const assistantMessageIds: MessageID[] = [];
@@ -259,34 +269,6 @@ export class GeminiTool implements ITool {
   }
 
   /**
-   * Create user message in database
-   * @private
-   */
-  private async createUserMessage(
-    sessionId: SessionID,
-    prompt: string,
-    taskId: TaskID | undefined,
-    nextIndex: number,
-    messageSource?: MessageSource
-  ): Promise<Message> {
-    const userMessage: Message = {
-      message_id: generateId() as MessageID,
-      session_id: sessionId,
-      type: 'user',
-      role: MessageRole.USER,
-      index: nextIndex,
-      timestamp: new Date().toISOString(),
-      content_preview: prompt.substring(0, 200),
-      content: prompt,
-      task_id: taskId,
-      metadata: messageSource ? { source: messageSource } : undefined,
-    };
-
-    await this.messagesService?.create(userMessage);
-    return userMessage;
-  }
-
-  /**
    * Create complete assistant message in database
    * @private
    */
@@ -322,21 +304,11 @@ export class GeminiTool implements ITool {
       content: content as Message['content'],
       tool_uses: toolUses,
       task_id: taskId,
-      metadata: {
-        model: resolvedModel || DEFAULT_GEMINI_MODEL,
-        tokens: {
-          input: tokenUsage?.input_tokens || 0,
-          output: tokenUsage?.output_tokens || 0,
-        },
-      },
+      metadata: buildAssistantMessageMetadata({ model: resolvedModel, tokenUsage }),
     };
 
     await this.messagesService?.create(message);
-
-    // If task exists, update it with resolved model
-    if (taskId && resolvedModel && this.tasksService) {
-      await this.tasksService.patch(taskId, { model: resolvedModel });
-    }
+    await patchTaskModelIfKnown(this.tasksService, taskId, resolvedModel);
 
     return message;
   }
@@ -371,14 +343,17 @@ export class GeminiTool implements ITool {
     const existingMessages = await this.messagesRepo.findBySessionId(sessionId);
     let nextIndex = existingMessages.length;
 
-    // Create user message
-    const userMessage = await this.createUserMessage(
+    // Create user message (or reuse the daemon's pre-write — see Alt D in
+    // docs/never-lose-prompt-design.md).
+    const userMessage = await createUserMessage(
       sessionId,
       prompt,
       taskId,
-      nextIndex++,
-      messageSource
+      nextIndex,
+      this.messagesService!,
+      { messageSource, existingMessages }
     );
+    nextIndex = userMessage.index + 1;
 
     // Execute prompt via Gemini SDK
     const assistantMessageIds: MessageID[] = [];

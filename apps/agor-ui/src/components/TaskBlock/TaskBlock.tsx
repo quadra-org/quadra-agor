@@ -9,12 +9,9 @@
  * - Groups 3+ sequential tool-only messages into ToolBlock
  */
 
-import type { StreamingMessageState } from '@agor-live/client';
+import type { AgorClient, StreamingMessageState } from '@agor-live/client';
 import {
-  type InputRequestContent,
-  InputRequestStatus,
   type Message,
-  type MessageID,
   MessageRole,
   type PermissionRequestContent,
   type PermissionScope,
@@ -39,17 +36,16 @@ import { getContextWindowGradient } from '../../utils/contextWindow';
 import { AgentChain } from '../AgentChain';
 import { AgorAvatar } from '../AgorAvatar';
 import { CompactionBlock } from '../CompactionBlock';
+import { CopyableContent } from '../CopyableContent';
 import { MessageBlock } from '../MessageBlock';
 import { CreatedByTag } from '../metadata/CreatedByTag';
 import {
   ContextWindowPill,
   GitStatePill,
-  MessageCountPill,
   ModelPill,
   ScheduledRunPill,
   TimerPill,
   TokenCountPill,
-  ToolCountPill,
 } from '../Pill';
 import { RateLimitBlock } from '../RateLimitBlock';
 import { StickyTodoRenderer } from '../StickyTodoRenderer';
@@ -74,7 +70,12 @@ interface TaskBlockProps {
   userById?: Map<string, User>;
   currentUserId?: string;
   isExpanded: boolean;
-  onExpandChange: (expanded: boolean) => void;
+  /**
+   * Called when the user toggles this task's expand state. Receives the
+   * `taskId` so the parent can use a single stable callback shared across
+   * every TaskBlock — see ConversationView's `handleTaskExpandChange`.
+   */
+  onExpandChange: (taskId: string, expanded: boolean) => void;
   sessionId?: SessionID | null;
   onPermissionDecision?: (
     sessionId: string,
@@ -83,22 +84,17 @@ interface TaskBlockProps {
     allow: boolean,
     scope: PermissionScope
   ) => void;
-  onInputResponse?: (
-    sessionId: string,
-    requestId: string,
-    taskId: string,
-    answers: Record<string, string>,
-    annotations?: Record<string, { markdown?: string; notes?: string }>
-  ) => void;
-  worktreeName?: string;
-  scheduledFromWorktree?: boolean;
+  branchName?: string;
+  scheduledFromBranch?: boolean;
   scheduledRunAt?: number;
-  streamingMessages?: Map<MessageID, StreamingMessageState>;
+  streamingMessages?: Map<string, StreamingMessageState>;
   taskMessages: Message[];
   taskMessagesLoaded: boolean;
   onLoadTaskMessages: (taskId: string) => Promise<void> | void;
   onUnloadTaskMessages: (taskId: string) => void;
   assistantEmoji?: string;
+  /** Authenticated Feathers client, forwarded to MessageBlock → WidgetBlock for inline submission. */
+  client?: AgorClient | null;
   /** Whether this is the most recent task in the session */
   isLatestTask?: boolean;
 }
@@ -360,9 +356,8 @@ export const TaskBlock = React.memo<TaskBlockProps>(
     onExpandChange,
     sessionId,
     onPermissionDecision,
-    onInputResponse,
-    worktreeName,
-    scheduledFromWorktree,
+    branchName,
+    scheduledFromBranch,
     scheduledRunAt,
     streamingMessages,
     taskMessages,
@@ -371,6 +366,7 @@ export const TaskBlock = React.memo<TaskBlockProps>(
     onUnloadTaskMessages,
     assistantEmoji,
     isLatestTask = false,
+    client = null,
   }) => {
     const { token } = theme.useToken();
 
@@ -424,17 +420,6 @@ export const TaskBlock = React.memo<TaskBlockProps>(
       return -1;
     }, [blocks]);
 
-    // Calculate message count from task message_range
-    const messageCount = task.message_range.end_index - task.message_range.start_index + 1;
-
-    // Calculate tool count (hybrid approach)
-    // - For completed tasks: use stored count (no messages needed)
-    // - For running tasks: calculate from loaded messages (live count)
-    const toolCount =
-      task.status === TaskStatus.COMPLETED
-        ? task.tool_use_count
-        : messages.reduce((sum, msg) => sum + (msg.tool_uses?.length || 0), 0);
-
     // Get normalized SDK response (computed by executor, stored in DB)
     const normalized = task.normalized_sdk_response || null;
 
@@ -442,7 +427,11 @@ export const TaskBlock = React.memo<TaskBlockProps>(
     // If undefined, it means the backend computation failed or hasn't run yet
     const contextWindowUsed = task.computed_context_window ?? 0;
     const contextWindowLimit = normalized?.contextWindowLimit ?? 200000;
-    const taskHeaderGradient = getContextWindowGradient(contextWindowUsed, contextWindowLimit);
+    const taskHeaderGradient = getContextWindowGradient(
+      contextWindowUsed,
+      contextWindowLimit,
+      normalized?.contextUsageSnapshot
+    );
 
     // Task header shows when collapsed
     const taskHeader = (
@@ -464,11 +453,28 @@ export const TaskBlock = React.memo<TaskBlockProps>(
 
         {/* Right column: Content */}
         <Flex vertical flex={1} style={{ minWidth: 0 }}>
-          <Typography.Text ellipsis style={{ marginBottom: token.sizeUnit }}>
-            {typeof task.description === 'string'
-              ? task.description || 'User Prompt'
-              : 'User Prompt'}
-          </Typography.Text>
+          {/* Full prompt rendered with one-line CSS ellipsis. The complete
+              text stays in the DOM so users can recover it via the
+              copy-overlay (matches MessageBlock's pattern) — no tooltip,
+              which got in the way of normal hover behavior. */}
+          <CopyableContent
+            textContent={task.full_prompt || ''}
+            // Default offsets place the icon outside the wrapper, but the
+            // task header has rounded corners with overflow:hidden which
+            // clips it. Pull the icon inside the prompt row instead.
+            copyButtonOffset={{ top: 0, right: 0 }}
+          >
+            <Typography.Text
+              ellipsis
+              style={{
+                marginBottom: token.sizeUnit,
+                display: 'block',
+                paddingRight: token.sizeUnit * 3,
+              }}
+            >
+              {task.full_prompt || 'User Prompt'}
+            </Typography.Text>
+          </CopyableContent>
 
           {/* Task metadata */}
           <Flex wrap gap={token.sizeUnit}>
@@ -482,8 +488,9 @@ export const TaskBlock = React.memo<TaskBlockProps>(
                   : undefined)
               }
               durationMs={task.duration_ms}
+              lastExecutorHeartbeatAt={task.last_executor_heartbeat_at}
             />
-            {scheduledFromWorktree && scheduledRunAt && (
+            {scheduledFromBranch && scheduledRunAt && (
               <ScheduledRunPill scheduledRunAt={scheduledRunAt} />
             )}
             {task.created_by && (
@@ -494,8 +501,6 @@ export const TaskBlock = React.memo<TaskBlockProps>(
                 prefix="By"
               />
             )}
-            <MessageCountPill count={messageCount} />
-            <ToolCountPill count={toolCount} />
             {normalized && (
               <TokenCountPill
                 count={normalized.tokenUsage.totalTokens}
@@ -524,7 +529,7 @@ export const TaskBlock = React.memo<TaskBlockProps>(
                 <GitStatePill
                   branch={task.git_state.ref_at_start}
                   sha={task.git_state.sha_at_start}
-                  worktreeName={worktreeName}
+                  branchName={branchName}
                   style={{ fontSize: 11 }}
                 />
                 {task.git_state.sha_at_end &&
@@ -536,7 +541,7 @@ export const TaskBlock = React.memo<TaskBlockProps>(
                       </Typography.Text>
                       <GitStatePill
                         sha={task.git_state.sha_at_end}
-                        worktreeName={worktreeName}
+                        branchName={branchName}
                         showDirtyIndicator={true}
                         style={{ fontSize: 11 }}
                       />
@@ -557,7 +562,7 @@ export const TaskBlock = React.memo<TaskBlockProps>(
     return (
       <Collapse
         activeKey={isExpanded ? ['task-content'] : []}
-        onChange={(keys) => onExpandChange(keys.length > 0)}
+        onChange={(keys) => onExpandChange(task.task_id, keys.length > 0)}
         expandIcon={() => null}
         style={{ background: 'transparent', margin: `${token.sizeUnit * 3}px 0` }}
         items={[
@@ -613,23 +618,6 @@ export const TaskBlock = React.memo<TaskBlockProps>(
                         }
                       }
 
-                      // Find if this is an input request and if it's the first pending one
-                      const isInputRequest = block.message.type === 'input_request';
-                      let isFirstPendingInput = false;
-
-                      if (isInputRequest) {
-                        const content = block.message.content as InputRequestContent;
-                        if (content.status === InputRequestStatus.PENDING) {
-                          isFirstPendingInput = !blocks.slice(0, blockIndex).some((b) => {
-                            if (b.type === 'message' && b.message.type === 'input_request') {
-                              const c = b.message.content as InputRequestContent;
-                              return c.status === InputRequestStatus.PENDING;
-                            }
-                            return false;
-                          });
-                        }
-                      }
-
                       // Render SDK status messages (rate limit, API wait, etc.) with dedicated component
                       if (isSdkStatusMessage(block.message)) {
                         return (
@@ -656,13 +644,11 @@ export const TaskBlock = React.memo<TaskBlockProps>(
                           isTaskRunning={task.status === TaskStatus.RUNNING}
                           sessionId={sessionId}
                           onPermissionDecision={onPermissionDecision}
-                          onInputResponse={onInputResponse}
                           isFirstPendingPermission={isFirstPending}
-                          isFirstPendingInput={isFirstPendingInput}
                           isLatestMessage={isLatestMessage}
                           taskId={task.task_id}
-                          allMessages={messages}
                           assistantEmoji={assistantEmoji}
+                          client={client}
                         />
                       );
                     }

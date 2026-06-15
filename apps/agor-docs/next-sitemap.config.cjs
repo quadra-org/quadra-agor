@@ -1,6 +1,12 @@
+const siteOrigin = (process.env.NEXT_PUBLIC_SITE_URL || 'https://agor.live').replace(/\/+$/, '');
+const basePath = process.env.NEXT_PUBLIC_BASE_PATH
+  ? `/${process.env.NEXT_PUBLIC_BASE_PATH.replace(/^\/+|\/+$/g, '')}`
+  : '';
+const siteUrl = `${siteOrigin}${basePath}`;
+
 /** @type {import('next-sitemap').IConfig} */
 module.exports = {
-  siteUrl: 'https://agor.live',
+  siteUrl,
   generateRobotsTxt: false, // We use custom robots.txt in public/
   outDir: './out',
   changefreq: 'weekly',

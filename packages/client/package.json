@@ -1,51 +1,60 @@
 {
   "name": "@agor-live/client",
-  "version": "0.16.5",
+  "version": "0.21.1",
   "description": "TypeScript client for connecting to the Agor daemon",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
     },
     "./config": {
+      "source": "./src/config.ts",
       "types": "./dist/config.d.ts",
       "import": "./dist/config.js",
       "require": "./dist/config.cjs"
     },
     "./yaml": {
+      "source": "./src/yaml.ts",
       "types": "./dist/yaml.d.ts",
       "import": "./dist/yaml.js",
       "require": "./dist/yaml.cjs"
+    },
+    "./jwt": {
+      "source": "./src/jwt.ts",
+      "types": "./dist/jwt.d.ts",
+      "import": "./dist/jwt.js",
+      "require": "./dist/jwt.cjs"
     }
   },
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "tsup && node scripts/patch-dts.mjs",
+    "build": "tsup && node scripts/build-dts.mjs && node scripts/patch-dts.mjs",
     "check:pack": "node scripts/validate-pack-artifact.mjs",
     "dev": "tsup --watch",
     "prepublishOnly": "pnpm build && pnpm check:pack",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@feathersjs/authentication-client": "^5.0.44",
-    "@feathersjs/feathers": "^5.0.44",
-    "@feathersjs/rest-client": "^5.0.44",
-    "@feathersjs/socketio-client": "^5.0.44",
+    "@feathersjs/authentication-client": "^5.0.45",
+    "@feathersjs/feathers": "^5.0.45",
+    "@feathersjs/rest-client": "^5.0.45",
+    "@feathersjs/socketio-client": "^5.0.45",
     "js-yaml": "^4.1.1",
     "socket.io-client": "^4.8.3"
   },
   "devDependencies": {
     "@agor/core": "workspace:*",
     "@types/js-yaml": "^4.0.9",
-    "@types/node": "^22.10.2",
+    "@types/node": "^24.6.0",
     "tsup": "^8.5.1",
-    "typescript": "^5.9.3"
+    "typescript": "^6.0.3"
   },
   "keywords": [
     "agor",

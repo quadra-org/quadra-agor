@@ -25,7 +25,7 @@ graph TB
     subgraph "Agor Daemon (Trusted Zone)"
         Feathers["<b>FeathersJS Server</b>"]
         MCP["<b>MCP HTTP Endpoint</b><br/>POST /mcp?sessionToken=..."]
-        Services["<b>Services</b><br/>Sessions, Tasks, Messages<br/>Boards, Worktrees, Repos<br/>Users, MCP, Context, Health"]
+        Services["<b>Services</b><br/>Sessions, Tasks, Messages<br/>Boards, Branches, Repos<br/>Users, MCP, Context, Health"]
         ExecutorPool["<b>Executor Pool</b><br/>Spawn & manage executors"]
         IPCService["<b>IPC Service</b><br/>Unix socket server"]
         ORM["<b>Drizzle ORM</b><br/>Type-safe queries"]
@@ -50,7 +50,7 @@ graph TB
 
     subgraph Storage
         DB[("<b>LibSQL Database</b><br/>~/.agor/agor.db<br/>🔒 Daemon access only")]
-        Git["<b>Git Worktrees</b><br/>~/.agor/worktrees/"]
+        Git["<b>Git Branches</b><br/>~/.agor/worktrees/"]
         Config["<b>Config</b><br/>~/.agor/config.yaml<br/>🔒 Daemon access only"]
     end
 
@@ -133,7 +133,7 @@ The unified model is no longer used in current Agor releases.
 - **[FeathersJS](https://feathersjs.com/)** - Unified REST + WebSocket API framework
 - **[Drizzle ORM](https://orm.drizzle.team/)** - Type-safe database layer with LibSQL support
 - **[LibSQL](https://github.com/tursodatabase/libsql)** - Local SQLite-compatible database (future: cloud sync via Turso)
-- **[simple-git](https://github.com/steveukx/simple-git)** - Git operations for worktree management
+- **[simple-git](https://github.com/steveukx/simple-git)** - Git operations for branch management
 
 ### Frontend
 
@@ -141,6 +141,43 @@ The unified model is no longer used in current Agor releases.
 - **[Ant Design](https://ant.design/)** - Enterprise UI component library
 - **[React Flow](https://reactflow.dev/)** - Interactive session canvas with drag-and-drop
 - **[Socket.IO Client](https://socket.io/)** - Real-time WebSocket connection
+
+### Typed TypeScript Client (`@agor-live/client`)
+
+The UI and CLI both consume the daemon through a published, fully-typed client package. It's the same shape of API your own scripts and integrations use — there is no second-class "internal API."
+
+```typescript
+import { createAgorClient } from '@agor-live/client';
+
+const agor = createAgorClient({ url: 'http://localhost:3030' });
+await agor.authenticate({ strategy: 'local', email, password });
+
+// Strongly-typed CRUD across every service
+const { data: branches } = await agor.service('branches').find({
+  query: { board_id: boardId },
+});
+
+const session = await agor.service('sessions').create({
+  branch_id: branches[0].id,
+  agentic_tool: 'claude-code',
+  initial_prompt: 'Add OAuth login',
+});
+
+// Real-time WebSocket events with typed payloads
+agor.service('messages').on('created', (msg) => {
+  console.log(`${msg.role}: ${msg.content}`);
+});
+```
+
+**What you get:**
+
+- **Branded ID types** — `BranchId`, `SessionId`, `BoardId` aren't interchangeable; the compiler catches mix-ups.
+- **Service hooks across REST + WebSocket** — One subscription, one event API; the same `created`/`patched`/`removed` pattern for every entity.
+- **Schema-driven types** — Generated from Drizzle ORM models so DB schema changes propagate to clients at compile time.
+- **Authentication strategies built in** — `local`, `jwt`, `api-key`, and session-token strategies share one client surface.
+- **Same client the UI uses** — Whatever pattern works for an Agor screen works for your script.
+
+> If you're integrating Agor into your own tooling, prefer `@agor-live/client` over raw HTTP. You'll inherit every type and event the product evolves.
 
 ### CLI
 
@@ -196,8 +233,8 @@ The daemon exposes 12 FeathersJS services via REST and WebSocket:
 | **tasks**               | Work units within sessions    | CRUD, completion tracking           |
 | **messages**            | Conversation history          | CRUD, bulk insert, streaming        |
 | **boards**              | Spatial session organization  | CRUD, session positioning           |
-| **worktrees**           | Git worktree isolation        | Create, list, delete worktrees      |
-| **repos**               | Git repository management     | Clone, list, worktree operations    |
+| **branches**           | Git branch isolation        | Create, list, delete branches      |
+| **repos**               | Git repository management     | Clone, list, branch operations    |
 | **users**               | User accounts & auth          | CRUD, JWT authentication            |
 | **mcp-servers**         | MCP server configs            | CRUD, capability queries            |
 | **session-mcp-servers** | Session MCP links             | Associate MCP servers with sessions |
@@ -221,10 +258,12 @@ Every Agor session automatically gets MCP configured with **zero user configurat
    mcpServers: {
      agor: {
        type: 'http',
-       url: 'http://localhost:3030/mcp?sessionToken=cd5fc175...'
+       url: 'http://localhost:3030/mcp',
+       headers: { Authorization: 'Bearer cd5fc175...' }
      }
    }
    ```
+   The daemon requires the token in the `Authorization: Bearer` header. Query-string tokens are rejected so secrets don't leak into access logs.
 3. **Immediate Availability** - The agent can use MCP tools without any setup
 
 **Benefits:**
@@ -244,7 +283,7 @@ Agents running in Agor sessions can **introspect their own execution context**:
 ← {
     session_id: "019a1...",
     agentic_tool: "claude-code",
-    worktree_id: "019a2...",
+    branch_id: "019a2...",
     board_id: "019a3...",
     status: "running"
   }
@@ -281,7 +320,7 @@ This enables **autonomous multi-agent workflows** where a parent agent can deleg
 **Internal (Session-Scoped Tokens)**
 
 - **Authentication:** Session-specific tokens (64-char hex, 24h expiration)
-- **Scope:** Full access to own session + read access to other sessions/boards/worktrees
+- **Scope:** Full access to own session + read access to other sessions/boards/branches
 - **Use Case:** Agents running within Agor sessions (primary mode)
 - **Security:** Token is scoped to the user who created the session
 
@@ -316,7 +355,7 @@ https://localhost:3030/
 
 ## MCP Tools Reference
 
-The MCP server provides **14 tools** across sessions, worktrees, boards, tasks, and users, enabling structured programmatic access instead of brittle CLI parsing:
+The MCP server provides a growing toolkit across sessions, branches, boards, tasks, users, environments, cards, artifacts, and more — enabling structured programmatic access instead of brittle CLI parsing. See the [Agor MCP Server](/guide/internal-mcp) page for the up-to-date capability map.
 
 ```typescript
 // ❌ Brittle approach
@@ -337,18 +376,19 @@ $ agor session list | grep running | wc -l
 | `agor_sessions_get_current` | Get current session (introspection) | `{}` |
 | `agor_sessions_spawn` | Spawn child session & execute prompt | `{ prompt: 'Implement feature X', title: 'Feature X' }` |
 
-**Worktree Tools:**
+**Branch Tools:**
 | Tool | Description | Example |
 |------|-------------|---------|
-| `agor_worktrees_get` | Get worktree details | `{ worktreeId: '...' }` |
-| `agor_worktrees_list` | List all worktrees | `{ limit: 10 }` |
-| `agor_worktrees_create` | Create a worktree with optional issue/PR links | `{ repoId: '019a...', worktreeName: 'feat-x', issueUrl: 'https://...' }` |
-| `agor_worktrees_update` | Update worktree metadata (issue/PR URLs, notes) | `{ worktreeId: '019a...', pullRequestUrl: 'https://...', notes: 'Ready for review' }` |
+| `agor_branches_get` | Get branch details | `{ branchId: '...' }` |
+| `agor_branches_list` | List branches, including zone metadata and optional zone filtering | `{ limit: 10, zoneId: 'zone-review' }` |
+| `agor_branches_create` | Create a branch with optional issue/PR links | `{ repoId: '019a...', branchName: 'feat-x', issueUrl: 'https://...' }` |
+| `agor_branches_update` | Update branch metadata (issue/PR URLs, notes) | `{ branchId: '019a...', pullRequestUrl: 'https://...', notes: 'Ready for review' }` |
+| `agor_branches_set_zone` | Pin a branch to a board zone, or clear its zone pin with `zoneId: null` | `{ branchId: '019a...', zoneId: null }` |
 
 **Board Tools:**
 | Tool | Description | Example |
 |------|-------------|---------|
-| `agor_boards_get` | Get board by ID | `{ boardId: '...' }` |
+| `agor_boards_get` | Get board metadata/canvas objects; filter to zones or paginated active entities for large boards (`includeArchived: true` opts archived branch entities back in) | `{ boardId: '...', objectTypes: ['zone'], includeEntities: true, entityZoneId: 'zone-review', entitiesLimit: 25 }` |
 | `agor_boards_list` | List all boards | `{}` |
 
 **Task Tools:**
@@ -360,7 +400,8 @@ $ agor session list | grep running | wc -l
 **User Tools:**
 | Tool | Description | Example |
 |------|-------------|---------|
-| `agor_users_list` | List all users | `{ limit: 10 }` |
+| `agor_users_list` | List users with pagination, compact rows, and optional search | `{ search: 'reed', limit: 10 }` |
+| `agor_users_find` | Find users by name, email, or Unix username before admin updates | `{ email: 'reed@preset.io' }` |
 | `agor_users_get` | Get user by ID | `{ userId: '...' }` |
 | `agor_users_get_current` | Get current authenticated user | `{}` |
 | `agor_users_update_current` | Update own profile | `{ name: 'Alice', emoji: '🚀' }` |
@@ -400,7 +441,7 @@ Planned tools for expanded orchestration capabilities:
 
 - `agor_sessions_fork` - Fork session at decision point (preserve history)
 - `agor_boards_create` - Create new board for organizing sessions
-- `agor_worktrees_clone` - Clone an existing worktree configuration (branch, metadata) for rapid duplication
+- `agor_branches_clone` - Clone an existing branch configuration (branch, metadata) for rapid duplication
 
 **Note:** `agor_sessions_spawn` is already live and enables autonomous multi-agent delegation!
 
@@ -427,22 +468,22 @@ Agor uses a **hybrid materialization approach** for cross-database compatibility
 - Fast indexed queries
 - Cross-database compatibility (LibSQL ↔ PostgreSQL)
 
-### Worktree-Based Isolation
+### Branch-Based Isolation
 
-Every session requires a worktree (foreign key constraint):
+Every session requires a branch (foreign key constraint):
 
 ```
 ~/.agor/
 ├── agor.db              # Database
 ├── repos/               # Bare repositories
 │   └── myapp/
-└── worktrees/           # Session worktrees
+└── branches/           # Session branches
     └── myapp/
-        ├── main/        # Session 1 worktree
-        └── feat-auth/   # Session 2 worktree
+        ├── main/        # Session 1 branch
+        └── feat-auth/   # Session 2 branch
 ```
 
-**Why worktrees?**
+**Why branches?**
 
 - Parallel development without branch switching
 - Session isolation (no shared working directory)
@@ -450,12 +491,14 @@ Every session requires a worktree (foreign key constraint):
 
 ## Authentication
 
-Four authentication strategies:
+Four authentication strategies (all require credentials — there is no anonymous path):
 
-1. **Anonymous** (default) - No auth required for local development
-2. **Local** (email/password) - JWT-based authentication for user login
-3. **JWT** - Token refresh and validation for user sessions
+1. **Local** (email/password) - JWT-based authentication for user login
+2. **JWT** - Token refresh and validation for user sessions
+3. **API Key** - Long-lived `agor_sk_…` tokens for scripts and CI
 4. **Session Token** - Opaque UUID tokens for executor-to-daemon authentication
+
+On a fresh install with zero users, the daemon auto-creates an admin user on first start (`ensureFirstRunAdmin`), writing the generated password to `~/.agor/admin-credentials` (mode 0600) and printing it once to the daemon log.
 
 **Session Token Strategy Details:**
 
@@ -470,6 +513,8 @@ All strategies use FeathersJS authentication with configurable storage.
 
 ## Next Steps
 
-- **[Getting Started](/guide/getting-started)** - Install and run Agor
-- **[API Reference](/api-reference)** - REST endpoints and WebSocket events
+- **[Getting Started](/guide/getting-started)** — Install and run Agor
+- **[Agor MCP Server](/guide/internal-mcp)** — The agent-facing automation surface
+- **[Security](/security)** — Deployment modes, RBAC, Unix isolation, trust boundaries
+- **[SDK Comparison](/guide/sdk-comparison)** — Capability matrix across agent SDKs
 - Run `agor --help` for complete CLI documentation

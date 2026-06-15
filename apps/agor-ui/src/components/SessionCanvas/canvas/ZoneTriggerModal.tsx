@@ -1,5 +1,5 @@
 /**
- * Modal for handling zone triggers on worktree drops
+ * Modal for handling zone triggers on branch drops
  * Flow:
  * 1. Primary choice: Create new session OR Reuse existing session
  * 2. If reuse: Select session and choose action (Prompt/Fork/Spawn)
@@ -7,21 +7,28 @@
 
 import type {
   AgenticToolName,
+  AgorClient,
+  Branch,
+  BranchID,
   MCPServer,
   PermissionMode,
   Session,
   User,
-  Worktree,
-  WorktreeID,
   ZoneTrigger,
 } from '@agor-live/client';
-
+// Canonical zone-trigger context shape (branch.context / board.context /
+// zone / session). Shared with the daemon's fire-zone-trigger route and the
+// MCP `agor_branches_set_zone` path so all three render against the same
+// shape.
+import { buildZoneTriggerContext } from '@agor-live/client';
 import { DownOutlined } from '@ant-design/icons';
-import { Alert, Collapse, Form, Input, Modal, Radio, Select, Space, Typography } from 'antd';
-import Handlebars from 'handlebars';
+import { Alert, Collapse, Form, Input, Modal, Radio, Select, Space, Spin, Typography } from 'antd';
 import { useEffect, useMemo, useState } from 'react';
 import type { AgenticToolOption } from '../../../types';
 import { getSessionDisplayTitle } from '../../../utils/sessionTitle';
+// Async server-side renderer — keeps Handlebars out of the browser bundle so
+// the page doesn't need CSP `script-src 'unsafe-eval'`.
+import { renderTemplate } from '../../../utils/templates';
 import { AgenticToolConfigForm } from '../../AgenticToolConfigForm';
 import { AgentSelectionGrid } from '../../AgentSelectionGrid';
 import type { ModelConfig } from '../../ModelSelector';
@@ -29,9 +36,10 @@ import type { ModelConfig } from '../../ModelSelector';
 interface ZoneTriggerModalProps {
   open: boolean;
   onCancel: () => void;
-  worktreeId: WorktreeID;
-  worktree: Worktree | undefined;
-  sessionsByWorktree: Map<string, Session[]>; // O(1) worktree filtering
+  client: AgorClient | null;
+  branchId: BranchID;
+  branch: Branch | undefined;
+  sessionsByBranch: Map<string, Session[]>; // O(1) branch filtering
   zoneName: string;
   trigger: ZoneTrigger;
   boardName?: string;
@@ -55,9 +63,10 @@ interface ZoneTriggerModalProps {
 export const ZoneTriggerModal = ({
   open,
   onCancel,
-  worktreeId,
-  worktree,
-  sessionsByWorktree,
+  client,
+  branchId,
+  branch,
+  sessionsByBranch,
   zoneName,
   trigger,
   boardName,
@@ -85,6 +94,10 @@ export const ZoneTriggerModal = ({
   // Editable rendered template (user can modify before executing)
   const [editableTemplate, setEditableTemplate] = useState<string>('');
 
+  // Drives a Spin overlay so the user doesn't see the raw `{{...}}` flash
+  // before the daemon's rendered content arrives.
+  const [isRendering, setIsRendering] = useState<boolean>(true);
+
   // Explicit state for session config (survives form mount/unmount cycles)
   const [sessionConfig, setSessionConfig] = useState<{
     modelConfig?: ModelConfig;
@@ -92,17 +105,17 @@ export const ZoneTriggerModal = ({
     mcpServerIds?: string[];
   }>({});
 
-  // Filter sessions for this worktree using O(1) Map lookup
-  const worktreeSessions = useMemo(() => {
-    return sessionsByWorktree.get(worktreeId) || [];
-  }, [sessionsByWorktree, worktreeId]);
+  // Filter sessions for this branch using O(1) Map lookup
+  const branchSessions = useMemo(() => {
+    return sessionsByBranch.get(branchId) || [];
+  }, [sessionsByBranch, branchId]);
 
   // Smart default: Most recent active/completed session
   const smartDefaultSession = useMemo(() => {
-    if (worktreeSessions.length === 0) return '';
+    if (branchSessions.length === 0) return '';
 
     // Prioritize running sessions
-    const runningSessions = worktreeSessions.filter((s) => s.status === 'running');
+    const runningSessions = branchSessions.filter((s) => s.status === 'running');
     if (runningSessions.length > 0) {
       // Most recently updated running session
       return runningSessions.sort(
@@ -113,38 +126,38 @@ export const ZoneTriggerModal = ({
     }
 
     // Otherwise most recent session
-    return worktreeSessions.sort(
+    return branchSessions.sort(
       (a, b) =>
         new Date(b.last_updated || b.created_at).getTime() -
         new Date(a.last_updated || a.created_at).getTime()
     )[0].session_id;
-  }, [worktreeSessions]);
+  }, [branchSessions]);
 
   // Get the currently selected session (for pre-populating form on reuse)
   const selectedSession = useMemo(() => {
-    return worktreeSessions.find((s) => s.session_id === selectedSessionId);
-  }, [selectedSessionId, worktreeSessions]);
+    return branchSessions.find((s) => s.session_id === selectedSessionId);
+  }, [selectedSessionId, branchSessions]);
 
   // Reset to defaults when modal opens
   useEffect(() => {
     if (open) {
       // Default to 'reuse_existing' if sessions are available, otherwise 'create_new'
-      setMode(worktreeSessions.length > 0 ? 'reuse_existing' : 'create_new');
+      setMode(branchSessions.length > 0 ? 'reuse_existing' : 'create_new');
       setSelectedSessionId(smartDefaultSession);
       setSelectedAction('prompt');
       form.resetFields();
       setSessionConfig({}); // Clear session config state
     }
-  }, [open, smartDefaultSession, form, worktreeSessions.length]);
+  }, [open, smartDefaultSession, form, branchSessions.length]);
 
   // Pre-populate form AND state when creating new session
   // Priority: Most recent session > User defaults > System defaults
   useEffect(() => {
     if (mode === 'create_new' && selectedAgent) {
-      // Find the most recent session for this worktree (create a copy to avoid mutating the array)
+      // Find the most recent session for this branch (create a copy to avoid mutating the array)
       const mostRecentSession =
-        worktreeSessions.length > 0
-          ? [...worktreeSessions].sort(
+        branchSessions.length > 0
+          ? [...branchSessions].sort(
               (a, b) =>
                 new Date(b.last_updated || b.created_at).getTime() -
                 new Date(a.last_updated || a.created_at).getTime()
@@ -154,10 +167,10 @@ export const ZoneTriggerModal = ({
       // Get user defaults for this agent as fallback
       const agentDefaults = currentUser?.default_agentic_config?.[selectedAgent as AgenticToolName];
 
-      // MCP inheritance: worktree config > user defaults
+      // MCP inheritance: branch config > user defaults
       const effectiveMcpServerIds =
-        worktree?.mcp_server_ids && worktree.mcp_server_ids.length > 0
-          ? worktree.mcp_server_ids
+        branch?.mcp_server_ids && branch.mcp_server_ids.length > 0
+          ? branch.mcp_server_ids
           : agentDefaults?.mcpServerIds || [];
 
       // Calculate config values (priority: most recent session > user defaults)
@@ -173,7 +186,7 @@ export const ZoneTriggerModal = ({
       form.setFieldsValue(configValues);
       setSessionConfig(configValues);
     }
-  }, [mode, selectedAgent, currentUser, worktreeSessions, form, worktree?.mcp_server_ids]);
+  }, [mode, selectedAgent, currentUser, branchSessions, form, branch?.mcp_server_ids]);
 
   // Pre-populate form with selected session's config when reusing
   useEffect(() => {
@@ -188,71 +201,61 @@ export const ZoneTriggerModal = ({
     }
   }, [mode, selectedSession, form]);
 
-  // Render template preview
-  const renderedTemplate = useMemo(() => {
-    try {
-      const context = {
-        worktree: worktree
-          ? {
-              name: worktree.name || '',
-              ref: worktree.ref || '',
-              issue_url: worktree.issue_url || '',
-              pull_request_url: worktree.pull_request_url || '',
-              notes: worktree.notes || '',
-              path: worktree.path || '',
-              context: worktree.custom_context || {},
-            }
-          : {
-              name: '',
-              ref: '',
-              issue_url: '',
-              pull_request_url: '',
-              notes: '',
-              path: '',
-              context: {},
-            },
-        board: {
-          name: boardName || '',
-          description: boardDescription || '',
-          context: boardCustomContext || {},
-        },
-        session:
-          mode === 'reuse_existing' && selectedSessionId
-            ? {
-                description:
-                  worktreeSessions.find((s) => s.session_id === selectedSessionId)?.description ||
-                  '',
-                context:
-                  worktreeSessions.find((s) => s.session_id === selectedSessionId)
-                    ?.custom_context || {},
-              }
-            : {
-                description: '',
-                context: {},
-              },
-      };
-
-      const template = Handlebars.compile(trigger.template);
-      return template(context);
-    } catch (error) {
-      console.error('Handlebars template error:', error);
-      return trigger.template; // Fallback to raw template
+  // Render template preview (server-side via daemon /templates).
+  // We fetch on every dependency change; consecutive renders share the
+  // socket.io connection, and stale responses are dropped via the cancelled
+  // flag. For the user-facing preview we want the raw template (with
+  // unresolved `{{...}}`) on failure rather than a silently-blank textarea.
+  useEffect(() => {
+    let cancelled = false;
+    if (!client) {
+      setEditableTemplate(trigger.template);
+      setIsRendering(false);
+      return;
     }
+    const selectedSessionForCtx =
+      mode === 'reuse_existing' && selectedSessionId
+        ? branchSessions.find((s) => s.session_id === selectedSessionId)
+        : undefined;
+    const context = buildZoneTriggerContext({
+      branch,
+      board: {
+        name: boardName,
+        description: boardDescription,
+        custom_context: boardCustomContext,
+      },
+      zone: { label: zoneName },
+      session: selectedSessionForCtx
+        ? {
+            description: selectedSessionForCtx.description,
+            custom_context: selectedSessionForCtx.custom_context,
+          }
+        : undefined,
+    });
+
+    setIsRendering(true);
+    renderTemplate(client, trigger.template, context, 'raw').then((rendered) => {
+      if (!cancelled) {
+        setEditableTemplate(rendered);
+        setIsRendering(false);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
   }, [
+    client,
     trigger.template,
-    worktree,
+    branch,
     boardName,
     boardDescription,
     boardCustomContext,
+    zoneName,
     mode,
     selectedSessionId,
-    worktreeSessions,
+    branchSessions,
   ]);
-
-  // Update editable template when rendered template changes
-  useEffect(() => {
-    setEditableTemplate(renderedTemplate);
-  }, [renderedTemplate]);
 
   const handleExecute = async () => {
     if (mode === 'create_new') {
@@ -299,6 +302,7 @@ export const ZoneTriggerModal = ({
       onCancel={onCancel}
       onOk={handleExecute}
       okText="Execute Trigger"
+      okButtonProps={{ disabled: isRendering }}
       cancelText="Cancel"
       width={700}
     >
@@ -312,14 +316,14 @@ export const ZoneTriggerModal = ({
           >
             <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
               <Radio value="create_new">Create a new session</Radio>
-              <Radio value="reuse_existing" disabled={worktreeSessions.length === 0}>
+              <Radio value="reuse_existing" disabled={branchSessions.length === 0}>
                 Reuse a session
               </Radio>
             </Space>
           </Radio.Group>
-          {worktreeSessions.length === 0 && (
+          {branchSessions.length === 0 && (
             <Alert
-              message="No existing sessions in this worktree"
+              title="No existing sessions in this branch"
               type="info"
               showIcon
               style={{ marginTop: 12 }}
@@ -339,7 +343,7 @@ export const ZoneTriggerModal = ({
                 onChange={setSelectedSessionId}
                 style={{ width: '100%' }}
                 size="large"
-                options={worktreeSessions.map((session) => ({
+                options={branchSessions.map((session) => ({
                   value: session.session_id,
                   label: (
                     <span>
@@ -419,7 +423,7 @@ export const ZoneTriggerModal = ({
                   <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
                     {mode === 'reuse_existing' && (
                       <Alert
-                        message="Showing current configuration. These settings are for reference."
+                        title="Showing current configuration. These settings are for reference."
                         type="info"
                         showIcon
                       />
@@ -446,17 +450,19 @@ export const ZoneTriggerModal = ({
           <Typography.Text strong style={{ display: 'block', marginBottom: 8 }}>
             Prompt (editable)
           </Typography.Text>
-          <Input.TextArea
-            value={editableTemplate}
-            onChange={(e) => setEditableTemplate(e.target.value)}
-            rows={8}
-            style={{
-              fontFamily: 'monospace',
-              fontSize: '13px',
-              lineHeight: '1.5',
-            }}
-            placeholder="Edit the rendered prompt before executing..."
-          />
+          <Spin spinning={isRendering} delay={200} description="Rendering template…">
+            <Input.TextArea
+              value={editableTemplate}
+              onChange={(e) => setEditableTemplate(e.target.value)}
+              rows={8}
+              style={{
+                fontFamily: 'monospace',
+                fontSize: '13px',
+                lineHeight: '1.5',
+              }}
+              placeholder="Edit the rendered prompt before executing..."
+            />
+          </Spin>
         </div>
       </Space>
     </Modal>

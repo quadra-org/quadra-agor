@@ -6,83 +6,230 @@
  * Extracted from index.ts for maintainability.
  */
 
-import { type AgorConfig, isUnixImpersonationEnabled, type UnknownJson } from '@agor/core/config';
+import { analyticsLogger } from '@agor/core/analytics';
+import {
+  type AgorConfig,
+  isUnixImpersonationEnabled,
+  loadConfig,
+  type UnknownJson,
+  validateRepoEnvironment,
+  wrapV1AsV2,
+} from '@agor/core/config';
 import {
   ArtifactRepository,
   BoardRepository,
+  type BranchRepository,
   type Database,
+  ScheduleRepository,
   type SessionRepository,
+  shortId,
   UserMCPOAuthTokenRepository,
   type UsersRepository,
-  type WorktreeRepository,
 } from '@agor/core/db';
+import {
+  MANAGED_ENV_EXECUTION_MODE_DEFAULT,
+  validateManagedEnvLifecyclePolicy,
+  validateRenderedManagedEnvUrlFields,
+  validateRepoEnvironmentLifecyclePolicy,
+} from '@agor/core/environment/webhook';
 import type { Application } from '@agor/core/feathers';
 import { BadRequest, Forbidden, NotAuthenticated } from '@agor/core/feathers';
 import {
   boardCommentQueryValidator,
   boardObjectQueryValidator,
   boardQueryValidator,
+  branchQueryValidator,
   mcpServerQueryValidator,
   repoQueryValidator,
   sessionQueryValidator,
   taskQueryValidator,
   typedValidateQuery,
   userQueryValidator,
-  worktreeQueryValidator,
 } from '@agor/core/lib/feathers-validation';
 import type {
   AuthenticatedParams,
   Board,
+  Branch,
   HookContext,
   MCPServer,
   Paginated,
   Params,
   Session,
   User,
+  UserID,
 } from '@agor/core/types';
 import { hasMinimumRole, ROLES } from '@agor/core/types';
+import { executorRuntimeScopeGuard } from './auth/executor-runtime-scope.js';
 import type {
   BoardsServiceImpl,
   MessagesServiceImpl,
   SessionsServiceImpl,
 } from './declarations.js';
-
 import { gatewayRouteHook } from './hooks/gateway-route.js';
 import type { ArtifactsService } from './services/artifacts.js';
 import type { GatewayService } from './services/gateway.js';
+import { groupMembershipsHooks, groupsHooks } from './services/groups.js';
+import { isLocalAuthenticationLookup } from './services/users.js';
+import { buildSessionCreatedAnalyticsProperties } from './utils/analytics-payloads.js';
+import { applySessionConfigDefaults } from './utils/apply-session-config-defaults.js';
 import {
   ensureMinimumRole,
   registerAuthenticatedRoute,
   requireAdminForEnvConfig,
   requireMinimumRole,
 } from './utils/authorization.js';
+import {
+  cacheBranchAccess,
+  ensureBranchPermission,
+  ensureCanCreateSession,
+  ensureCanModifySchedule,
+  ensureCanPromptInSession,
+  ensureCanPromptTargetSession,
+  ensureCanView,
+  ensureSessionImmutability,
+  loadBranch,
+  loadBranchFromSession,
+  loadScheduleAndBranch,
+  loadSession,
+  loadSessionBranch,
+  PERMISSION_RANK,
+  resolveSessionContext,
+  scopeFindToAccessibleBoards,
+  scopeFindToAccessibleBranches,
+  scopeFindToAccessibleSessions,
+  scopeScheduleQuery,
+  scopeSessionQuery,
+  setSessionUnixUsername,
+  validateSessionUnixUsername,
+} from './utils/branch-authorization.js';
+import { inspectBranchViaExecutor } from './utils/branch-inspect.js';
+import { resolveExecutorReadAsUser } from './utils/executor-read-impersonation.js';
 import { injectCreatedBy } from './utils/inject-created-by.js';
+import {
+  redactMCPServerSecrets,
+  shouldExposeMCPServerSecrets,
+} from './utils/mcp-header-secrets.js';
+import { canReceiveMcpTokenForSession } from './utils/mcp-token-authorization.js';
+import { realignRepoOriginAfterPatchHook } from './utils/realign-repo-origin.js';
+import {
+  type RealtimeAccessBranchRepository,
+  RealtimeAccessCache,
+  type RealtimeAccessSessionRepository,
+} from './utils/realtime-access-cache.js';
+import { configureRealtimePublish } from './utils/realtime-publish.js';
+import {
+  ensureCurrentScheduleLoaded,
+  ensureScheduleRunsAsCaller,
+  recomputeNextRunAt,
+  validateScheduleConfig,
+} from './utils/schedule-hooks.js';
 import {
   createServiceToken,
   getDaemonUrl,
   spawnExecutorFireAndForget,
 } from './utils/spawn-executor.js';
-import {
-  ensureCanCreateSession,
-  ensureCanPromptInSession,
-  ensureCanPromptTargetSession,
-  ensureCanView,
-  ensureSessionImmutability,
-  ensureWorktreePermission,
-  loadSession,
-  loadSessionWorktree,
-  loadWorktree,
-  loadWorktreeFromSession,
-  PERMISSION_RANK,
-  resolveSessionContext,
-  scopeFindToAccessibleBoards,
-  scopeFindToAccessibleSessions,
-  scopeFindToAccessibleWorktrees,
-  scopeSessionQuery,
-  scopeWorktreeQuery,
-  setSessionUnixUsername,
-  validateSessionUnixUsername,
-} from './utils/worktree-authorization.js';
+
+const DEBUG_MCP_TOKENS =
+  process.env.AGOR_DEBUG_MCP_TOKENS === '1' || process.env.DEBUG?.includes('mcp-tokens');
+
+function mcpTokenDebug(...args: unknown[]): void {
+  if (DEBUG_MCP_TOKENS) {
+    console.debug(...args);
+  }
+}
+
+const BRANCH_ENV_FIELDS = [
+  'start_command',
+  'stop_command',
+  'nuke_command',
+  'logs_command',
+  'health_check_url',
+  'app_url',
+] as const;
+
+function itemHasAnyField(item: Record<string, unknown>, fields: readonly string[]): boolean {
+  return fields.some((field) => Object.hasOwn(item, field));
+}
+
+async function getManagedEnvExecutionMode() {
+  const config = await loadConfig();
+  return config.execution?.managed_envs_execution_mode ?? MANAGED_ENV_EXECUTION_MODE_DEFAULT;
+}
+
+function validateRepoEnvPolicyHook() {
+  return async (context: HookContext) => {
+    const mode = await getManagedEnvExecutionMode();
+    const items = Array.isArray(context.data) ? context.data : [context.data];
+
+    for (const item of items as Array<Record<string, unknown>>) {
+      if (Object.hasOwn(item, 'environment') && item.environment !== null) {
+        try {
+          const env = validateRepoEnvironment(item.environment);
+          validateRepoEnvironmentLifecyclePolicy(env, mode);
+        } catch (error) {
+          throw new BadRequest(error instanceof Error ? error.message : 'Invalid repo environment');
+        }
+      }
+
+      if (Object.hasOwn(item, 'environment_config') && item.environment_config !== null) {
+        try {
+          const env = wrapV1AsV2(item.environment_config as Parameters<typeof wrapV1AsV2>[0]);
+          if (env) validateRepoEnvironmentLifecyclePolicy(env, mode, 'legacy repo environment');
+        } catch (error) {
+          throw new BadRequest(
+            error instanceof Error ? error.message : 'Invalid legacy repo environment'
+          );
+        }
+      }
+    }
+
+    return context;
+  };
+}
+
+function branchEnvFieldsFromItem(item: Partial<Branch>) {
+  return {
+    start: item.start_command,
+    stop: item.stop_command,
+    nuke: item.nuke_command,
+    logs: item.logs_command,
+  };
+}
+
+function validateBranchEnvPolicyHook() {
+  return async (context: HookContext) => {
+    const items = Array.isArray(context.data) ? context.data : [context.data];
+    const shouldValidate = (items as Array<Record<string, unknown>>).some((item) =>
+      itemHasAnyField(item, BRANCH_ENV_FIELDS)
+    );
+    if (!shouldValidate) return context;
+
+    const mode = await getManagedEnvExecutionMode();
+    for (const raw of items as Array<Partial<Branch>>) {
+      let item = raw;
+      if (context.method === 'patch' && context.id !== null && context.id !== undefined) {
+        const existing = (await context.service.get(context.id, context.params)) as Branch;
+        item = { ...existing, ...raw };
+      }
+
+      try {
+        validateManagedEnvLifecyclePolicy(
+          branchEnvFieldsFromItem(item),
+          mode,
+          'branch environment'
+        );
+        validateRenderedManagedEnvUrlFields({
+          health: item.health_check_url,
+          app: item.app_url,
+        });
+      } catch (error) {
+        throw new BadRequest(error instanceof Error ? error.message : 'Invalid branch environment');
+      }
+    }
+
+    return context;
+  };
+}
 
 /**
  * Session fields written as runtime bookkeeping during the prompt/execution
@@ -98,7 +245,7 @@ import {
  *   - executor opencode init   → `sdk_session_id` (SDK session handle)
  *
  * When a `patch` touches ONLY these fields, the sessions hook chain downgrades
- * the required worktree permission from `'all'` to the same tier that
+ * the required branch permission from `'all'` to the same tier that
  * {@link ensureCanPromptInSession} enforces:
  *   - `'prompt'` or `'all'` → can patch any session's prompt-flow fields
  *   - `'session'`           → can patch own session's prompt-flow fields
@@ -131,41 +278,6 @@ export function isPromptFlowPatchOnly(data: unknown): boolean {
 }
 
 /**
- * Authorization predicate for emitting an MCP token on `GET /sessions/:id`.
- *
- * The token binds `uid = session.created_by` and lets the bearer act AS the
- * creator on the MCP channel. It must therefore only be handed to callers
- * who are ALREADY allowed to act as that creator:
- *
- *   - the creator themselves, provided they are still `member+` (viewers
- *     never receive a token — see docs: "Viewers never receive an
- *     mcp_token")
- *   - a superadmin (ops access)
- *   - the executor's service identity (spawns the child that uses the
- *     token; see `createServiceToken` in utils/spawn-executor.ts)
- *
- * A plain `member+` with `view` permission on the worktree is NOT enough —
- * giving them the token would let them impersonate the creator, sidestepping
- * the `session`-tier "own sessions only" rule enforced elsewhere.
- *
- * Note: `service` is not part of the user-facing role hierarchy (see
- * `ROLE_RANK` in `@agor/core/types/user.ts`), so `hasMinimumRole('service',
- * ...)` returns false — we check for it by exact-string match instead.
- */
-export function canReceiveMcpTokenForSession(params: {
-  callerUserId: string | undefined;
-  callerRole: string | undefined;
-  sessionCreatedBy: string | null | undefined;
-}): boolean {
-  const { callerUserId, callerRole, sessionCreatedBy } = params;
-  const isSuperadmin = hasMinimumRole(callerRole, ROLES.SUPERADMIN);
-  const isServiceExecutor = callerRole === 'service';
-  const isCreatorMember =
-    !!callerUserId && callerUserId === sessionCreatedBy && hasMinimumRole(callerRole, ROLES.MEMBER);
-  return isCreatorMember || isSuperadmin || isServiceExecutor;
-}
-
-/**
  * Extended Params with route ID parameter (needed by artifact routes in hooks).
  */
 interface RouteParams extends Params {
@@ -173,6 +285,7 @@ interface RouteParams extends Params {
     id?: string;
     messageId?: string;
     mcpId?: string;
+    requestId?: string;
   };
   user?: User;
 }
@@ -186,17 +299,15 @@ export interface RegisterHooksContext {
   config: AgorConfig;
   svcEnabled: (group: string) => boolean;
   jwtSecret: string;
-  worktreeRbacEnabled: boolean;
-  allowAnonymous: boolean;
+  branchRbacEnabled: boolean;
   requireAuth: (context: HookContext) => Promise<HookContext>;
-  getReadAuthHooks: () => Array<(context: HookContext) => Promise<HookContext>>;
   superadminOpts: { allowSuperadmin: boolean };
 
   // Service instances from registerServices()
   sessionsService: SessionsServiceImpl;
   messagesService: MessagesServiceImpl;
   boardsService: BoardsServiceImpl | undefined;
-  worktreeRepository: WorktreeRepository;
+  branchRepository: BranchRepository;
   usersRepository: UsersRepository;
   sessionsRepository: SessionRepository;
 }
@@ -211,14 +322,12 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     config,
     svcEnabled,
     jwtSecret,
-    worktreeRbacEnabled,
-    allowAnonymous,
+    branchRbacEnabled,
     requireAuth,
-    getReadAuthHooks,
     superadminOpts,
     sessionsService,
     boardsService,
-    worktreeRepository,
+    branchRepository,
     usersRepository,
     sessionsRepository,
   } = ctx;
@@ -232,6 +341,39 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     }
   };
 
+  const realtimeAccessCache = new RealtimeAccessCache({
+    branchRepository: branchRepository as unknown as RealtimeAccessBranchRepository,
+    sessionsRepository: sessionsRepository as unknown as RealtimeAccessSessionRepository,
+  });
+
+  const invalidateRealtimeBranchAccess = async (branchId: unknown): Promise<void> => {
+    if (typeof branchId !== 'string' || branchId.length === 0) return;
+    realtimeAccessCache.invalidateBranch(branchId);
+    try {
+      const branch = await branchRepository.findById(branchId);
+      if (branch) realtimeAccessCache.invalidateBranch(branch.branch_id);
+    } catch {
+      // Best-effort cache invalidation only.
+    }
+  };
+
+  const invalidateRealtimeBranchFromResult = async (context: HookContext): Promise<HookContext> => {
+    const branchId =
+      (context.result as { branch_id?: unknown } | undefined)?.branch_id ?? context.id;
+    await invalidateRealtimeBranchAccess(branchId);
+    return context;
+  };
+
+  const invalidateRealtimeBranchFromRoute = async (context: HookContext): Promise<HookContext> => {
+    await invalidateRealtimeBranchAccess(context.params.route?.id);
+    return context;
+  };
+
+  const clearRealtimeBranchVisibility = (context: HookContext): HookContext => {
+    realtimeAccessCache.clearVisibility();
+    return context;
+  };
+
   // Helper to get usersService from app
   const usersService = app.service('users');
 
@@ -241,55 +383,55 @@ export function registerHooks(ctx: RegisterHooksContext): void {
 
   app.service('messages').hooks({
     before: {
-      all: [requireAuth],
+      all: [requireAuth, executorRuntimeScopeGuard()],
       find: [
         // RBAC: Scope messages.find() to sessions the caller can access.
         // Without this backstop, any authenticated member could list messages
-        // across every session/worktree by omitting the session_id filter.
-        ...(worktreeRbacEnabled
+        // across every session/branch by omitting the session_id filter.
+        ...(branchRbacEnabled
           ? [scopeFindToAccessibleSessions(sessionsRepository, superadminOpts)]
           : []),
       ],
       get: [
-        ...(worktreeRbacEnabled
+        ...(branchRbacEnabled
           ? [
               resolveSessionContext(),
               loadSession(sessionsService),
-              loadWorktreeFromSession(worktreeRepository),
+              loadBranchFromSession(branchRepository),
               ensureCanView(superadminOpts), // Require 'view' permission
             ]
           : []),
       ],
       create: [
         requireMinimumRole(ROLES.MEMBER, 'create messages'),
-        ...(worktreeRbacEnabled
+        ...(branchRbacEnabled
           ? [
               resolveSessionContext(),
               loadSession(sessionsService),
               validateSessionUnixUsername(usersRepository), // Defensive check: session.unix_username must match creator's current unix_username
-              loadWorktreeFromSession(worktreeRepository),
+              loadBranchFromSession(branchRepository),
               ensureCanPromptInSession(superadminOpts), // Require 'prompt' (or 'session' for own sessions)
             ]
           : []),
       ],
       patch: [
         requireMinimumRole(ROLES.MEMBER, 'update messages'),
-        ...(worktreeRbacEnabled
+        ...(branchRbacEnabled
           ? [
               resolveSessionContext(),
               loadSession(sessionsService),
-              loadWorktreeFromSession(worktreeRepository),
+              loadBranchFromSession(branchRepository),
               ensureCanPromptInSession(superadminOpts), // Require 'prompt' (or 'session' for own sessions)
             ]
           : []),
       ],
       remove: [
         requireMinimumRole(ROLES.MEMBER, 'delete messages'),
-        ...(worktreeRbacEnabled
+        ...(branchRbacEnabled
           ? [
               resolveSessionContext(),
               loadSession(sessionsService),
-              loadWorktreeFromSession(worktreeRepository),
+              loadBranchFromSession(branchRepository),
               ensureCanPromptInSession(superadminOpts), // Require 'prompt' (or 'session' for own sessions)
             ]
           : []),
@@ -340,21 +482,21 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     before: {
       all: [
         typedValidateQuery(boardObjectQueryValidator),
-        ...getReadAuthHooks(),
-        ...(allowAnonymous ? [] : [requireMinimumRole(ROLES.MEMBER, 'manage board objects')]),
+        requireAuth,
+        requireMinimumRole(ROLES.MEMBER, 'manage board objects'),
       ],
-      // NOTE: We deliberately do NOT add scopeFindToAccessibleWorktrees here.
-      // Board-objects may reference `worktree_id` (worktree cards) OR `card_id`
-      // (kanban cards with no worktree) OR neither (zones, layout objects).
-      // The before-hook would filter out rows with null worktree_id, breaking
+      // NOTE: We deliberately do NOT add scopeFindToAccessibleBranches here.
+      // Board-objects may reference `branch_id` (branch cards) OR `card_id`
+      // (kanban cards with no branch) OR neither (zones, layout objects).
+      // The before-hook would filter out rows with null branch_id, breaking
       // card-only boards. Access control lives in the after-hook below, which
-      // correctly preserves card/zone rows while scoping worktree-bound ones.
+      // correctly preserves card/zone rows while scoping branch-bound ones.
     },
     after: {
       find: [
-        ...(worktreeRbacEnabled
+        ...(branchRbacEnabled
           ? [
-              // Filter board-objects based on worktree access permissions
+              // Filter board-objects based on branch access permissions
               async (context: HookContext) => {
                 // Skip for internal calls
                 if (!context.params.provider) {
@@ -379,21 +521,22 @@ export function registerHooks(ctx: RegisterHooksContext): void {
                 // biome-ignore lint/suspicious/noExplicitAny: BoardObject type not fully available in hook context
                 const boardObjects: any[] = context.result?.data ?? context.result ?? [];
 
-                // Filter based on worktree access
+                // Filter based on branch access
                 const authorizedBoardObjects = [];
                 for (const boardObject of boardObjects) {
-                  // Board objects may reference worktrees or sessions
-                  if (boardObject.worktree_id) {
-                    // Check worktree access
-                    const worktree = await worktreeRepository.findById(boardObject.worktree_id);
-                    if (!worktree) {
-                      continue; // Skip if worktree doesn't exist
+                  // Board objects may reference branches or sessions
+                  if (boardObject.branch_id) {
+                    // Check branch access
+                    const branch = await branchRepository.findById(boardObject.branch_id);
+                    if (!branch) {
+                      continue; // Skip if branch doesn't exist
                     }
 
-                    const isOwner = await worktreeRepository.isOwner(worktree.worktree_id, userId);
-                    const effectivePermission = worktree.others_can ?? 'session';
-                    const hasAccess =
-                      isOwner || PERMISSION_RANK[effectivePermission] >= PERMISSION_RANK.view;
+                    const effectivePermission = await branchRepository.resolveUserPermission(
+                      branch,
+                      userId
+                    );
+                    const hasAccess = PERMISSION_RANK[effectivePermission] >= PERMISSION_RANK.view;
 
                     if (hasAccess) {
                       authorizedBoardObjects.push(boardObject);
@@ -402,7 +545,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
                     // Card board objects: cards inherit board-level access (no per-card RBAC)
                     authorizedBoardObjects.push(boardObject);
                   } else {
-                    // No worktree or card reference - allow access (e.g., zones, other board objects)
+                    // No branch or card reference - allow access (e.g., zones, other board objects)
                     authorizedBoardObjects.push(boardObject);
                   }
                 }
@@ -429,7 +572,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
 
   safeService('card-types')?.hooks({
     before: {
-      all: [...getReadAuthHooks()],
+      all: [requireAuth],
       create: [requireMinimumRole(ROLES.MEMBER, 'create card types')],
       patch: [requireMinimumRole(ROLES.MEMBER, 'update card types')],
       remove: [requireMinimumRole(ROLES.MEMBER, 'delete card types')],
@@ -438,7 +581,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
 
   safeService('cards')?.hooks({
     before: {
-      all: [...getReadAuthHooks()],
+      all: [requireAuth],
       create: [requireMinimumRole(ROLES.MEMBER, 'create cards'), injectCreatedBy()],
       patch: [requireMinimumRole(ROLES.MEMBER, 'update cards')],
       remove: [requireMinimumRole(ROLES.MEMBER, 'delete cards')],
@@ -476,15 +619,15 @@ export function registerHooks(ctx: RegisterHooksContext): void {
 
   safeService('artifacts')?.hooks({
     before: {
-      all: [...getReadAuthHooks()],
+      all: [requireAuth],
       find: [
-        // RBAC: Artifacts carry a `worktree_id` (nullable — survives worktree deletion).
-        // Scope find() to the worktrees the caller can access. Rows with null
-        // worktree_id (orphaned artifacts) will be excluded by the $in filter,
+        // RBAC: Artifacts carry a `branch_id` (nullable — survives branch deletion).
+        // Scope find() to the branches the caller can access. Rows with null
+        // branch_id (orphaned artifacts) will be excluded by the $in filter,
         // which is the safe default — orphans can only be surfaced via explicit
         // board-scoped queries.
-        ...(worktreeRbacEnabled
-          ? [scopeFindToAccessibleWorktrees(worktreeRepository, superadminOpts)]
+        ...(branchRbacEnabled
+          ? [scopeFindToAccessibleBranches(branchRepository, superadminOpts)]
           : []),
       ],
       create: [requireMinimumRole(ROLES.MEMBER, 'create artifacts'), injectCreatedBy()],
@@ -520,8 +663,17 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         ) {
           const artifactId = _params.route?.id;
           if (!artifactId) throw new Error('Artifact ID required');
+          const userId = _params.user?.user_id;
+          if (!userId) throw new Error('Authenticated user required');
           const artifactsService = app.service('artifacts') as unknown as ArtifactsService;
-          artifactsService.appendConsoleLogs(artifactId, data.entries as never);
+          // Visibility check: only viewers who can see the artifact may
+          // append to its console buffer. Without this any member could
+          // write spam into another artifact's logs.
+          const artifact = await artifactsService.get(artifactId);
+          if (!artifactsService.isVisibleTo(artifact, userId)) {
+            throw new Error(`Artifact ${artifactId} not found`);
+          }
+          artifactsService.appendConsoleLogs(artifactId, userId, data.entries as never);
           return { success: true };
         },
       },
@@ -544,8 +696,14 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         ) {
           const artifactId = _params.route?.id;
           if (!artifactId) throw new Error('Artifact ID required');
+          const userId = _params.user?.user_id;
+          if (!userId) throw new Error('Authenticated user required');
           const artifactsService = app.service('artifacts') as unknown as ArtifactsService;
-          artifactsService.setSandpackError(artifactId, data.error, data.status);
+          const artifact = await artifactsService.get(artifactId);
+          if (!artifactsService.isVisibleTo(artifact, userId)) {
+            throw new Error(`Artifact ${artifactId} not found`);
+          }
+          artifactsService.setSandpackError(artifactId, userId, data.error, data.status);
           return { success: true };
         },
       },
@@ -554,15 +712,139 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       },
       requireAuth
     );
+
+    // ── Runtime query responses ────────────────────────────────────────────
+    // Browser POSTs the iframe's `agor:result` payload here. Path encodes
+    // the request id so the daemon can correlate to a pending query in
+    // memory. The caller must be the same user that issued the original
+    // query — the service-side check rejects mismatches silently.
+    //
+    // The injected agor-runtime.js caps replies (200KB document HTML, 50
+    // nodes per query, 50KB outerHTML per node), but a malicious or buggy
+    // browser could bypass the runtime and POST a much larger body. Cap
+    // here too so a wrongly-sized payload doesn't bloat the daemon's
+    // pending-query map or the agent's MCP context.
+    const RUNTIME_RESPONSE_BYTE_CAP = 512 * 1024;
+    registerAuthenticatedRoute(
+      app,
+      '/artifacts/:id/runtime-response/:requestId',
+      {
+        async create(
+          data: { ok: boolean; result?: unknown; error?: string },
+          _params: RouteParams
+        ) {
+          const requestId = _params.route?.requestId;
+          if (!requestId) throw new Error('Request ID required');
+          const userId = _params.user?.user_id;
+          if (!userId) throw new Error('Authenticated user required');
+
+          // Defensive size cap. JSON.stringify is the cheapest faithful
+          // measurement of "how big is this payload going to be when we
+          // hand it to the agent." Round trips through the runtime stay
+          // well under this in practice.
+          let payloadOk = data.ok;
+          let payloadResult = data.result;
+          let payloadError = data.error;
+          try {
+            const measured = JSON.stringify(payloadResult ?? null);
+            if (measured.length > RUNTIME_RESPONSE_BYTE_CAP) {
+              payloadOk = false;
+              payloadResult = undefined;
+              payloadError = `Runtime response exceeded ${RUNTIME_RESPONSE_BYTE_CAP} bytes (got ${measured.length}). Reduce maxNodes or use a more specific selector.`;
+            }
+          } catch (err) {
+            payloadOk = false;
+            payloadResult = undefined;
+            payloadError = `Runtime response was not JSON-serializable: ${err instanceof Error ? err.message : String(err)}`;
+          }
+
+          const artifactsService = app.service('artifacts') as unknown as ArtifactsService;
+          artifactsService.resolveRuntimeQuery({
+            requestId,
+            responderUserId: userId,
+            ok: payloadOk,
+            result: payloadResult,
+            error: payloadError,
+          });
+          return { received: true };
+        },
+      },
+      {
+        create: { role: ROLES.MEMBER, action: 'post artifact runtime response' },
+      },
+      requireAuth
+    );
+
+    // ── Trust grants (TOFU consent flow) ───────────────────────────────────
+    // Per-artifact: POST creates a grant covering the artifact's currently-
+    // requested env vars and grants. Caller MUST be authenticated; the grant
+    // is attributed to the calling user.
+    registerAuthenticatedRoute(
+      app,
+      '/artifacts/:id/trust',
+      {
+        async create(
+          data: { scopeType: import('@agor/core/types').ArtifactTrustScopeType },
+          _params: RouteParams
+        ) {
+          const artifactId = _params.route?.id;
+          if (!artifactId) throw new Error('Artifact ID required');
+          const userId = _params.user?.user_id;
+          if (!userId) throw new Error('Authenticated user required');
+          const artifactsService = app.service('artifacts') as unknown as ArtifactsService;
+          // The consent surface (env vars + grants) is derived server-side
+          // from the artifact's current request. The client only nominates
+          // the scope; the server decides what the grant covers. This stops
+          // a confused/malicious client from persisting a grant whose
+          // covered set diverges from what the server will actually inject.
+          return artifactsService.grantTrust({
+            userId,
+            artifactId,
+            scopeType: data.scopeType,
+          });
+        },
+      },
+      {
+        create: { role: ROLES.MEMBER, action: 'create artifact trust grant' },
+      },
+      requireAuth
+    );
+
+    // List the calling user's active trust grants. Used by the settings page.
+    registerAuthenticatedRoute(
+      app,
+      '/me/artifact-trust-grants',
+      {
+        async find(params: RouteParams) {
+          const userId = params.user?.user_id;
+          if (!userId) throw new Error('Authenticated user required');
+          const artifactsService = app.service('artifacts') as unknown as ArtifactsService;
+          return artifactsService.listTrustGrants(userId);
+        },
+        async remove(id: unknown, params: RouteParams) {
+          const userId = params.user?.user_id;
+          if (!userId) throw new Error('Authenticated user required');
+          const grantId = String(id);
+          const artifactsService = app.service('artifacts') as unknown as ArtifactsService;
+          await artifactsService.revokeTrustGrant(userId, grantId);
+          return { revoked: true, grantId };
+        },
+      },
+      {
+        find: { role: ROLES.VIEWER, action: 'list artifact trust grants' },
+        remove: { role: ROLES.MEMBER, action: 'revoke artifact trust grant' },
+      },
+      requireAuth
+    );
   }
 
   // ============================================================================
-  // Board comments, repos, worktrees hooks
+  // Board comments, repos, branches hooks
   // ============================================================================
 
   safeService('board-comments')?.hooks({
     before: {
-      all: [typedValidateQuery(boardCommentQueryValidator), ...getReadAuthHooks()],
+      all: [typedValidateQuery(boardCommentQueryValidator), requireAuth],
       create: [requireMinimumRole(ROLES.MEMBER, 'create board comments'), injectCreatedBy()],
       patch: [requireMinimumRole(ROLES.MEMBER, 'update board comments')],
       remove: [requireMinimumRole(ROLES.MEMBER, 'delete board comments')],
@@ -573,62 +855,87 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     before: {
       all: [
         typedValidateQuery(repoQueryValidator),
-        ...getReadAuthHooks(),
-        ...(allowAnonymous ? [] : [requireMinimumRole(ROLES.MEMBER, 'access repositories')]),
+        requireAuth,
+        requireMinimumRole(ROLES.MEMBER, 'access repositories'),
       ],
-      create: [requireMinimumRole(ROLES.MEMBER, 'create repositories'), requireAdminForEnvConfig()],
-      update: [requireMinimumRole(ROLES.MEMBER, 'update repositories'), requireAdminForEnvConfig()],
-      patch: [requireMinimumRole(ROLES.MEMBER, 'update repositories'), requireAdminForEnvConfig()],
+      create: [
+        requireMinimumRole(ROLES.MEMBER, 'create repositories'),
+        requireAdminForEnvConfig(),
+        validateRepoEnvPolicyHook(),
+      ],
+      update: [
+        requireMinimumRole(ROLES.MEMBER, 'update repositories'),
+        requireAdminForEnvConfig(),
+        validateRepoEnvPolicyHook(),
+      ],
+      patch: [
+        requireMinimumRole(ROLES.MEMBER, 'update repositories'),
+        requireAdminForEnvConfig(),
+        validateRepoEnvPolicyHook(),
+      ],
       remove: [requireMinimumRole(ROLES.MEMBER, 'delete repositories')],
+    },
+    after: {
+      patch: [realignRepoOriginAfterPatchHook()],
     },
   });
 
-  app.service('worktrees').hooks({
+  app.service('branches').hooks({
     before: {
       all: [
-        typedValidateQuery(worktreeQueryValidator),
-        ...getReadAuthHooks(),
-        ...(allowAnonymous ? [] : [requireMinimumRole(ROLES.MEMBER, 'access worktrees')]),
+        typedValidateQuery(branchQueryValidator),
+        requireAuth,
+        executorRuntimeScopeGuard(),
+        requireMinimumRole(ROLES.MEMBER, 'access branches'),
       ],
       find: [
-        // RBAC: Optimized SQL-based filtering (single query with JOIN, no N+1)
-        ...(worktreeRbacEnabled ? [scopeWorktreeQuery(worktreeRepository, superadminOpts)] : []),
+        // RBAC: compose an accessible branch_id filter and let BranchesService.find()
+        // handle service-level filters/enrichment (including virtual zone_id).
+        ...(branchRbacEnabled
+          ? [scopeFindToAccessibleBranches(branchRepository, superadminOpts)]
+          : []),
       ],
       get: [
-        ...(worktreeRbacEnabled
+        ...(branchRbacEnabled
           ? [
-              loadWorktree(worktreeRepository),
-              ensureCanView(superadminOpts), // Require 'view' permission to read worktree
+              loadBranch(branchRepository),
+              ensureCanView(superadminOpts), // Require 'view' permission to read branch
             ]
           : []),
       ],
       create: [
-        requireMinimumRole(ROLES.MEMBER, 'create worktrees'),
+        requireMinimumRole(ROLES.MEMBER, 'create branches'),
         requireAdminForEnvConfig(),
+        validateBranchEnvPolicyHook(),
         injectCreatedBy(),
       ],
-      update: [requireMinimumRole(ROLES.MEMBER, 'update worktrees'), requireAdminForEnvConfig()],
+      update: [
+        requireMinimumRole(ROLES.MEMBER, 'update branches'),
+        requireAdminForEnvConfig(),
+        validateBranchEnvPolicyHook(),
+      ],
       patch: [
         requireAdminForEnvConfig(),
-        ...(worktreeRbacEnabled
+        validateBranchEnvPolicyHook(),
+        ...(branchRbacEnabled
           ? [
-              loadWorktree(worktreeRepository),
-              ensureWorktreePermission('all', 'update worktrees', superadminOpts), // Require 'all' permission to update
+              loadBranch(branchRepository),
+              ensureBranchPermission('all', 'update branches', superadminOpts), // Require 'all' permission to update
             ]
           : []),
         // Capture previous others_fs_access for comparison in after hook
-        ...(worktreeRbacEnabled
+        ...(branchRbacEnabled
           ? [
               async (context: HookContext) => {
-                const patchData = context.data as Partial<import('@agor/core/types').Worktree>;
+                const patchData = context.data as Partial<import('@agor/core/types').Branch>;
                 const params = context.params as AuthenticatedParams & {
                   _skipUnixSync?: boolean;
                   _previousOthersFsAccess?: string;
                 };
                 if (Object.hasOwn(patchData, 'others_fs_access') && !params._skipUnixSync) {
                   // Fetch current value to compare in after hook
-                  const worktree = await context.service.get(context.id);
-                  params._previousOthersFsAccess = worktree.others_fs_access;
+                  const branch = await context.service.get(context.id);
+                  params._previousOthersFsAccess = branch.others_fs_access;
                 }
                 return context;
               },
@@ -636,46 +943,48 @@ export function registerHooks(ctx: RegisterHooksContext): void {
           : []),
       ],
       remove: [
-        ...(worktreeRbacEnabled
+        ...(branchRbacEnabled
           ? [
-              loadWorktree(worktreeRepository),
-              ensureWorktreePermission('all', 'delete worktrees', superadminOpts), // Require 'all' permission to delete
+              loadBranch(branchRepository),
+              ensureBranchPermission('all', 'delete branches', superadminOpts), // Require 'all' permission to delete
             ]
           : []),
       ],
     },
     after: {
       create: [
-        ...(worktreeRbacEnabled
+        ...(branchRbacEnabled
           ? [
               async (context: HookContext) => {
                 // RBAC + Unix Integration: Create Unix group and add initial owner
-                const worktree = context.result as import('@agor/core/types').Worktree;
-                const creatorId = worktree.created_by;
+                const branch = context.result as import('@agor/core/types').Branch;
+                const creatorId = branch.created_by;
 
                 // Add creator as initial owner
-                await worktreeRepository.addOwner(
-                  worktree.worktree_id,
+                await branchRepository.addOwner(
+                  branch.branch_id,
                   creatorId as import('@agor/core/types').UUID
                 );
                 console.log(
-                  `[RBAC] Added creator ${creatorId.substring(0, 8)} as owner of worktree ${worktree.worktree_id.substring(0, 8)}`
+                  `[RBAC] Added creator ${shortId(creatorId)} as owner of branch ${shortId(branch.branch_id)}`
                 );
 
-                // NOTE: unix.sync-worktree is NOT spawned here to avoid race conditions.
-                // git.worktree.add executor handles Unix group creation synchronously.
-                // unix.sync-worktree is only used when owners are added/removed AFTER creation.
+                // NOTE: unix.sync-branch is NOT spawned here to avoid race conditions.
+                // git.branch.add executor handles Unix group creation synchronously.
+                // unix.sync-branch is only used when owners are added/removed AFTER creation.
 
                 return context;
               },
             ]
           : []),
+        invalidateRealtimeBranchFromResult,
       ],
       patch: [
-        ...(worktreeRbacEnabled
+        invalidateRealtimeBranchFromResult,
+        ...(branchRbacEnabled
           ? [
               async (context: HookContext) => {
-                // Unix Integration: Sync worktree permissions when others_fs_access changes
+                // Unix Integration: Sync branch permissions when others_fs_access changes
                 const params = context.params as AuthenticatedParams & {
                   _skipUnixSync?: boolean;
                   _previousOthersFsAccess?: string;
@@ -686,27 +995,27 @@ export function registerHooks(ctx: RegisterHooksContext): void {
                   return context;
                 }
 
-                const patchData = context.data as Partial<import('@agor/core/types').Worktree>;
+                const patchData = context.data as Partial<import('@agor/core/types').Branch>;
 
                 // Only proceed if others_fs_access was in the patch data
                 if (!Object.hasOwn(patchData, 'others_fs_access')) {
                   return context;
                 }
 
-                const worktree = context.result as import('@agor/core/types').Worktree;
+                const branch = context.result as import('@agor/core/types').Branch;
 
                 // Check if the value actually changed (avoid unnecessary sync)
                 const previousValue = params._previousOthersFsAccess;
-                if (previousValue === worktree.others_fs_access) {
+                if (previousValue === branch.others_fs_access) {
                   console.log(
-                    `[Unix Integration] Worktree ${worktree.worktree_id.substring(0, 8)} others_fs_access unchanged (${previousValue}), skipping`
+                    `[Unix Integration] Branch ${shortId(branch.branch_id)} others_fs_access unchanged (${previousValue}), skipping`
                   );
                   return context;
                 }
 
-                if (!worktree.path) {
+                if (!branch.path) {
                   console.log(
-                    `[Unix Integration] Worktree ${worktree.worktree_id.substring(0, 8)} has no path, skipping permission update`
+                    `[Unix Integration] Branch ${shortId(branch.branch_id)} has no path, skipping permission update`
                   );
                   return context;
                 }
@@ -715,20 +1024,23 @@ export function registerHooks(ctx: RegisterHooksContext): void {
                 // The executor will handle permission changes idempotently
                 if (jwtSecret) {
                   console.log(
-                    `[Unix Integration] Syncing permissions for worktree ${worktree.worktree_id.substring(0, 8)} (others_fs_access: ${previousValue} -> ${worktree.others_fs_access})`
+                    `[Unix Integration] Syncing permissions for branch ${shortId(branch.branch_id)} (others_fs_access: ${previousValue} -> ${branch.others_fs_access})`
                   );
-                  const serviceToken = createServiceToken(jwtSecret);
+                  const serviceToken = createServiceToken(jwtSecret, undefined, {
+                    branch_id: branch.branch_id,
+                    command: 'unix.sync-branch',
+                  });
                   spawnExecutorFireAndForget(
                     {
-                      command: 'unix.sync-worktree',
+                      command: 'unix.sync-branch',
                       sessionToken: serviceToken,
                       daemonUrl: getDaemonUrl(),
                       params: {
-                        worktreeId: worktree.worktree_id,
+                        branchId: branch.branch_id,
                         daemonUser: config.daemon?.unix_user,
                       },
                     },
-                    { logPrefix: '[Executor/worktree.patch]' }
+                    { logPrefix: '[Executor/branch.patch]' }
                   );
                 }
 
@@ -738,27 +1050,31 @@ export function registerHooks(ctx: RegisterHooksContext): void {
           : []),
       ],
       remove: [
-        ...(worktreeRbacEnabled
+        invalidateRealtimeBranchFromResult,
+        ...(branchRbacEnabled
           ? [
               async (context: HookContext) => {
-                // Unix Integration: Delete Unix group when worktree is deleted
-                const worktreeId = context.id as import('@agor/core/types').WorktreeID;
+                // Unix Integration: Delete Unix group when branch is deleted
+                const branchId = context.id as import('@agor/core/types').BranchID;
 
                 // Fire-and-forget sync with delete flag to executor
                 if (jwtSecret) {
-                  const serviceToken = createServiceToken(jwtSecret);
+                  const serviceToken = createServiceToken(jwtSecret, undefined, {
+                    branch_id: branchId,
+                    command: 'unix.sync-branch',
+                  });
                   spawnExecutorFireAndForget(
                     {
-                      command: 'unix.sync-worktree',
+                      command: 'unix.sync-branch',
                       sessionToken: serviceToken,
                       daemonUrl: getDaemonUrl(),
                       params: {
-                        worktreeId,
+                        branchId,
                         daemonUser: config.daemon?.unix_user,
                         delete: true, // Signal to delete the group instead of syncing
                       },
                     },
-                    { logPrefix: '[Executor/worktree.remove]' }
+                    { logPrefix: '[Executor/branch.remove]' }
                   );
                 }
 
@@ -767,6 +1083,78 @@ export function registerHooks(ctx: RegisterHooksContext): void {
             ]
           : []),
       ],
+    },
+  });
+
+  // ============================================================================
+  // Knowledge hooks
+  // ============================================================================
+
+  safeService('kb/namespaces')?.hooks({
+    before: {
+      all: [requireAuth],
+      create: [requireMinimumRole(ROLES.MEMBER, 'create knowledge namespaces')],
+      patch: [requireMinimumRole(ROLES.MEMBER, 'update knowledge namespaces')],
+      update: [requireMinimumRole(ROLES.MEMBER, 'update knowledge namespaces')],
+      remove: [requireMinimumRole(ROLES.MEMBER, 'delete knowledge namespaces')],
+      saveWithAcl: [requireMinimumRole(ROLES.MEMBER, 'save knowledge namespace permissions')],
+      listAcl: [requireMinimumRole(ROLES.MEMBER, 'manage knowledge namespace permissions')],
+      setAcl: [requireMinimumRole(ROLES.MEMBER, 'manage knowledge namespace permissions')],
+      removeAcl: [requireMinimumRole(ROLES.MEMBER, 'manage knowledge namespace permissions')],
+    },
+  } as never);
+
+  safeService('kb/documents')?.hooks({
+    before: {
+      all: [requireAuth],
+      create: [requireMinimumRole(ROLES.MEMBER, 'create knowledge documents')],
+      patch: [requireMinimumRole(ROLES.MEMBER, 'update knowledge documents')],
+      update: [requireMinimumRole(ROLES.MEMBER, 'update knowledge documents')],
+      remove: [requireMinimumRole(ROLES.MEMBER, 'delete knowledge documents')],
+    },
+  });
+
+  safeService('kb/document-edits')?.hooks({
+    before: {
+      all: [requireAuth, requireMinimumRole(ROLES.MEMBER, 'edit knowledge documents')],
+    },
+  });
+
+  safeService('kb/versions')?.hooks({
+    before: {
+      all: [requireAuth],
+    },
+  });
+
+  safeService('kb/search')?.hooks({
+    before: {
+      all: [requireAuth],
+    },
+  });
+
+  safeService('kb/settings')?.hooks({
+    before: {
+      all: [requireAuth, requireMinimumRole(ROLES.ADMIN, 'configure Knowledge semantic search')],
+    },
+  });
+
+  safeService('kb/indexing/status')?.hooks({
+    before: {
+      all: [requireAuth, requireMinimumRole(ROLES.ADMIN, 'view Knowledge indexing status')],
+    },
+  });
+
+  safeService('kb/indexing/reindex')?.hooks({
+    before: {
+      all: [requireAuth, requireMinimumRole(ROLES.ADMIN, 'reindex Knowledge embeddings')],
+    },
+  });
+
+  (safeService('kb/graph') as { hooks?: (options: unknown) => void } | undefined)?.hooks?.({
+    before: {
+      all: [requireAuth],
+      create: [requireMinimumRole(ROLES.MEMBER, 'link knowledge graph nodes')],
+      link: [requireMinimumRole(ROLES.MEMBER, 'link knowledge graph nodes')],
     },
   });
 
@@ -887,19 +1275,36 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     return context;
   };
 
+  const redactMCPServerSecretFields = async (context: HookContext) => {
+    if (shouldExposeMCPServerSecrets(context.params)) return context;
+
+    if (Array.isArray(context.result)) {
+      context.result = context.result.map(redactMCPServerSecrets);
+    } else if (context.result?.data && Array.isArray(context.result.data)) {
+      context.result.data = context.result.data.map(redactMCPServerSecrets);
+    } else if (context.result?.mcp_server_id) {
+      context.result = redactMCPServerSecrets(context.result);
+    }
+
+    return context;
+  };
+
   // NOTE: mcp-servers is global admin-managed configuration. These rows are
-  // not worktree- or session-scoped, so no RBAC find() scoping is applied.
+  // not branch- or session-scoped, so no RBAC find() scoping is applied.
   // Creation/update/removal remain gated by requireMinimumRole(ADMIN).
   safeService('mcp-servers')?.hooks({
     before: {
-      all: [typedValidateQuery(mcpServerQueryValidator), ...getReadAuthHooks()],
+      all: [typedValidateQuery(mcpServerQueryValidator), requireAuth],
       create: [requireMinimumRole(ROLES.ADMIN, 'create MCP servers')],
       patch: [requireMinimumRole(ROLES.ADMIN, 'update MCP servers')],
       remove: [requireMinimumRole(ROLES.ADMIN, 'delete MCP servers')],
     },
     after: {
-      find: [injectPerUserOAuthTokens],
-      get: [injectPerUserOAuthTokens],
+      find: [injectPerUserOAuthTokens, redactMCPServerSecretFields],
+      get: [injectPerUserOAuthTokens, redactMCPServerSecretFields],
+      create: [redactMCPServerSecretFields],
+      patch: [redactMCPServerSecretFields],
+      update: [redactMCPServerSecretFields],
     },
   });
 
@@ -909,13 +1314,13 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       find: [
         requireMinimumRole(ROLES.MEMBER, 'list session MCP servers'),
         // RBAC: Scope to sessions the caller can access.
-        ...(worktreeRbacEnabled
+        ...(branchRbacEnabled
           ? [scopeFindToAccessibleSessions(sessionsRepository, superadminOpts)]
           : []),
       ],
     },
     after: {
-      find: [injectPerUserOAuthTokens],
+      find: [injectPerUserOAuthTokens, redactMCPServerSecretFields],
     },
   });
 
@@ -931,7 +1336,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       find: [
         requireMinimumRole(ROLES.MEMBER, 'list session env selections'),
         // RBAC: Scope to sessions the caller can access.
-        ...(worktreeRbacEnabled
+        ...(branchRbacEnabled
           ? [scopeFindToAccessibleSessions(sessionsRepository, superadminOpts)]
           : []),
       ],
@@ -984,6 +1389,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       all: [requireAuth],
       create: [
         requireMinimumRole(ROLES.ADMIN, 'create gateway channels'),
+        injectCreatedBy(),
         // Encrypt env var values at rest (same pattern as user env vars / API keys)
         async (context: HookContext) => {
           const data = context.data as Record<string, unknown> | undefined;
@@ -1163,11 +1569,11 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         requireAuth,
         requireMinimumRole(ROLES.MEMBER, 'search files'),
         // RBAC: files service takes a sessionId query param and returns files
-        // from that session's worktree. Verify the caller can at least 'view'
-        // that worktree before running git ls-files. If sessionId is missing
+        // from that session's branch. Verify the caller can at least 'view'
+        // that branch before running git ls-files. If sessionId is missing
         // the service itself returns []; we skip the permission check in that
         // case rather than throwing.
-        ...(worktreeRbacEnabled
+        ...(branchRbacEnabled
           ? [
               async (context: HookContext) => {
                 if (!context.params.provider) return context;
@@ -1178,7 +1584,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
                 context.params.sessionId = sessionId;
                 // Delegate to the existing chain now that sessionId is primed.
                 await loadSession(sessionsService)(context);
-                await loadWorktreeFromSession(worktreeRepository)(context);
+                await loadBranchFromSession(branchRepository)(context);
                 await ensureCanView(superadminOpts)(context);
                 return context;
               },
@@ -1188,15 +1594,15 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     },
   });
 
-  // /file (singular): read-only worktree filesystem browser. Takes worktree_id
-  // as a query param. Gate with worktree RBAC 'view' permission when enabled.
+  // /file (singular): read-only branch filesystem browser. Takes branch_id
+  // as a query param. Gate with branch RBAC 'view' permission when enabled.
   safeService('/file')?.hooks({
     before: {
       all: [
         requireAuth,
         requireMinimumRole(ROLES.MEMBER, 'read files'),
-        ...(worktreeRbacEnabled
-          ? [loadWorktree(worktreeRepository, 'worktree_id'), ensureCanView(superadminOpts)]
+        ...(branchRbacEnabled
+          ? [loadBranch(branchRepository, 'branch_id'), ensureCanView(superadminOpts)]
           : []),
       ],
     },
@@ -1204,7 +1610,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
 
   // Terminal access gate:
   // - `execution.allow_web_terminal` defaults to true. Any authenticated user
-  //   with role `member` or higher may open a terminal. Worktree-level RBAC
+  //   with role `member` or higher may open a terminal. Branch-level RBAC
   //   still applies inside the service (see services/terminals.ts).
   // - Setting the flag to false disables the terminal for everyone (including
   //   admins). The modal is hidden from the UI in that case.
@@ -1223,6 +1629,51 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         },
         requireMinimumRole(ROLES.MEMBER, 'access terminals'),
       ],
+    },
+  });
+
+  // ============================================================================
+  // Groups hooks
+  // ============================================================================
+
+  safeService('groups')?.hooks(groupsHooks);
+  safeService('groups')?.hooks({
+    after: {
+      patch: [clearRealtimeBranchVisibility],
+      remove: [clearRealtimeBranchVisibility],
+    },
+  });
+  safeService('group-memberships')?.hooks(groupMembershipsHooks);
+  safeService('group-memberships')?.hooks({
+    after: {
+      create: [clearRealtimeBranchVisibility],
+      remove: [clearRealtimeBranchVisibility],
+    },
+  });
+  safeService('branches/:id/owners')?.hooks({
+    after: {
+      create: [invalidateRealtimeBranchFromRoute],
+      remove: [invalidateRealtimeBranchFromRoute],
+    },
+  });
+  safeService('branches/:id/group-grants')?.hooks({
+    after: {
+      create: [invalidateRealtimeBranchFromRoute],
+      patch: [invalidateRealtimeBranchFromRoute],
+      remove: [invalidateRealtimeBranchFromRoute],
+    },
+  });
+  safeService('boards/:id/owners')?.hooks({
+    after: {
+      create: [clearRealtimeBranchVisibility],
+      remove: [clearRealtimeBranchVisibility],
+    },
+  });
+  safeService('boards/:id/group-grants')?.hooks({
+    after: {
+      create: [clearRealtimeBranchVisibility],
+      patch: [clearRealtimeBranchVisibility],
+      remove: [clearRealtimeBranchVisibility],
     },
   });
 
@@ -1247,8 +1698,11 @@ export function registerHooks(ctx: RegisterHooksContext): void {
           }
 
           const query = params.query || {};
-          if (query.email) {
-            // Allow local authentication lookup, ensure we only return minimal results
+          if (query.email && isLocalAuthenticationLookup(params)) {
+            // Allow only the Feathers local authentication pipeline to perform
+            // unauthenticated exact-email lookup. Direct external /users?email
+            // calls are denied below so hashes/private auth fields cannot leak
+            // through lookup/enumeration responses.
             params.query = { ...query, $limit: 1 };
             return context;
           }
@@ -1339,6 +1793,30 @@ export function registerHooks(ctx: RegisterHooksContext): void {
             return context;
           }
 
+          // Env-var-specific trusted write escape hatch. Set ONLY by the widget
+          // submit path, which has already authorized the caller via
+          // `canResolveWidget` (session-creator OR prompt-tier branch RBAC)
+          // before calling users.patch on the session creator's behalf.
+          //
+          // Deliberately narrow: only allows `env_vars` + `env_var_scopes`
+          // fields — any attempt to slip in other fields (e.g. role, unix_username)
+          // throws immediately. Field-level admin gates above run first and are
+          // NOT bypassed regardless.
+          //
+          // Grep for: trustedEnvVarWrite — to audit every site that sets it.
+          if (
+            !context.params.provider &&
+            (params as { trustedEnvVarWrite?: boolean }).trustedEnvVarWrite === true
+          ) {
+            const keys = Object.keys(context.data ?? {});
+            if (!keys.every((k) => k === 'env_vars' || k === 'env_var_scopes')) {
+              throw new Forbidden(
+                'trustedEnvVarWrite only permits env_vars and env_var_scopes updates'
+              );
+            }
+            return context;
+          }
+
           // Otherwise forbidden
           throw new Forbidden('You can only update your own profile');
         },
@@ -1372,7 +1850,10 @@ export function registerHooks(ctx: RegisterHooksContext): void {
 
           // Fire-and-forget sync to executor
           console.log(`[Unix Integration] Syncing Unix user for: ${user.unix_username}`);
-          const serviceToken = createServiceToken(jwtSecret);
+          const serviceToken = createServiceToken(jwtSecret, undefined, {
+            user_id: user.user_id,
+            command: 'unix.sync-user',
+          });
           spawnExecutorFireAndForget(
             {
               command: 'unix.sync-user',
@@ -1420,7 +1901,10 @@ export function registerHooks(ctx: RegisterHooksContext): void {
 
           // Fire-and-forget sync to executor
           console.log(`[Unix Integration] Syncing Unix user for: ${user.unix_username}`);
-          const serviceToken = createServiceToken(jwtSecret);
+          const serviceToken = createServiceToken(jwtSecret, undefined, {
+            user_id: user.user_id,
+            command: 'unix.sync-user',
+          });
           spawnExecutorFireAndForget(
             {
               command: 'unix.sync-user',
@@ -1445,25 +1929,13 @@ export function registerHooks(ctx: RegisterHooksContext): void {
   // Publish service events
   // ============================================================================
 
-  // Publish service events to authenticated clients only
-  // SECURITY: Only connections in 'authenticated' channel (joined on login) receive events
-  // This prevents unauthenticated sockets from receiving sensitive data
-  app.publish((data, context) => {
-    // Skip logging for streaming events (too verbose) and internal events without path/method
-    const isStreamingEvent =
-      context.path === 'messages/streaming' ||
-      (context.path === 'messages' && context.event?.startsWith('streaming:'));
-    if (context.path && context.method && !isStreamingEvent) {
-      console.log(
-        `📡 [Publish] ${context.path} ${context.method}`,
-        context.id
-          ? `id: ${typeof context.id === 'string' ? context.id.substring(0, 8) : context.id}`
-          : '',
-        `channels: ${app.channel('authenticated').length}`
-      );
-    }
-    // Broadcast only to authenticated clients (joined to channel on login)
-    return app.channel('authenticated');
+  configureRealtimePublish({
+    app,
+    branchRbacEnabled,
+    branchRepository,
+    sessionsRepository,
+    accessCache: realtimeAccessCache,
+    allowSuperadmin: superadminOpts.allowSuperadmin,
   });
 
   // ============================================================================
@@ -1472,47 +1944,39 @@ export function registerHooks(ctx: RegisterHooksContext): void {
 
   app.service('sessions').hooks({
     before: {
-      all: [typedValidateQuery(sessionQueryValidator), ...getReadAuthHooks()],
+      all: [typedValidateQuery(sessionQueryValidator), requireAuth, executorRuntimeScopeGuard()],
       find: [
-        // RBAC: Optimized SQL-based filtering (single query with JOIN on worktrees, no N+1)
-        ...(worktreeRbacEnabled ? [scopeSessionQuery(sessionsRepository, superadminOpts)] : []),
+        // RBAC: Optimized SQL-based filtering (single query with JOIN on branches, no N+1)
+        ...(branchRbacEnabled ? [scopeSessionQuery(sessionsRepository, superadminOpts)] : []),
       ],
       get: [
-        ...(worktreeRbacEnabled
+        ...(branchRbacEnabled
           ? [
-              // Load session's worktree and check permissions
-              loadSessionWorktree(sessionsService, worktreeRepository),
-              ensureCanView(superadminOpts), // Require 'view' permission on worktree
+              // Load session's branch and check permissions
+              loadSessionBranch(sessionsService, branchRepository),
+              ensureCanView(superadminOpts), // Require 'view' permission on branch
             ]
           : []),
       ],
       create: [
         requireMinimumRole(ROLES.MEMBER, 'create sessions'),
-        ...(worktreeRbacEnabled
+        ...(branchRbacEnabled
           ? [
               setSessionUnixUsername(usersRepository), // Stamp session with creator's unix_username (MUST run first)
-              // Check worktree permission BEFORE injecting created_by (need worktree_id)
+              // Check branch permission BEFORE injecting created_by (need branch_id)
               async (context: HookContext) => {
-                // RBAC: Ensure user can create sessions in this worktree ('all' permission)
+                // RBAC: Ensure user can create sessions in this branch ('all' permission)
                 const data = context.data as Partial<Session>;
-                if (context.params.provider && data?.worktree_id) {
+                if (context.params.provider && data?.branch_id) {
                   try {
-                    const worktree = await worktreeRepository.findById(data.worktree_id);
-                    if (!worktree) {
-                      throw new Forbidden(`Worktree not found: ${data.worktree_id}`);
+                    const branch = await branchRepository.findById(data.branch_id);
+                    if (!branch) {
+                      throw new Forbidden(`Branch not found: ${data.branch_id}`);
                     }
-                    const userId = context.params.user?.user_id as
-                      | import('@agor/core/types').UUID
-                      | undefined;
-                    const isOwner = userId
-                      ? await worktreeRepository.isOwner(worktree.worktree_id, userId)
-                      : false;
-
                     // Cache for later hooks (RBACParams fields)
-                    context.params.worktree = worktree;
-                    context.params.isWorktreeOwner = isOwner;
+                    await cacheBranchAccess(context.params, branchRepository, branch);
                   } catch (error) {
-                    console.error('Failed to load worktree for RBAC check:', error);
+                    console.error('Failed to load branch for RBAC check:', error);
                     throw error;
                   }
                 }
@@ -1522,68 +1986,81 @@ export function registerHooks(ctx: RegisterHooksContext): void {
             ]
           : []),
         injectCreatedBy(),
+        // Auto-fill permission_config / model_config from the creator's
+        // default_agentic_config[tool] when the caller omits them. Must run
+        // after injectCreatedBy() so `data.created_by` is the trusted user
+        // ID. See utils/apply-session-config-defaults.ts.
+        applySessionConfigDefaults(),
         async (context) => {
-          // Populate repo field and auto-populate git_state from worktree_id
-          if (!Array.isArray(context.data) && context.data?.worktree_id) {
+          // Populate repo field and auto-populate git_state from branch_id
+          if (!Array.isArray(context.data) && context.data?.branch_id) {
             try {
-              const worktree = await context.app.service('worktrees').get(context.data.worktree_id);
-              if (worktree) {
-                const repo = await context.app.service('repos').get(worktree.repo_id);
+              const branch = await context.app.service('branches').get(context.data.branch_id);
+              if (branch) {
+                const repo = await context.app.service('repos').get(branch.repo_id);
                 if (repo) {
                   (context.data as Record<string, unknown>).repo = {
                     repo_id: repo.repo_id,
                     repo_slug: repo.slug,
-                    worktree_name: worktree.name,
-                    cwd: worktree.path,
-                    managed_worktree: true,
+                    branch_name: branch.name,
+                    cwd: branch.path,
+                    managed_branch: true,
                   };
-                  console.log(`✅ Populated repo.cwd from worktree: ${worktree.path}`);
+                  console.log(`✅ Populated repo.cwd from branch: ${branch.path}`);
                 }
 
-                // Auto-populate git_state if not provided (UI and gateway don't set it)
-                // IMPORTANT: Must use sudo -u to get fresh Unix group memberships
-                // because the daemon process has stale groups from startup.
-                // Without fresh groups, git can't read ACL-protected repo files.
+                // Auto-populate git_state if not provided (UI and gateway don't set it).
+                // Branch git reads go through the executor so the daemon never
+                // runs git inside the managed checkout.
                 const existingGitState = (context.data as Record<string, unknown>).git_state as
                   | { base_sha?: string }
                   | undefined;
-                if (!existingGitState?.base_sha && worktree.path) {
+                if (!existingGitState?.base_sha && branch.path) {
                   try {
-                    const { captureGitStateViaShell } = await import(
-                      './utils/git-shell-capture.js'
+                    const { currentSha, currentRef } = await inspectBranchViaExecutor(
+                      context.app as Application,
+                      branch.branch_id,
+                      {
+                        asUser: await resolveExecutorReadAsUser(
+                          db,
+                          (context.params as AuthenticatedParams).user?.user_id as
+                            | UserID
+                            | undefined
+                        ),
+                        logPrefix: `[sessions.create ${branch.name}]`,
+                      }
                     );
-                    const gitState = await captureGitStateViaShell(worktree.path);
                     (context.data as Record<string, unknown>).git_state = {
-                      ref: gitState.ref || worktree.name || 'unknown',
-                      base_sha: gitState.sha,
-                      current_sha: gitState.sha,
+                      ref: currentRef || branch.name || 'unknown',
+                      base_sha: currentSha,
+                      current_sha: currentSha,
                     };
                     console.log(
-                      `✅ Auto-populated git_state from worktree: ref=${gitState.ref}, sha=${gitState.sha.substring(0, 8)}`
+                      `✅ Auto-populated git_state from branch: ref=${currentRef}, sha=${currentSha.substring(0, 8)}`
                     );
                   } catch (gitError) {
-                    console.warn('Failed to auto-populate git_state from worktree:', gitError);
+                    console.warn('Failed to auto-populate git_state from branch:', gitError);
                   }
                 }
               }
             } catch (error) {
-              console.error('Failed to populate repo from worktree:', error);
+              console.error('Failed to populate repo from branch:', error);
             }
           }
 
-          // Validate user has prompt permission on callback target session's worktree
+          // Validate user has prompt permission on callback target session's branch
           const cbConfig = (context.data as Record<string, unknown> | undefined)?.callback_config as
             | { callback_session_id?: string }
             | undefined;
           if (cbConfig?.callback_session_id) {
             // Use authenticated user, NOT context.data.created_by (which could be client-supplied)
             const authenticatedUserId =
-              (context.params as { user?: { user_id: string } }).user?.user_id || 'anonymous';
+              (context.params as { user?: { user_id: string } }).user?.user_id || 'unknown';
             await ensureCanPromptTargetSession(
               cbConfig.callback_session_id,
               authenticatedUserId,
               context.app,
-              worktreeRepository
+              branchRepository
             );
           }
 
@@ -1591,12 +2068,12 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         },
       ],
       patch: [
-        ...(worktreeRbacEnabled
+        ...(branchRbacEnabled
           ? [
               ensureSessionImmutability(), // Prevent changing session.created_by and unix_username
               resolveSessionContext(),
               loadSession(sessionsService),
-              loadWorktreeFromSession(worktreeRepository),
+              loadBranchFromSession(branchRepository),
               // Branch permission by patch type:
               //   - Prompt-flow patches (tasks, archived, status, …) are bookkeeping
               //     emitted by /sessions/:id/prompt and /sessions/:id/stop on behalf
@@ -1610,7 +2087,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
                 if (isPromptFlowPatchOnly(context.data)) {
                   return ensureCanPromptInSession(superadminOpts)(context);
                 }
-                return ensureWorktreePermission(
+                return ensureBranchPermission(
                   'all',
                   'update session metadata',
                   superadminOpts
@@ -1618,30 +2095,30 @@ export function registerHooks(ctx: RegisterHooksContext): void {
               },
             ]
           : []),
-        // Validate user has prompt permission on callback target session's worktree
+        // Validate user has prompt permission on callback target session's branch
         async (context) => {
           const patchCbConfig = (context.data as Record<string, unknown> | undefined)
             ?.callback_config as { callback_session_id?: string } | undefined;
           if (patchCbConfig?.callback_session_id) {
             const userId =
-              (context.params as { user?: { user_id: string } }).user?.user_id || 'anonymous';
+              (context.params as { user?: { user_id: string } }).user?.user_id || 'unknown';
             await ensureCanPromptTargetSession(
               patchCbConfig.callback_session_id,
               userId,
               context.app,
-              worktreeRepository
+              branchRepository
             );
           }
           return context;
         },
       ],
       remove: [
-        ...(worktreeRbacEnabled
+        ...(branchRbacEnabled
           ? [
               resolveSessionContext(),
               loadSession(sessionsService),
-              loadWorktreeFromSession(worktreeRepository),
-              ensureWorktreePermission('all', 'delete sessions', superadminOpts), // Require 'all' permission
+              loadBranchFromSession(branchRepository),
+              ensureBranchPermission('all', 'delete sessions', superadminOpts), // Require 'all' permission
             ]
           : []),
       ],
@@ -1649,7 +2126,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     after: {
       get: [
         async (context) => {
-          // Regenerate MCP token for fetched session (deterministic, no DB storage)
+          // Attach an MCP token for fetched session (cached/reused when still valid).
           if (config.daemon?.mcpEnabled === false) {
             return context;
           }
@@ -1669,7 +2146,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
           }
 
           const { generateSessionToken } = await import('./mcp/tokens.js');
-          const userId = session.created_by || 'anonymous';
+          const userId = session.created_by || 'unknown';
 
           const jwtSecret = app.settings.authentication?.secret;
           if (!jwtSecret) {
@@ -1683,16 +2160,50 @@ export function registerHooks(ctx: RegisterHooksContext): void {
             userId as import('@agor/core/types').UserID
           );
 
-          console.log(`🔄 Regenerated MCP token for session ${session.session_id.substring(0, 8)}`);
+          mcpTokenDebug(`🔄 Resolved MCP token for session ${shortId(session.session_id)}`);
 
-          // Add token to result (not stored in DB, regenerated on-demand with
-          // a fresh `jti` and `exp`)
+          // Add token to result. Tokens are not stored on the session row; the
+          // token module may reuse a still-valid issued token or mint a new one.
           context.result = { ...session, mcp_token: mcpToken };
 
           return context;
         },
       ],
       create: [
+        async (context) => {
+          const session = context.result as Session;
+          analyticsLogger.track(
+            'session.created',
+            buildSessionCreatedAnalyticsProperties(session),
+            { userId: session.created_by }
+          );
+          return context;
+        },
+        // Claude Code CLI: register watcher + persist cli_state + dispatch
+        // the Zellij tab spawn. No-op for other agentic tools.
+        async (context) => {
+          const session = context.result as Session;
+          if (session.agentic_tool !== 'claude-code-cli') return context;
+          try {
+            const branch = await context.app
+              .service('branches')
+              .get(session.branch_id, { provider: undefined });
+            const cwd = (branch as { path?: string } | undefined)?.path;
+            if (cwd) {
+              const { onCliSessionCreated } = await import('./services/claude-cli-integration.js');
+              await onCliSessionCreated(context.app, session, cwd);
+            } else {
+              console.warn(
+                `[claude-cli-integration] no branch.path for session ${session.session_id}; skipping spawn`
+              );
+            }
+          } catch (err) {
+            // Never fail the session create on integration errors — the
+            // session row is still useful even if the watcher misfires.
+            console.error('[claude-cli-integration] onCliSessionCreated failed:', err);
+          }
+          return context;
+        },
         async (context) => {
           // Skip MCP setup if MCP server is disabled
           if (config.daemon?.mcpEnabled === false) {
@@ -1705,10 +2216,10 @@ export function registerHooks(ctx: RegisterHooksContext): void {
             return context;
           }
 
-          // Mint MCP token for this session (jti + exp + gen embedded)
+          // Resolve MCP token for this session (cached/reused when still valid).
           const { generateSessionToken } = await import('./mcp/tokens.js');
           const session = context.result as Session;
-          const userId = session.created_by || 'anonymous';
+          const userId = session.created_by || 'unknown';
 
           // Get JWT secret from app settings
           const jwtSecret = app.settings.authentication?.secret;
@@ -1723,7 +2234,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
             userId as import('@agor/core/types').UserID
           );
 
-          console.log(`🎫 MCP token issued for session ${session.session_id.substring(0, 8)}`);
+          console.log(`🎫 MCP token issued for session ${shortId(session.session_id)}`);
 
           // Note: We no longer auto-attach global MCP servers to sessions.
           // Instead, getMcpServersForSession() will automatically provide ALL
@@ -1737,52 +2248,52 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         },
         // TODO: OpenCode session creation moved to executor - implement via IPC if needed
 
-        // Unix Integration: When a non-owner creates a session in a worktree with
-        // others_fs_access != 'none', ensure they're added to the worktree and repo
+        // Unix Integration: When a non-owner creates a session in a branch with
+        // others_fs_access != 'none', ensure they're added to the branch and repo
         // unix groups. Without this, non-owners can't access the .git/ directory
-        // (which uses 2770 = no others access) even if the worktree directory itself
+        // (which uses 2770 = no others access) even if the branch directory itself
         // allows "others" access via ACLs.
-        ...(worktreeRbacEnabled
+        ...(branchRbacEnabled
           ? [
               async (context: HookContext) => {
                 const session = context.result as Session;
 
-                // Only for sessions with a worktree and unix_username
-                if (!session.worktree_id || !session.unix_username) {
+                // Only for sessions with a branch and unix_username
+                if (!session.branch_id || !session.unix_username) {
                   return context;
                 }
 
                 // Check if user is NOT an owner (owners are already handled by sync)
-                const isOwner = context.params?.isWorktreeOwner;
+                const isOwner = context.params?.isBranchOwner;
                 if (isOwner) {
                   return context;
                 }
 
-                // Load worktree to check others_fs_access
+                // Load branch to check others_fs_access
                 try {
-                  const worktree = await worktreeRepository.findById(session.worktree_id);
-                  if (
-                    !worktree ||
-                    !worktree.others_fs_access ||
-                    worktree.others_fs_access === 'none'
-                  ) {
+                  const branch = await branchRepository.findById(session.branch_id);
+                  if (!branch?.others_fs_access || branch.others_fs_access === 'none') {
                     return context;
                   }
 
-                  // Fire-and-forget: trigger unix.sync-worktree to add session user to groups
+                  // Fire-and-forget: trigger unix.sync-branch to add session user to groups
                   if (jwtSecret) {
                     console.log(
-                      `[Unix Integration] Non-owner session created in worktree ${session.worktree_id.substring(0, 8)} ` +
-                        `by ${session.unix_username} (others_fs_access: ${worktree.others_fs_access}), syncing group membership`
+                      `[Unix Integration] Non-owner session created in branch ${shortId(session.branch_id)} ` +
+                        `by ${session.unix_username} (others_fs_access: ${branch.others_fs_access}), syncing group membership`
                     );
-                    const serviceToken = createServiceToken(jwtSecret);
+                    const serviceToken = createServiceToken(jwtSecret, undefined, {
+                      branch_id: branch.branch_id,
+                      session_id: session.session_id,
+                      command: 'unix.sync-branch',
+                    });
                     spawnExecutorFireAndForget(
                       {
-                        command: 'unix.sync-worktree',
+                        command: 'unix.sync-branch',
                         sessionToken: serviceToken,
                         daemonUrl: getDaemonUrl(),
                         params: {
-                          worktreeId: session.worktree_id,
+                          branchId: session.branch_id,
                           daemonUser: config.daemon?.unix_user,
                         },
                       },
@@ -1792,7 +2303,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
                 } catch (error) {
                   // Don't fail session creation if unix sync fails
                   console.error(
-                    `[Unix Integration] Failed to trigger group sync for session ${session.session_id.substring(0, 8)}:`,
+                    `[Unix Integration] Failed to trigger group sync for session ${shortId(session.session_id)}:`,
                     error
                   );
                 }
@@ -1804,8 +2315,8 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       ],
       patch: [
         async (context) => {
-          // Automatically process queued messages when session becomes IDLE
-          // This ensures queued messages are processed regardless of how the session became IDLE
+          // Automatically process queued tasks when session becomes IDLE
+          // This ensures queued tasks are processed regardless of how the session became IDLE
           const session = Array.isArray(context.result) ? context.result[0] : context.result;
 
           if (session && session.status === 'idle') {
@@ -1819,7 +2330,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
                 await gatewayService.flushGitHubBuffer(session.session_id);
               } catch (error) {
                 console.warn(
-                  `[gateway] Failed to flush GitHub buffer for session ${session.session_id.substring(0, 8)}:`,
+                  `[gateway] Failed to flush GitHub buffer for session ${shortId(session.session_id)}:`,
                   error
                 );
               }
@@ -1830,13 +2341,13 @@ export function registerHooks(ctx: RegisterHooksContext): void {
               setImmediate(async () => {
                 try {
                   console.log(
-                    `🔄 [SessionsService.after.patch] Session ${session.session_id.substring(0, 8)} became IDLE, checking for queued messages...`
+                    `🔄 [SessionsService.after.patch] Session ${shortId(session.session_id)} became IDLE, checking for queued tasks...`
                   );
 
                   await sessionsService.triggerQueueProcessing(session.session_id, context.params);
                 } catch (error) {
                   console.error(
-                    `❌ [SessionsService.after.patch] Failed to process queue for session ${session.session_id.substring(0, 8)}:`,
+                    `❌ [SessionsService.after.patch] Failed to process queue for session ${shortId(session.session_id)}:`,
                     error
                   );
                   // Don't throw - queue processing failure shouldn't break session patches
@@ -1858,10 +2369,70 @@ export function registerHooks(ctx: RegisterHooksContext): void {
   if (svcEnabled('leaderboard')) {
     app.service('leaderboard').hooks({
       before: {
-        all: [...getReadAuthHooks()],
+        all: [requireAuth],
       },
     });
   }
+
+  // ============================================================================
+  // Schedules hooks
+  // ============================================================================
+  // Schedules inherit RBAC from the parent branch (same model as
+  // sessions). See docs/internal/schedules-first-class-design-2026-05-24.md §4.4.
+
+  const scheduleRepository = new ScheduleRepository(db);
+
+  app.service('schedules').hooks({
+    before: {
+      all: [requireAuth],
+      find: [
+        ...(branchRbacEnabled ? [scopeScheduleQuery(scheduleRepository, superadminOpts)] : []),
+      ],
+      get: [
+        ...(branchRbacEnabled
+          ? [
+              loadScheduleAndBranch(scheduleRepository, branchRepository),
+              ensureCanView(superadminOpts),
+            ]
+          : []),
+      ],
+      create: [
+        requireMinimumRole(ROLES.MEMBER, 'create schedules'),
+        ...(branchRbacEnabled
+          ? [loadBranch(branchRepository, 'branch_id'), ensureCanCreateSession(superadminOpts)]
+          : []),
+        injectCreatedBy(),
+        validateScheduleConfig(),
+        recomputeNextRunAt(),
+      ],
+      patch: [
+        requireMinimumRole(ROLES.MEMBER, 'update schedules'),
+        ...(branchRbacEnabled
+          ? [
+              loadScheduleAndBranch(scheduleRepository, branchRepository),
+              ensureCanModifySchedule(superadminOpts),
+            ]
+          : []),
+        // Lazy-load the current schedule when RBAC didn't cache it for
+        // us. `validateScheduleConfig` and `recomputeNextRunAt` both
+        // need the merged current+patch shape to do their work
+        // correctly, and they have to run on every install.
+        ensureCurrentScheduleLoaded(scheduleRepository),
+        ensureScheduleRunsAsCaller(superadminOpts),
+        validateScheduleConfig(),
+        recomputeNextRunAt(),
+      ],
+      remove: [
+        requireMinimumRole(ROLES.MEMBER, 'delete schedules'),
+        ...(branchRbacEnabled
+          ? [
+              loadScheduleAndBranch(scheduleRepository, branchRepository),
+              ensureBranchPermission('all', 'delete schedule', superadminOpts),
+            ]
+          : []),
+      ],
+    },
+  });
 
   // ============================================================================
   // Tasks hooks
@@ -1869,57 +2440,57 @@ export function registerHooks(ctx: RegisterHooksContext): void {
 
   app.service('tasks').hooks({
     before: {
-      all: [typedValidateQuery(taskQueryValidator), requireAuth],
+      all: [typedValidateQuery(taskQueryValidator), requireAuth, executorRuntimeScopeGuard()],
       find: [
         // RBAC: Scope tasks.find() to sessions the caller can access.
-        ...(worktreeRbacEnabled
+        ...(branchRbacEnabled
           ? [scopeFindToAccessibleSessions(sessionsRepository, superadminOpts)]
           : []),
       ],
       get: [
-        ...(worktreeRbacEnabled
+        ...(branchRbacEnabled
           ? [
               resolveSessionContext(),
               loadSession(sessionsService),
-              loadWorktreeFromSession(worktreeRepository),
+              loadBranchFromSession(branchRepository),
               ensureCanView(superadminOpts), // Require 'view' permission
             ]
           : []),
       ],
       create: [
         requireMinimumRole(ROLES.MEMBER, 'create tasks'),
-        ...(worktreeRbacEnabled
+        ...(branchRbacEnabled
           ? [
               resolveSessionContext(),
               loadSession(sessionsService),
               validateSessionUnixUsername(usersRepository), // Defensive check: session.unix_username must match creator's current unix_username
-              loadWorktreeFromSession(worktreeRepository),
+              loadBranchFromSession(branchRepository),
               ensureCanPromptInSession(superadminOpts), // Require 'prompt' (or 'session' for own sessions)
             ]
           : []),
         injectCreatedBy(),
       ],
       patch: [
-        ...(worktreeRbacEnabled
+        ...(branchRbacEnabled
           ? [
               resolveSessionContext(),
               loadSession(sessionsService),
-              loadWorktreeFromSession(worktreeRepository),
+              loadBranchFromSession(branchRepository),
               ensureCanPromptInSession(superadminOpts), // Require 'prompt' (or 'session' for own sessions)
             ]
           : []),
       ],
       remove: [
         requireMinimumRole(ROLES.MEMBER, 'delete tasks'),
-        // RBAC: deleting a task requires 'all' permission on the worktree
+        // RBAC: deleting a task requires 'all' permission on the branch
         // (mirrors sessions.remove). Without this, any member with 'session'
-        // access could delete tasks owned by other users on shared worktrees.
-        ...(worktreeRbacEnabled
+        // access could delete tasks owned by other users on shared branches.
+        ...(branchRbacEnabled
           ? [
               resolveSessionContext(),
               loadSession(sessionsService),
-              loadWorktreeFromSession(worktreeRepository),
-              ensureWorktreePermission('all', 'delete tasks', superadminOpts),
+              loadBranchFromSession(branchRepository),
+              ensureBranchPermission('all', 'delete tasks', superadminOpts),
             ]
           : []),
       ],
@@ -1933,21 +2504,71 @@ export function registerHooks(ctx: RegisterHooksContext): void {
   // BoardRepository for RBAC find-scope hook (single instance reused across
   // requests). Cheap to construct — just wraps the shared db handle.
   const boardRepository = new BoardRepository(db);
+  const ensureBoardAccess = (mode: 'view' | 'mutate', action: string) => {
+    return async (context: HookContext) => {
+      if (!branchRbacEnabled || !context.params.provider) return context;
+      const user = context.params.user;
+      if (!user) throw new NotAuthenticated('Authentication required');
+      if (user._isServiceAccount) return context;
+      const allowSuperadmin = superadminOpts?.allowSuperadmin ?? true;
+      if (user.role === ROLES.ADMIN || (allowSuperadmin && user.role === ROLES.SUPERADMIN)) {
+        return context;
+      }
+
+      // biome-ignore lint/suspicious/noExplicitAny: Custom Feathers method args are dynamic.
+      const args = (context as any).arguments as unknown[] | undefined;
+      const firstArg = args?.[0];
+      const id =
+        typeof context.id === 'string'
+          ? context.id
+          : typeof context.params.route?.id === 'string'
+            ? context.params.route.id
+            : typeof firstArg === 'string'
+              ? firstArg
+              : firstArg && typeof firstArg === 'object'
+                ? ((firstArg as { boardId?: string; id?: string; slug?: string }).boardId ??
+                  (firstArg as { boardId?: string; id?: string; slug?: string }).id ??
+                  (firstArg as { boardId?: string; id?: string; slug?: string }).slug)
+                : undefined;
+      if (!id) throw new BadRequest('Board ID is required');
+
+      const board = await boardRepository.findBySlugOrId(id);
+      if (!board) throw new Forbidden(`Board not found: ${id}`);
+      const allowed =
+        mode === 'view'
+          ? await boardRepository.canView(board.board_id, user.user_id as UserID)
+          : await boardRepository.canMutate(board.board_id, user.user_id as UserID);
+      if (!allowed) {
+        throw new Forbidden(
+          mode === 'view'
+            ? `You need board access to ${action}`
+            : `You need board owner or board group 'all' access to ${action}`
+        );
+      }
+      return context;
+    };
+  };
+  const ensureCanViewBoard = (action: string) => ensureBoardAccess('view', action);
+  const ensureCanMutateBoard = (action: string) => ensureBoardAccess('mutate', action);
 
   safeService('boards')?.hooks({
     before: {
-      all: [typedValidateQuery(boardQueryValidator), ...getReadAuthHooks()],
+      all: [typedValidateQuery(boardQueryValidator), requireAuth],
       find: [
         // RBAC: restrict boards.find to boards the caller created or has a
-        // worktree on. Runs at the SQL layer via BoardRepository.findVisibleBoardIds
-        // to avoid hydrating every accessible worktree in-memory.
-        ...(worktreeRbacEnabled
+        // branch on. Runs at the SQL layer via BoardRepository.findVisibleBoardIds
+        // to avoid hydrating every accessible branch in-memory.
+        ...(branchRbacEnabled
           ? [scopeFindToAccessibleBoards(boardRepository, superadminOpts)]
           : []),
       ],
+      get: [ensureCanViewBoard('view this board')],
+      findBySlug: [ensureCanViewBoard('view this board')],
+      findBySlugOrId: [ensureCanViewBoard('view this board')],
       create: [requireMinimumRole(ROLES.MEMBER, 'create boards'), injectCreatedBy()],
       patch: [
         requireMinimumRole(ROLES.MEMBER, 'update boards'),
+        ensureCanMutateBoard('update this board'),
         async (context: HookContext<Board>) => {
           // Handle atomic board object operations via _action parameter
           const contextData = context.data || {};
@@ -1971,7 +2592,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
             );
             context.result = result;
             console.log('🔄 [boards patch hook] Emitting patched event for upsertObject', {
-              board_id: result.board_id.substring(0, 8),
+              board_id: shortId(result.board_id),
               objectId,
               objectsCount: Object.keys(result.objects || {}).length,
               objects: result.objects,
@@ -2013,24 +2634,6 @@ export function registerHooks(ctx: RegisterHooksContext): void {
 
           if (_action === 'deleteZone' && objectId) {
             if (!context.id) throw new Error('Board ID required');
-            // Look up zone position for coordinate translation
-            const board = await boardsService!.get(context.id as string);
-            const zoneObj = board?.objects?.[objectId as string];
-            const zonePosition =
-              zoneObj && 'x' in zoneObj && 'y' in zoneObj
-                ? { x: zoneObj.x, y: zoneObj.y }
-                : undefined;
-
-            // Clear zone_id on board objects before deleting the zone
-            // Converts relative positions to absolute so entities don't jump
-            const boardObjectsService = app.service(
-              'board-objects'
-            ) as unknown as import('./services/board-objects').BoardObjectsService;
-            await boardObjectsService.clearZoneReferences(
-              context.id as import('@agor/core/types').BoardID,
-              objectId as string,
-              zonePosition
-            );
             const result = await boardsService!.deleteZone(
               context.id as string,
               objectId as string,
@@ -2045,12 +2648,33 @@ export function registerHooks(ctx: RegisterHooksContext): void {
           return context;
         },
       ],
-      remove: [requireMinimumRole(ROLES.MEMBER, 'delete boards')],
-      toBlob: [requireMinimumRole(ROLES.MEMBER, 'export boards')],
-      toYaml: [requireMinimumRole(ROLES.MEMBER, 'export boards')],
+      remove: [
+        requireMinimumRole(ROLES.MEMBER, 'delete boards'),
+        ensureCanMutateBoard('delete this board'),
+      ],
+      toBlob: [
+        requireMinimumRole(ROLES.MEMBER, 'export boards'),
+        ensureCanViewBoard('export boards'),
+      ],
+      toYaml: [
+        requireMinimumRole(ROLES.MEMBER, 'export boards'),
+        ensureCanViewBoard('export boards'),
+      ],
       fromBlob: [requireMinimumRole(ROLES.MEMBER, 'import boards')],
       fromYaml: [requireMinimumRole(ROLES.MEMBER, 'import boards')],
-      clone: [requireMinimumRole(ROLES.MEMBER, 'clone boards')],
+      clone: [requireMinimumRole(ROLES.MEMBER, 'clone boards'), ensureCanViewBoard('clone boards')],
+      setPrimaryAssistant: [
+        requireMinimumRole(ROLES.MEMBER, 'set primary assistant'),
+        ensureCanMutateBoard('set primary assistant'),
+      ],
+      clearPrimaryAssistant: [
+        requireMinimumRole(ROLES.MEMBER, 'clear primary assistant'),
+        ensureCanMutateBoard('clear primary assistant'),
+      ],
+      ensureAssistantWelcomeNote: [
+        requireMinimumRole(ROLES.MEMBER, 'create assistant welcome note'),
+        ensureCanMutateBoard('create assistant welcome note'),
+      ],
     },
     after: {
       // Strip private artifact objects from board.objects for non-owners
@@ -2121,9 +2745,12 @@ export function registerHooks(ctx: RegisterHooksContext): void {
           return context;
         },
       ],
+      patch: [clearRealtimeBranchVisibility],
+      remove: [clearRealtimeBranchVisibility],
       // Emit created events for custom methods that create boards
       // Custom methods don't automatically trigger app.publish(), so we emit manually
       clone: [
+        clearRealtimeBranchVisibility,
         async (context: HookContext<Board>) => {
           if (context.result) {
             app.service('boards').emit('created', context.result);
@@ -2132,6 +2759,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         },
       ],
       fromBlob: [
+        clearRealtimeBranchVisibility,
         async (context: HookContext<Board>) => {
           if (context.result) {
             app.service('boards').emit('created', context.result);
@@ -2140,9 +2768,42 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         },
       ],
       fromYaml: [
+        clearRealtimeBranchVisibility,
         async (context: HookContext<Board>) => {
           if (context.result) {
             app.service('boards').emit('created', context.result);
+          }
+          return context;
+        },
+      ],
+      setPrimaryAssistant: [
+        clearRealtimeBranchVisibility,
+        async (context: HookContext<Board>) => {
+          if (context.result) {
+            app.service('boards').emit('patched', context.result);
+          }
+          return context;
+        },
+      ],
+      clearPrimaryAssistant: [
+        clearRealtimeBranchVisibility,
+        async (context: HookContext<Board>) => {
+          if (context.result) {
+            app.service('boards').emit('patched', context.result);
+          }
+          return context;
+        },
+      ],
+      ensureAssistantWelcomeNote: [
+        clearRealtimeBranchVisibility,
+        async (context: HookContext<Board>) => {
+          const assistantWelcomeNoteMutated = (
+            context.params as typeof context.params & {
+              assistantWelcomeNoteMutated?: boolean;
+            }
+          ).assistantWelcomeNoteMutated;
+          if (context.result && assistantWelcomeNoteMutated) {
+            app.service('boards').emit('patched', context.result);
           }
           return context;
         },
@@ -2166,8 +2827,13 @@ export function registerHooks(ctx: RegisterHooksContext): void {
 
     app.service('/boards/:id/archive').hooks({
       before: {
-        create: [requireAuth, requireMinimumRole(ROLES.MEMBER, 'archive boards')],
+        create: [
+          requireAuth,
+          requireMinimumRole(ROLES.MEMBER, 'archive boards'),
+          ensureCanMutateBoard('archive this board'),
+        ],
       },
+      after: { create: [clearRealtimeBranchVisibility] },
     });
 
     // POST /boards/:id/unarchive - Unarchive a board
@@ -2181,8 +2847,13 @@ export function registerHooks(ctx: RegisterHooksContext): void {
 
     app.service('/boards/:id/unarchive').hooks({
       before: {
-        create: [requireAuth, requireMinimumRole(ROLES.MEMBER, 'unarchive boards')],
+        create: [
+          requireAuth,
+          requireMinimumRole(ROLES.MEMBER, 'unarchive boards'),
+          ensureCanMutateBoard('unarchive this board'),
+        ],
       },
+      after: { create: [clearRealtimeBranchVisibility] },
     });
   } // end boards archive/unarchive
 }

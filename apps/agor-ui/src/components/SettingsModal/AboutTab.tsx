@@ -3,9 +3,11 @@
  */
 
 import type { AgorClient, UnixUserMode } from '@agor-live/client';
-import { Card, Descriptions, Space, Tag, Tooltip, Typography } from 'antd';
+import { Button, Card, Descriptions, Space, Tag, Tooltip, Typography } from 'antd';
 import { lazy, Suspense, useEffect, useState } from 'react';
 import { getDaemonUrl } from '../../config/daemon';
+import { useConnectionState } from '../../contexts/ConnectionContext';
+import { isOutOfSync } from '../../hooks/useServerVersion';
 
 // Lazy load particles
 const ParticleBackground = lazy(() =>
@@ -25,8 +27,25 @@ interface WindowWithAgorConfig extends Window {
   AGOR_DAEMON_URL?: string;
 }
 
+// Renders nothing — just throws on mount. Used by the admin Crash Test
+// button to verify the global ErrorBoundary catches render-phase crashes
+// and renders the friendly crash screen. React error boundaries do NOT
+// catch errors thrown from event handlers, which is why we flip a state
+// flag and let this component throw during the next render instead of
+// throwing from the button's onClick directly.
+function CrashTestBomb(): never {
+  throw new Error(
+    'Crash test: this is a synthetic render-phase error from About → Crash Test. ' +
+      "If you're seeing the friendly crash screen, the global ErrorBoundary works."
+  );
+}
+
 interface HealthInfo {
   version?: string;
+  /** Build SHA from /health (canonical version signal — see setup/build-info.ts). */
+  buildSha?: string;
+  /** ISO timestamp from /health, may be null when SHA came from env or git. */
+  builtAt?: string | null;
   database?:
     | string
     | {
@@ -36,14 +55,13 @@ interface HealthInfo {
       };
   auth?: {
     requireAuth: boolean;
-    allowAnonymous: boolean;
   };
   encryption?: {
     enabled: boolean;
     method: string | null;
   };
   execution?: {
-    worktreeRbac: boolean;
+    branchRbac: boolean;
     unixUserMode: UnixUserMode;
   };
   security?: {
@@ -71,6 +89,12 @@ export const AboutTab: React.FC<AboutTabProps> = ({
   const daemonUrl = getDaemonUrl();
   const [detectionMethod, setDetectionMethod] = useState<string>('');
   const [healthInfo, setHealthInfo] = useState<HealthInfo | null>(null);
+  // Admin-only crash-test toggle: flipping this true makes <CrashTestBomb />
+  // mount and throw on the next render, which trips the global ErrorBoundary.
+  const [crashTest, setCrashTest] = useState(false);
+  // SHA captured at tab-load time (resets on hard reload). Provider-owned in
+  // App.tsx via useServerVersion so this and the banner stay in lockstep.
+  const { capturedSha } = useConnectionState();
 
   useEffect(() => {
     // Determine which detection method was used
@@ -130,6 +154,26 @@ export const AboutTab: React.FC<AboutTabProps> = ({
               {healthInfo?.version && (
                 <Descriptions.Item label="Version">{healthInfo.version}</Descriptions.Item>
               )}
+              {healthInfo?.buildSha && (
+                <Descriptions.Item label="Daemon Build">
+                  <code>{healthInfo.buildSha}</code>
+                  {healthInfo.builtAt && (
+                    <Typography.Text type="secondary" style={{ marginLeft: 8 }}>
+                      built {healthInfo.builtAt}
+                    </Typography.Text>
+                  )}
+                </Descriptions.Item>
+              )}
+              {capturedSha && (
+                <Descriptions.Item label="Tab Captured">
+                  <code>{capturedSha}</code>
+                  {isOutOfSync(capturedSha, healthInfo?.buildSha) && (
+                    <Typography.Text type="warning" style={{ marginLeft: 8 }}>
+                      ⚠️ out of sync — refresh to load the latest UI
+                    </Typography.Text>
+                  )}
+                </Descriptions.Item>
+              )}
               {healthInfo?.encryption && (
                 <Descriptions.Item label="Encryption">
                   {healthInfo.encryption.enabled ? (
@@ -186,19 +230,12 @@ export const AboutTab: React.FC<AboutTabProps> = ({
                       </>
                     ))}
                   {healthInfo?.auth && (
-                    <>
-                      <Descriptions.Item label="Authentication">
-                        {healthInfo.auth.requireAuth ? '🔐 Required' : '🔓 Optional'}
-                      </Descriptions.Item>
-                      <Descriptions.Item label="Anonymous Access">
-                        {healthInfo.auth.allowAnonymous ? '✓ Enabled' : '✗ Disabled'}
-                      </Descriptions.Item>
-                    </>
+                    <Descriptions.Item label="Authentication">🔐 Required</Descriptions.Item>
                   )}
                   {healthInfo?.execution && (
                     <>
-                      <Descriptions.Item label="Worktree RBAC">
-                        {healthInfo.execution.worktreeRbac ? (
+                      <Descriptions.Item label="Branch RBAC">
+                        {healthInfo.execution.branchRbac ? (
                           <span style={{ color: '#52c41a' }}>🛡️ Enabled</span>
                         ) : (
                           <span style={{ color: '#faad14' }}>⚠️ Disabled (open access)</span>
@@ -213,7 +250,7 @@ export const AboutTab: React.FC<AboutTabProps> = ({
                         )}
                         {healthInfo.execution.unixUserMode === 'insulated' && (
                           <Typography.Text type="secondary" style={{ marginLeft: 8 }}>
-                            (worktree groups)
+                            (branch groups)
                           </Typography.Text>
                         )}
                         {healthInfo.execution.unixUserMode === 'strict' && (
@@ -335,6 +372,17 @@ export const AboutTab: React.FC<AboutTabProps> = ({
                   </Descriptions.Item>
                   <Descriptions.Item label="Path">
                     <code>{window.location.pathname}</code>
+                  </Descriptions.Item>
+                  <Descriptions.Item label="Crash Test">
+                    <Space>
+                      <Button danger size="small" onClick={() => setCrashTest(true)}>
+                        Trigger render crash
+                      </Button>
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                        Throws during render to verify the global error boundary. Reload to recover.
+                      </Typography.Text>
+                    </Space>
+                    {crashTest && <CrashTestBomb />}
                   </Descriptions.Item>
                 </Descriptions>
               </Card>

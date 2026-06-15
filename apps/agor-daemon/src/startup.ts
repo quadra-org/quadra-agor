@@ -5,15 +5,32 @@
  * server listen, scheduler, gateway init, and graceful shutdown.
  */
 
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
 import type { AgorConfig } from '@agor/core/config';
+import { getAgorHome, resolveExecutorHeartbeatConfig } from '@agor/core/config';
 import type { Database } from '@agor/core/db';
-import type { Id, Paginated, Session, Task } from '@agor/core/types';
+import { MessagesRepository, SessionRepository, shortId } from '@agor/core/db';
+import type { Id, Paginated, Session, SessionID, Task } from '@agor/core/types';
 import { SessionStatus, TaskStatus } from '@agor/core/types';
 import type { Application, SessionsServiceImpl, TasksServiceImpl } from './declarations.js';
+import { ExecutorHeartbeatSupervisor } from './services/executor-heartbeat-supervisor.js';
 import type { GatewayService } from './services/gateway.js';
-import { createHealthMonitor } from './services/health-monitor.js';
+import { HealthMonitor } from './services/health-monitor.js';
+import { KnowledgeEmbeddingIndexer } from './services/knowledge-embedding-indexer.js';
 import { SchedulerService } from './services/scheduler.js';
 import type { TerminalsService } from './services/terminals.js';
+import { appendSystemMessage } from './utils/append-system-message.js';
+import { scrubManagedGitRemoteCredentials } from './utils/git-remote-credential-scan.js';
+
+const DEBUG_STARTUP =
+  process.env.AGOR_DEBUG_STARTUP === '1' || process.env.DEBUG?.includes('startup');
+
+function startupDebug(...args: unknown[]): void {
+  if (DEBUG_STARTUP) {
+    console.debug(...args);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Context
@@ -38,27 +55,86 @@ export interface StartupContext {
 }
 
 // ---------------------------------------------------------------------------
+// Sentinel file — distinguishes graceful shutdown from crashes
+// ---------------------------------------------------------------------------
+
+const SENTINEL_FILENAME = 'daemon-shutdown-clean.flag';
+const SENTINEL_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24h — stale sentinels are treated as crashes
+
+interface ShutdownSentinel {
+  timestamp: string;
+  signal: string;
+}
+
+async function writeCleanShutdownSentinel(signal: string): Promise<void> {
+  try {
+    const sentinel: ShutdownSentinel = { timestamp: new Date().toISOString(), signal };
+    await fs.writeFile(
+      path.join(getAgorHome(), SENTINEL_FILENAME),
+      JSON.stringify(sentinel),
+      'utf8'
+    );
+  } catch (error) {
+    // Non-fatal — worst case, startup treats the next restart as unexpected
+    // and triggers orphan cleanup, which is the safer default. We surface
+    // a single warning so operators debugging crash-classification in
+    // read-only AGOR_HOME deployments (e.g. ConfigMap-mounted) can see
+    // why the sentinel isn't doing anything.
+    console.warn(
+      '[startup] Could not write shutdown sentinel — next restart will be classified as a crash. ' +
+        `Cause: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
+/** Read and immediately delete the sentinel. Returns whether shutdown was graceful. */
+async function readAndClearSentinel(): Promise<boolean> {
+  const sentinelPath = path.join(getAgorHome(), SENTINEL_FILENAME);
+  try {
+    const raw = await fs.readFile(sentinelPath, 'utf8');
+    await fs.unlink(sentinelPath);
+    const sentinel = JSON.parse(raw) as ShutdownSentinel;
+    const age = Date.now() - new Date(sentinel.timestamp).getTime();
+    return age < SENTINEL_MAX_AGE_MS;
+  } catch {
+    // Missing file = crash, stale/corrupt = treat as crash
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Orphan cleanup
 // ---------------------------------------------------------------------------
 
-async function cleanupOrphans(ctx: StartupContext): Promise<void> {
+interface OrphanCleanupResult {
+  wasGraceful: boolean;
+  orphanedTasks: Task[];
+  orphanedSessions: Session[];
+  sessionIdsWithOrphanedTasks: Set<string>;
+  queuedTasks: Task[];
+  sessionsResetFromOrphanedTasks: number;
+}
+
+async function cleanupOrphanStatuses(ctx: StartupContext): Promise<OrphanCleanupResult> {
   const { app, sessionsService } = ctx;
 
   // Get tasks service from the app (registered during services phase)
   const tasksService = app.service('tasks') as unknown as TasksServiceImpl;
 
-  console.log('🧹 Cleaning up orphaned tasks and sessions...');
+  // Determine restart type before touching anything — sentinel is consumed here
+  const wasGraceful = await readAndClearSentinel();
 
   // Find all orphaned tasks (running, stopping, awaiting_permission)
   const orphanedTasks = await tasksService.getOrphaned();
 
   if (orphanedTasks.length > 0) {
-    console.log(`   Found ${orphanedTasks.length} orphaned task(s)`);
     for (const task of orphanedTasks) {
       await tasksService.patch(task.task_id, {
         status: TaskStatus.STOPPED,
       });
-      console.log(`   ✓ Marked task ${task.task_id} as stopped (was: ${task.status})`);
+      startupDebug(
+        `[startup] stopped orphaned task ${shortId(task.task_id)} (was: ${task.status})`
+      );
     }
   }
 
@@ -78,7 +154,6 @@ async function cleanupOrphans(ctx: StartupContext): Promise<void> {
   }
 
   if (orphanedSessions.length > 0) {
-    console.log(`   Found ${orphanedSessions.length} orphaned session(s)`);
     for (const session of orphanedSessions) {
       // IMPORTANT: Use app.service() instead of sessionsService to go through
       // FeathersJS service layer and trigger app.publish() for WebSocket events
@@ -90,8 +165,8 @@ async function cleanupOrphans(ctx: StartupContext): Promise<void> {
         },
         {}
       );
-      console.log(
-        `   ✓ Marked session ${session.session_id.substring(0, 8)} as idle (was: ${session.status})`
+      startupDebug(
+        `   ✓ Marked session ${shortId(session.session_id)} as idle (was: ${session.status})`
       );
     }
   }
@@ -100,10 +175,8 @@ async function cleanupOrphans(ctx: StartupContext): Promise<void> {
   const sessionIdsWithOrphanedTasks = new Set(
     orphanedTasks.map((t: Task) => t.session_id as string)
   );
+  let sessionsResetFromOrphanedTasks = 0;
   if (sessionIdsWithOrphanedTasks.size > 0) {
-    console.log(
-      `   Checking ${sessionIdsWithOrphanedTasks.size} session(s) with orphaned tasks...`
-    );
     for (const sessionId of sessionIdsWithOrphanedTasks) {
       const session = await sessionsService.get(sessionId as Id);
       // If session is still in an active state after orphaned task cleanup, set to IDLE
@@ -121,16 +194,181 @@ async function cleanupOrphans(ctx: StartupContext): Promise<void> {
           },
           {}
         );
-        console.log(
-          `   ✓ Marked session ${sessionId.substring(0, 8)} as idle (had orphaned tasks, was: ${session.status})`
+        sessionsResetFromOrphanedTasks++;
+        startupDebug(
+          `   ✓ Marked session ${shortId(sessionId)} as idle (had orphaned tasks, was: ${session.status})`
         );
       }
     }
   }
 
-  if (orphanedTasks.length === 0 && orphanedSessions.length === 0) {
-    console.log('   No orphaned tasks or sessions found');
+  // Wipe the queue. Running tasks are marked STOPPED above, which invalidates
+  // the ordering premise of anything that was waiting behind them — a queued
+  // prompt typically depends on whatever was running first. Rather than carry
+  // an ambiguous queue across the restart, mark all QUEUED tasks as STOPPED
+  // (mirroring how we treat the running task — no work was lost, the user
+  // can re-issue from `full_prompt` if they still want it).
+  const queuedResult = (await tasksService.find({
+    query: { status: TaskStatus.QUEUED, $limit: 1000 },
+  })) as unknown as Paginated<Task>;
+  const queuedTasks = queuedResult.data;
+
+  if (queuedTasks.length > 0) {
+    for (const task of queuedTasks) {
+      await tasksService.patch(task.task_id, {
+        status: TaskStatus.STOPPED,
+      });
+    }
   }
+
+  const cleanupParts: string[] = [
+    `${orphanedTasks.length} orphaned task(s) stopped`,
+    `${orphanedSessions.length} active session(s) reset`,
+    `${queuedTasks.length} queued task(s) stopped`,
+  ];
+  if (sessionsResetFromOrphanedTasks > 0) {
+    cleanupParts.push(`${sessionsResetFromOrphanedTasks} task-owned session(s) reset`);
+  }
+  console.log(`[startup] orphan cleanup: ${cleanupParts.join(', ')}`);
+
+  return {
+    wasGraceful,
+    orphanedTasks,
+    orphanedSessions,
+    sessionIdsWithOrphanedTasks,
+    queuedTasks,
+    sessionsResetFromOrphanedTasks,
+  };
+}
+
+async function injectRestartNotices(
+  ctx: StartupContext,
+  cleanupResult: OrphanCleanupResult
+): Promise<void> {
+  const { app, db, sessionsService } = ctx;
+  const { wasGraceful, orphanedTasks, orphanedSessions, sessionIdsWithOrphanedTasks } =
+    cleanupResult;
+
+  // Get tasks service from the app (registered during services phase)
+  const tasksService = app.service('tasks') as unknown as TasksServiceImpl;
+
+  // Inject a system message into every affected session so the user (and the
+  // agent on resume) see an in-transcript explanation — not a toast, a
+  // persistent record in the conversation. Contrast with PR #1116 (filtered
+  // high-frequency SDK lifecycle noise): this is intentional, low-frequency,
+  // and user-meaningful.
+  //
+  // The message MUST be attached to a task: the reactive client drops taskless
+  // messages (ReactiveSessionState groups messages by task_id), so a notice
+  // with no task_id would be silently invisible in the UI.
+  const affectedSessionIds = new Set<string>([
+    ...orphanedSessions.map((s) => s.session_id as string),
+    ...Array.from(sessionIdsWithOrphanedTasks),
+  ]);
+
+  if (affectedSessionIds.size === 0) {
+    return;
+  }
+
+  console.log(`🧹 Injecting daemon restart notices for ${affectedSessionIds.size} session(s)...`);
+
+  const restartType = wasGraceful ? ('daemon_restart' as const) : ('daemon_crash' as const);
+  const messageText = wasGraceful
+    ? 'The Agor daemon was restarted while this session was running. Ask the agent to resume where it left off.'
+    : 'The Agor daemon restarted unexpectedly while this session was running. Ask the agent to resume where it left off.';
+
+  // Build session → last orphaned task map so we can attach notices to a task_id.
+  // Prefer orphaned tasks (they were the active tasks at shutdown); fall back to
+  // querying the session's most-recent task if none was orphaned.
+  const lastOrphanedTaskBySession = new Map<string, Task>();
+  for (const task of orphanedTasks) {
+    const sid = task.session_id as string;
+    const existing = lastOrphanedTaskBySession.get(sid);
+    if (!existing || task.created_at > existing.created_at) {
+      lastOrphanedTaskBySession.set(sid, task);
+    }
+  }
+
+  const sessionRepo = new SessionRepository(db);
+  const messageRepo = new MessagesRepository(db);
+
+  for (const sessionId of affectedSessionIds) {
+    try {
+      // Resolve the task to attach the notice to
+      let attachTask = lastOrphanedTaskBySession.get(sessionId);
+      if (!attachTask) {
+        // Sessions maintain an ordered task-ID list; the last entry is the most
+        // recent task without relying on TasksService.find() sort behavior.
+        const session = await sessionsService.get(sessionId as Id);
+        const latestTaskId = session.tasks?.at(-1);
+        if (latestTaskId) {
+          attachTask = await tasksService.get(latestTaskId);
+        }
+      }
+      if (!attachTask) {
+        // No task exists — message would be invisible (transcript is task-scoped).
+        // This session has never had any work, so there is nothing for the user to resume.
+        console.log(`   ⏭  Session ${shortId(sessionId)} has no tasks — skipping restart notice`);
+        continue;
+      }
+
+      // Idempotency: skip if the last message is already a daemon restart notice
+      // (guards against rapid restart cycles piling up notices before the user responds)
+      const messageCount = await sessionRepo.countMessages(sessionId);
+      if (messageCount > 0) {
+        const lastMessages = await messageRepo.findByRange(
+          sessionId as SessionID,
+          messageCount - 1,
+          messageCount - 1
+        );
+        const last = lastMessages[0];
+        if (last?.type === 'daemon_restart' || last?.type === 'daemon_crash') {
+          console.log(
+            `   ⏭  Session ${shortId(sessionId)} already has a restart notice — skipping`
+          );
+          continue;
+        }
+      }
+
+      const injectedMessage = await appendSystemMessage({
+        app,
+        db,
+        sessionId,
+        taskId: attachTask.task_id,
+        type: restartType,
+        content: messageText,
+        metadata: { source: 'agor' },
+      });
+
+      // Extend the task's message_range.end_index so the notice is counted
+      // and loaded within the task's window in the UI.
+      // Pass only end_index: TaskRepository.update() deep-merges with the live
+      // DB row, preserving fields written by the STOPPED patch (e.g. end_timestamp).
+      if (attachTask.message_range) {
+        await tasksService.patch(attachTask.task_id, {
+          message_range: { end_index: injectedMessage.index } as Task['message_range'],
+        });
+      }
+
+      console.log(`   ✉  Injected ${restartType} notice into session ${shortId(sessionId)}`);
+    } catch (err) {
+      console.warn(
+        `   ⚠️  Failed to inject restart notice into session ${shortId(sessionId)}:`,
+        err
+      );
+    }
+  }
+}
+
+export function runPostStartJob(name: string, job: () => Promise<void> | void): void {
+  void Promise.resolve()
+    .then(() => job())
+    .then(() => {
+      startupDebug(`[startup] post-start job completed: ${name}`);
+    })
+    .catch((error: unknown) => {
+      console.warn(`[startup] post-start job failed: ${name}`, error);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -138,27 +376,34 @@ async function cleanupOrphans(ctx: StartupContext): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function ensureMasterSecret(config: AgorConfig): Promise<void> {
-  if (!process.env.AGOR_MASTER_SECRET) {
-    // Check if we have a saved secret in config
-    const savedSecret = config.daemon?.masterSecret;
-
-    if (savedSecret) {
-      process.env.AGOR_MASTER_SECRET = savedSecret;
+  // AGOR_MASTER_SECRET: env > existing config value > generate-and-persist >
+  // fail-fast. See setup/persisted-secret.ts and the doc §1.5 (H3).
+  //
+  // Same fail-fast reasoning as the JWT path: a fresh master secret on every
+  // restart corrupts every stored encrypted API key.
+  const { randomBytes } = await import('node:crypto');
+  const { resolvePersistedSecret } = await import('./setup/persisted-secret.js');
+  const resolution = await resolvePersistedSecret({
+    name: 'AGOR_MASTER_SECRET (API key encryption)',
+    envVar: 'AGOR_MASTER_SECRET',
+    existing: config.daemon?.masterSecret,
+    configKey: 'daemon.masterSecret',
+    generate: () => randomBytes(32).toString('hex'),
+  });
+  // Side effect: downstream code (encrypted-creds resolver, etc.) reads this
+  // off process.env, not off a parameter. Keep that contract.
+  process.env.AGOR_MASTER_SECRET = resolution.value;
+  switch (resolution.source) {
+    case 'env':
+      console.log('🔐 API key encryption enabled (AGOR_MASTER_SECRET set)');
+      break;
+    case 'config':
       console.log('🔐 Using saved AGOR_MASTER_SECRET from config');
-    } else {
-      // Auto-generate a random master secret and persist it in config
-      const { randomBytes } = await import('node:crypto');
-      const { setConfigValue } = await import('@agor/core/config');
-
-      const generatedSecret = randomBytes(32).toString('hex');
-      await setConfigValue('daemon.masterSecret', generatedSecret);
-      process.env.AGOR_MASTER_SECRET = generatedSecret;
-
+      break;
+    case 'generated':
       console.log('🔐 Generated and saved AGOR_MASTER_SECRET for API key encryption');
       console.log('   Secret stored in ~/.agor/config.yaml');
-    }
-  } else {
-    console.log('🔐 API key encryption enabled (AGOR_MASTER_SECRET set)');
+      break;
   }
 }
 
@@ -179,11 +424,14 @@ export async function startup(ctx: StartupContext): Promise<void> {
     terminalsService,
   } = ctx;
 
-  // 1. Cleanup orphaned tasks/sessions from previous daemon instance
-  await cleanupOrphans(ctx);
+  // 1. Correct orphaned task/session state from previous daemon instance.
+  // Keep this blocking so clients never see stale RUNNING/AWAITING states from
+  // a previous process. More expensive UX/audit follow-ups are post-start jobs.
+  const orphanCleanupResult = await cleanupOrphanStatuses(ctx);
 
-  // 2. Initialize Health Monitor for periodic environment health checks
-  const healthMonitor = await createHealthMonitor(app);
+  // 2. Register Health Monitor listeners before serving requests. The initial
+  // full scan of already-running environments is deferred until after listen.
+  const healthMonitor = new HealthMonitor(app);
 
   // 3. Validate/generate master secret for API key encryption
   await ensureMasterSecret(config);
@@ -195,32 +443,29 @@ export async function startup(ctx: StartupContext): Promise<void> {
   console.log(
     `🚀 Agor daemon running at http://${displayHost}:${DAEMON_PORT} (bound to ${DAEMON_HOST})`
   );
-  console.log(`   Health: http://${displayHost}:${DAEMON_PORT}/health`);
   console.log(
-    `   Authentication: ${config.daemon?.allowAnonymous !== false ? '🔓 Anonymous (default)' : '🔐 Required'}`
+    `   health=/health auth=required services=/sessions,/tasks,/messages,/boards,/repos,/mcp-servers,/config,/context,/users`
   );
-  console.log(`   Login: POST http://${displayHost}:${DAEMON_PORT}/authentication`);
-  console.log(`   Services:`);
-  console.log(`     - /sessions`);
-  console.log(`     - /tasks`);
-  console.log(`     - /messages`);
-  console.log(`     - /boards`);
-  console.log(`     - /repos`);
-  console.log(`     - /mcp-servers`);
-  console.log(`     - /config`);
-  console.log(`     - /context`);
-  console.log(`     - /users`);
+
+  runPostStartJob('health-monitor-initialize', () => healthMonitor.initialize());
+  runPostStartJob('daemon-restart-notices', () => injectRestartNotices(ctx, orphanCleanupResult));
+
+  // Non-blocking credential spill repair. If an agent/user wrote a PAT into a
+  // git remote URL while the daemon was down, scrub persisted repo metadata
+  // and Agor-managed repo/worktree git configs after the API is already
+  // accepting requests. This is best-effort; filesystem config scrubbing
+  // deliberately skips registered local repos to avoid surprising writes
+  // outside Agor-managed storage.
+  runPostStartJob('git-remote-credential-scrub', () => scrubManagedGitRemoteCredentials(db));
 
   // Log the host IP that will be frozen into env command templates as
   // {{host.ip_address}}. Explicit config overrides autodetection.
-  try {
+  runPostStartJob('host-ip-log', async () => {
     const { resolveHostIpAddress } = await import('@agor/core/utils/host-ip');
     const hostIp = resolveHostIpAddress(config.daemon?.host_ip_address);
     const source = config.daemon?.host_ip_address ? 'config' : hostIp ? 'autodetected' : 'unknown';
-    console.log(`🌐 Host IP for env templates: ${hostIp ?? '(none)'} (source: ${source})`);
-  } catch (err) {
-    console.warn('⚠️  Failed to resolve host IP for env templates:', err);
-  }
+    startupDebug(`🌐 Host IP for env templates: ${hostIp ?? '(none)'} (source: ${source})`);
+  });
 
   // Security warning: web terminal + simple unix mode = daemon-user shell access.
   // `allow_web_terminal` defaults to true, so the check treats undefined as enabled.
@@ -240,7 +485,19 @@ export async function startup(ctx: StartupContext): Promise<void> {
     }
   }
 
-  // 5. Start scheduler service (background worker)
+  // 5. Start executor heartbeat stale supervisor
+  const heartbeatConfig = resolveExecutorHeartbeatConfig(config.execution);
+  const heartbeatSupervisor = new ExecutorHeartbeatSupervisor({ app, config: heartbeatConfig });
+  heartbeatSupervisor.start();
+  if (heartbeatConfig.enabled) {
+    console.log(
+      `💓 Executor heartbeat supervisor started (interval: ${heartbeatConfig.interval_ms}ms, stale after: ${heartbeatConfig.stale_after_ms}ms)`
+    );
+  } else {
+    console.log('💓 Executor heartbeat disabled');
+  }
+
+  // 6. Start scheduler service (background worker)
   let schedulerService: SchedulerService | null = null;
   if (svcEnabled('scheduler')) {
     schedulerService = new SchedulerService(db, app, {
@@ -250,13 +507,22 @@ export async function startup(ctx: StartupContext): Promise<void> {
       unixUserMode: config.execution?.unix_user_mode ?? 'simple',
     });
     schedulerService.start();
-    // Expose on app so route handlers (e.g. /worktrees/:id/execute-schedule-now)
+    // Expose on app so route handlers (e.g. /branches/:id/execute-schedule-now)
     // can reuse the scheduler's spawn code path.
     app.set('scheduler', schedulerService);
     console.log(`🔄 Scheduler started (tick interval: 30s)`);
   }
 
-  // 6. Initialize gateway: refresh channel state cache, then start Socket Mode listeners
+  // 7. Start Knowledge embedding indexer (no-op unless semantic search is configured)
+  let knowledgeEmbeddingIndexer: KnowledgeEmbeddingIndexer | null = null;
+  if (svcEnabled('knowledge')) {
+    knowledgeEmbeddingIndexer = new KnowledgeEmbeddingIndexer(db);
+    knowledgeEmbeddingIndexer.start();
+    app.set('knowledgeEmbeddingIndexer', knowledgeEmbeddingIndexer);
+    console.log('🧠 Knowledge embedding indexer started');
+  }
+
+  // 8. Initialize gateway: refresh channel state cache, then start Socket Mode listeners
   const gatewayService = safeService('gateway') as unknown as GatewayService | undefined;
   if (gatewayService) {
     gatewayService
@@ -269,13 +535,21 @@ export async function startup(ctx: StartupContext): Promise<void> {
       });
   }
 
-  // 7. Graceful shutdown handler
+  // 8. Graceful shutdown handler
   const shutdown = async (signal: string) => {
     console.log(`\n⏳ Received ${signal}, shutting down gracefully...`);
+
+    // Write sentinel before anything else — if later steps hang or fail and the
+    // process gets SIGKILL'd, the sentinel is already on disk and startup will
+    // correctly classify this as a graceful restart rather than a crash.
+    await writeCleanShutdownSentinel(signal);
 
     try {
       // Clean up health monitor
       healthMonitor.cleanup();
+
+      // Stop heartbeat supervisor
+      heartbeatSupervisor.stop();
 
       // Clean up terminal sessions
       if (terminalsService) {
@@ -287,6 +561,12 @@ export async function startup(ctx: StartupContext): Promise<void> {
       if (gatewayService) {
         console.log('🌐 Stopping gateway listeners...');
         await gatewayService.stopListeners();
+      }
+
+      // Stop Knowledge embedding indexer
+      if (knowledgeEmbeddingIndexer) {
+        console.log('🧠 Stopping Knowledge embedding indexer...');
+        knowledgeEmbeddingIndexer.stop();
       }
 
       // Stop scheduler

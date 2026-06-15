@@ -6,22 +6,39 @@
 
 import type {
   Artifact,
+  AssistantWelcomeNoteRequest,
   AuthenticationResult,
   Board,
   BoardExportBlob,
+  BoardGroupGrantWithGroup,
+  Branch,
+  BranchGroupGrantWithGroup,
   CardType,
   CardWithType,
+  CloneRepositoryResult,
   ContextFileDetail,
   ContextFileListItem,
+  Group,
+  GroupMembership,
+  KnowledgeDocument,
+  KnowledgeDocumentVersion,
+  KnowledgeEmbeddingStatus,
+  KnowledgeIndexingStatus,
+  KnowledgeNamespace,
+  KnowledgeNamespaceGraph,
+  KnowledgeSearchResult,
+  KnowledgeSemanticSettingsPublic,
   MCPServer,
   Message,
   PermissionMode,
   Repo,
+  Schedule,
   Session,
   Task,
+  TemplateRenderRequest,
+  TemplateRenderResponse,
   User,
   UUID,
-  Worktree,
 } from '@agor/core/types';
 import authentication from '@feathersjs/authentication-client';
 import type { Application, Paginated, Params } from '@feathersjs/feathers';
@@ -40,9 +57,13 @@ const DEFAULT_DAEMON_URL = `http://${DAEMON.DEFAULT_HOST}:${DAEMON.DEFAULT_PORT}
  * Using a symbol avoids clashing with existing service properties.
  */
 const BOARDS_SERVICE_EXTENDED = Symbol('agor.boardsServiceExtended');
+const USERS_SERVICE_EXTENDED = Symbol('agor.usersServiceExtended');
+const REPOS_SERVICE_EXTENDED = Symbol('agor.reposServiceExtended');
+const BRANCHES_SERVICE_EXTENDED = Symbol('agor.branchesServiceExtended');
 const SERVICE_FIND_ALL_EXTENDED = Symbol('agor.serviceFindAllExtended');
 const CLIENT_SERVICE_FACTORY_EXTENDED = Symbol('agor.clientServiceFactoryExtended');
 const CLIENT_SESSIONS_HELPERS_EXTENDED = Symbol('agor.clientSessionsHelpersExtended');
+const CLIENT_TASKS_HELPERS_EXTENDED = Symbol('agor.clientTasksHelpersExtended');
 
 /**
  * Client-side input type helper:
@@ -103,6 +124,48 @@ export interface SessionsClientHelpers {
 }
 
 /**
+ * Body shape for `POST /tasks/:id/run`. Matches the prompt route's options
+ * so the same defaults (`stream: true`, agor messageSource for socket
+ * callers) apply when explicitly triggering an already-created task.
+ */
+export interface TaskRunRequest {
+  permissionMode?: PermissionMode;
+  stream?: boolean;
+  messageSource?: 'gateway' | 'agor';
+}
+
+export interface TaskRunOptions extends TaskRunRequest {
+  params?: Params;
+}
+
+export interface TasksClientHelpers {
+  /**
+   * Trigger executor pickup for an already-created task. Pure-REST harnesses
+   * use this after `POST /tasks` to avoid needing an MCP client. Returns the
+   * Task with `status: 'running'`. Only `'created'` tasks on idle sessions
+   * are accepted — `'queued'` tasks drain automatically in queue-position
+   * order via the queue processor, and busy sessions should be prompted via
+   * `client.sessions.prompt()` (which creates and queues the task atomically).
+   */
+  run(taskId: string, options?: TaskRunOptions): Promise<Task>;
+}
+
+/**
+ * Server-side Handlebars renderer. UI sends `{template, context}` via
+ * `client.service('templates').create(...)`; daemon returns `{rendered}`.
+ * Used so the browser bundle doesn't need Handlebars (avoids CSP
+ * `script-src 'unsafe-eval'`).
+ *
+ * Transport DTOs live in `@agor/core/types/template.ts` so the daemon
+ * service and this client typing share one shape.
+ */
+export type { TemplateRenderRequest, TemplateRenderResponse };
+
+export interface TemplatesService {
+  create(data: TemplateRenderRequest, params?: Params): Promise<TemplateRenderResponse>;
+}
+
+/**
  * Service interfaces for type safety
  */
 export interface ServiceTypes {
@@ -110,14 +173,30 @@ export interface ServiceTypes {
   tasks: Task;
   boards: Board;
   repos: Repo;
+  'repos/clone': Repo;
   'repos/local': Repo;
-  worktrees: Worktree;
+  branches: Branch;
+  schedules: Schedule;
   users: User;
+  groups: Group;
+  'group-memberships': GroupMembership;
+  'boards/:id/owners': User;
+  'boards/:id/group-grants': BoardGroupGrantWithGroup;
+  'branches/:id/group-grants': BranchGroupGrantWithGroup;
   cards: CardWithType;
   'card-types': CardType; // CardType CRUD
   artifacts: Artifact;
   'mcp-servers': MCPServer;
   context: ContextFileListItem | ContextFileDetail; // GET /context returns list, GET /context/:path returns detail
+  'kb/namespaces': KnowledgeNamespace;
+  'kb/documents': KnowledgeDocument;
+  'kb/versions': KnowledgeDocumentVersion;
+  'kb/search': KnowledgeSearchResult;
+  'kb/graph': KnowledgeNamespaceGraph;
+  'kb/settings': KnowledgeSemanticSettingsPublic;
+  'kb/indexing/status': KnowledgeIndexingStatus;
+  'kb/indexing/reindex': { queued: number; status: KnowledgeEmbeddingStatus };
+  templates: TemplateRenderResponse;
 }
 
 /**
@@ -141,7 +220,7 @@ export interface AgorService<
   // Event emitter methods (for real-time updates)
   // Standard CRUD events use the service entity type T
   on(event: 'created' | 'updated' | 'patched' | 'removed', handler: (data: T) => void): void;
-  // Custom events (e.g. permission_resolved, input_resolved, queued)
+  // Custom events (e.g. permission_resolved, queued)
   // biome-ignore lint/suspicious/noExplicitAny: FeathersJS event handlers have varied signatures
   on(event: string, handler: (...args: any[]) => void): void;
   off(event: 'created' | 'updated' | 'patched' | 'removed', handler: (data: T) => void): void;
@@ -218,37 +297,81 @@ export interface MessagesService extends AgorService<Message> {
 }
 
 /**
- * Repos service with worktree management
+ * Repos service with branch management
  */
 export interface ReposService extends AgorService<Repo> {
   /**
-   * Clone a repository and register it
+   * Initialize Unix group for a repo (daemon-side privileged operation).
+   * Called by executor after cloning.
    */
-  clone(data: { url: string; name?: string; slug?: string }, params?: Params): Promise<Repo>;
+  initializeUnixGroup(
+    data: { repoId: string; userId?: string },
+    params?: Params
+  ): Promise<{ unixGroup: string }>;
 
   /**
-   * Create a git worktree for a repository
+   * Create a git branch for a repository.
+   *
+   * Shape matches the daemon's `/repos/:id/branches` route + Feathers
+   * service. Keep this in sync with `RepoService.createBranch()` in
+   * apps/agor-daemon/src/services/repos.ts — drift here means CLI/client
+   * consumers silently drop fields.
    */
-  createWorktree(
+  createBranch(
     id: string,
     data: {
       name: string;
       ref: string;
+      refType?: 'branch' | 'tag';
       createBranch?: boolean;
       pullLatest?: boolean;
       sourceBranch?: string;
+      issue_url?: string;
+      pull_request_url?: string;
+      boardId: string;
+      custom_context?: Record<string, unknown>;
+      notes?: string | null;
+      /** Explicit board position. Honored as-is when supplied. */
+      position?: { x: number; y: number };
+      zoneId?: string;
+      environment_variant?: string;
+      /**
+       * Branch storage model — see
+       * context/explorations/clone-redesign.md.
+       * 'worktree' (default) = native `git worktree add`.
+       * 'clone' = self-standing `git clone` with its own `.git/`.
+       */
+      storage_mode?: 'worktree' | 'clone';
+      /** Shallow clone depth (only when storage_mode='clone'). */
+      clone_depth?: number;
     },
     params?: Params
-  ): Promise<Repo>;
+  ): Promise<Branch>;
 
   /**
-   * Remove a git worktree
+   * Remove a git branch
    */
-  removeWorktree(id: string, name: string, params?: Params): Promise<Repo>;
+  removeBranch(id: string, name: string, params?: Params): Promise<Repo>;
 }
 
 export interface ReposLocalService extends AgorService<Repo> {
   create(data: { path: string; slug?: string }, params?: Params): Promise<Repo>;
+}
+
+/**
+ * `POST /repos/clone` returns the async `CloneRepositoryResult` envelope
+ * (status + repo_id for polling), not a fully-materialized `Repo`. Declared
+ * as a minimal standalone interface (not `AgorService<Repo>`) because
+ * overriding `create()` with a non-`Repo` return type would be a structural
+ * mismatch on the base service. Callers should fetch the full `Repo` via
+ * `client.service('repos').get(repo_id)` once polling shows `clone_status:
+ * 'ready'`.
+ */
+export interface ReposCloneService {
+  create(
+    data: { url: string; name?: string; slug?: string; default_branch?: string },
+    params?: Params
+  ): Promise<CloneRepositoryResult>;
 }
 
 /**
@@ -286,68 +409,113 @@ export interface BoardsService extends AgorService<Board> {
     newName?: string,
     params?: Params
   ): Promise<Board>;
+
+  /**
+   * Set or clear the board's primary assistant branch.
+   */
+  setPrimaryAssistant(
+    data: { id?: string; boardId?: string; branchId: string },
+    params?: Params
+  ): Promise<Board>;
+  clearPrimaryAssistant(boardId: string, params?: Params): Promise<Board>;
+
+  /**
+   * Create the bundled assistant welcome markdown note when missing. Rendering
+   * happens server-side from a static template; callers only provide values.
+   */
+  ensureAssistantWelcomeNote(data: AssistantWelcomeNoteRequest, params?: Params): Promise<Board>;
 }
 
 /**
- * Worktrees service with environment management
+ * Users service with git environment support
  */
-export interface WorktreesService extends AgorService<Worktree> {
+export interface UsersService extends AgorService<User> {
   /**
-   * Find worktree by repo_id and name
+   * Get the full resolved git environment for a user.
+   * Auth: service-account JWTs may fetch any user's env;
+   * regular users may only fetch their own.
    */
-  findByRepoAndName(repoId: string, name: string, params?: Params): Promise<Worktree | null>;
+  getGitEnvironment(data: { userId: string }, params?: Params): Promise<Record<string, string>>;
+}
+
+/**
+ * Branches service with environment management
+ */
+export interface BranchesService extends AgorService<Branch> {
+  /**
+   * Initialize Unix group for a branch (daemon-side privileged operation).
+   * Called by executor after creating the git branch.
+   */
+  initializeUnixGroup(
+    data: { branchId: string; othersAccess?: 'none' | 'read' | 'write' },
+    params?: Params
+  ): Promise<{ unixGroup: string }>;
 
   /**
-   * Add session to worktree
+   * Create or repair the primary Knowledge namespace for an assistant branch.
+   * API/UI-only; not exposed through assistant MCP config mutation tools.
    */
-  addSession(id: string, sessionId: string, params?: Params): Promise<Worktree>;
+  ensureAssistantKnowledgeNamespace(
+    data: { branchId?: string; branch_id?: string } | string,
+    params?: Params
+  ): Promise<{ namespace: KnowledgeNamespace; branch: Branch }>;
 
   /**
-   * Remove session from worktree
+   * Find branch by repo_id and name
    */
-  removeSession(id: string, sessionId: string, params?: Params): Promise<Worktree>;
+  findByRepoAndName(repoId: string, name: string, params?: Params): Promise<Branch | null>;
 
   /**
-   * Add worktree to board
+   * Add session to branch
    */
-  addToBoard(id: string, boardId: string, params?: Params): Promise<Worktree>;
+  addSession(id: string, sessionId: string, params?: Params): Promise<Branch>;
 
   /**
-   * Remove worktree from board
+   * Remove session from branch
    */
-  removeFromBoard(id: string, params?: Params): Promise<Worktree>;
+  removeSession(id: string, sessionId: string, params?: Params): Promise<Branch>;
+
+  /**
+   * Add branch to board
+   */
+  addToBoard(id: string, boardId: string, params?: Params): Promise<Branch>;
+
+  /**
+   * Remove branch from board
+   */
+  removeFromBoard(id: string, params?: Params): Promise<Branch>;
 
   /**
    * Update environment status
    */
   updateEnvironment(
     id: string,
-    environmentUpdate: Partial<Worktree['environment_instance']>,
+    environmentUpdate: Partial<Branch['environment_instance']>,
     params?: Params
-  ): Promise<Worktree>;
+  ): Promise<Branch>;
 
   /**
-   * Start worktree environment
+   * Start branch environment
    */
-  startEnvironment(id: string, params?: Params): Promise<Worktree>;
+  startEnvironment(id: string, params?: Params): Promise<Branch>;
 
   /**
-   * Stop worktree environment
+   * Stop branch environment
    */
-  stopEnvironment(id: string, params?: Params): Promise<Worktree>;
+  stopEnvironment(id: string, params?: Params): Promise<Branch>;
 
   /**
-   * Restart worktree environment
+   * Restart branch environment
    */
-  restartEnvironment(id: string, params?: Params): Promise<Worktree>;
+  restartEnvironment(id: string, params?: Params): Promise<Branch>;
 
   /**
    * Check environment health
    */
-  checkHealth(id: string, params?: Params): Promise<Worktree>;
+  checkHealth(id: string, params?: Params): Promise<Branch>;
 
   /**
-   * Archive or delete a worktree with filesystem cleanup options
+   * Archive or delete a branch with filesystem cleanup options
    */
   archiveOrDelete(
     id: string,
@@ -356,12 +524,12 @@ export interface WorktreesService extends AgorService<Worktree> {
       filesystemAction: 'preserved' | 'cleaned' | 'deleted';
     },
     params?: Params
-  ): Promise<Worktree | { deleted: true; worktree_id: string }>;
+  ): Promise<Branch | { deleted: true; branch_id: string }>;
 
   /**
-   * Unarchive a worktree
+   * Unarchive a branch
    */
-  unarchive(id: string, options?: { boardId?: string }, params?: Params): Promise<Worktree>;
+  unarchive(id: string, options?: { boardId?: string }, params?: Params): Promise<Branch>;
 }
 
 /**
@@ -370,14 +538,16 @@ export interface WorktreesService extends AgorService<Worktree> {
 export interface AgorClient extends Omit<Application<ServiceTypes>, 'service'> {
   io: Socket;
   sessions: SessionsClientHelpers;
+  tasks: TasksClientHelpers;
 
   // Typed service overloads for services with custom methods
   service(path: 'sessions'): SessionsService;
   service(path: 'tasks'): TasksService;
   service(path: 'messages'): MessagesService;
   service(path: 'repos'): ReposService;
+  service(path: 'repos/clone'): ReposCloneService;
   service(path: 'repos/local'): ReposLocalService;
-  service(path: 'worktrees'): WorktreesService;
+  service(path: 'branches'): BranchesService;
   service(path: 'boards'): BoardsService;
 
   // Bulk operation endpoints
@@ -387,9 +557,10 @@ export interface AgorClient extends Omit<Application<ServiceTypes>, 'service'> {
   // Standard services (CRUD only)
   service(path: 'cards'): AgorService<CardWithType>;
   service(path: 'card-types'): AgorService<CardType>;
-  service(path: 'users'): AgorService<User>;
+  service(path: 'users'): UsersService;
   service(path: 'mcp-servers'): AgorService<MCPServer>;
   service(path: 'context'): AgorService<ContextFileListItem | ContextFileDetail>;
+  service(path: 'templates'): TemplatesService;
 
   // Generic fallback for custom routes and dynamic paths
   service<K extends keyof ServiceTypes>(path: K): AgorService<ServiceTypes[K]>;
@@ -428,7 +599,17 @@ function extendBoardsService(client: AgorClient): void {
     ).methods;
 
     if (typeof methodsFn === 'function') {
-      methodsFn.call(service, 'toBlob', 'fromBlob', 'toYaml', 'fromYaml', 'clone');
+      methodsFn.call(
+        service,
+        'toBlob',
+        'fromBlob',
+        'toYaml',
+        'fromYaml',
+        'clone',
+        'setPrimaryAssistant',
+        'clearPrimaryAssistant',
+        'ensureAssistantWelcomeNote'
+      );
     }
   };
 
@@ -595,6 +776,51 @@ function extendFindAllOnService(service: AgorService<unknown>): void {
   findAllService[SERVICE_FIND_ALL_EXTENDED] = true;
 }
 
+/**
+ * Wire client-side custom methods for services that expose RPCs beyond the
+ * standard Feathers CRUD interface. The Socket.io client only wires the
+ * default methods at construction time, so each path that has custom methods
+ * on the server must call `service.methods(...)` here too — otherwise calling
+ * them on the client proxy throws "client.service(...).<method> is not a
+ * function". Keep these in sync with the `methods:` arrays in
+ * `apps/agor-daemon/src/register-services.ts`.
+ */
+function extendUsersService(client: AgorClient): void {
+  const usersService = client.service('users') as AgorService<User> & {
+    [USERS_SERVICE_EXTENDED]?: boolean;
+    methods?: (...names: string[]) => unknown;
+  };
+  if (usersService[USERS_SERVICE_EXTENDED]) return;
+  if (typeof usersService.methods === 'function') {
+    usersService.methods('getGitEnvironment');
+  }
+  usersService[USERS_SERVICE_EXTENDED] = true;
+}
+
+function extendReposService(client: AgorClient): void {
+  const reposService = client.service('repos') as AgorService<Repo> & {
+    [REPOS_SERVICE_EXTENDED]?: boolean;
+    methods?: (...names: string[]) => unknown;
+  };
+  if (reposService[REPOS_SERVICE_EXTENDED]) return;
+  if (typeof reposService.methods === 'function') {
+    reposService.methods('initializeUnixGroup');
+  }
+  reposService[REPOS_SERVICE_EXTENDED] = true;
+}
+
+function extendBranchesService(client: AgorClient): void {
+  const branchesService = client.service('branches') as AgorService<Branch> & {
+    [BRANCHES_SERVICE_EXTENDED]?: boolean;
+    methods?: (...names: string[]) => unknown;
+  };
+  if (branchesService[BRANCHES_SERVICE_EXTENDED]) return;
+  if (typeof branchesService.methods === 'function') {
+    branchesService.methods('initializeUnixGroup', 'ensureAssistantKnowledgeNamespace');
+  }
+  branchesService[BRANCHES_SERVICE_EXTENDED] = true;
+}
+
 function extendServiceFactory(client: AgorClient): void {
   const augmentedClient = client as AgorClient & {
     [CLIENT_SERVICE_FACTORY_EXTENDED]?: boolean;
@@ -635,6 +861,28 @@ function extendSessionsHelpers(client: AgorClient): void {
   };
 
   augmentedClient[CLIENT_SESSIONS_HELPERS_EXTENDED] = true;
+}
+
+function extendTasksHelpers(client: AgorClient): void {
+  const augmentedClient = client as AgorClient & {
+    [CLIENT_TASKS_HELPERS_EXTENDED]?: boolean;
+  };
+
+  if (augmentedClient[CLIENT_TASKS_HELPERS_EXTENDED]) {
+    return;
+  }
+
+  client.tasks = {
+    run: async (taskId: string, options?: TaskRunOptions) => {
+      const { params, ...requestOptions } = options ?? {};
+      const response = await client
+        .service(`tasks/${taskId}/run`)
+        .create(requestOptions as TaskRunRequest, params);
+      return response as Task;
+    },
+  };
+
+  augmentedClient[CLIENT_TASKS_HELPERS_EXTENDED] = true;
 }
 
 /**
@@ -700,7 +948,11 @@ export async function createRestClient(
 
   extendServiceFactory(client);
   extendBoardsService(client);
+  extendUsersService(client);
+  extendReposService(client);
+  extendBranchesService(client);
   extendSessionsHelpers(client);
+  extendTasksHelpers(client);
 
   return client;
 }
@@ -764,18 +1016,26 @@ export function createClient(
 
   client.configure(socketio(socket));
 
-  // Configure authentication with localStorage if available (browser only)
-  const storage =
-    typeof globalThis !== 'undefined' && 'localStorage' in globalThis
-      ? (globalThis as typeof globalThis & { localStorage: Storage }).localStorage
-      : undefined;
+  // Configure authentication with localStorage if available (browser only).
+  // Node 25 exposes a `localStorage` global that is NOT a working Storage —
+  // it has no `setItem` method, so the Feathers auth client throws
+  // `_a.setItem is not a function` on first authenticate(). Guard against
+  // that by also requiring a callable setItem before treating it as Storage.
+  const _ls = (globalThis as { localStorage?: unknown }).localStorage as
+    | (Storage & { setItem?: unknown })
+    | undefined;
+  const storage = _ls && typeof _ls.setItem === 'function' ? (_ls as Storage) : undefined;
 
   client.configure(authentication({ storage }));
   client.io = socket;
 
   extendServiceFactory(client);
   extendBoardsService(client);
+  extendUsersService(client);
+  extendReposService(client);
+  extendBranchesService(client);
   extendSessionsHelpers(client);
+  extendTasksHelpers(client);
 
   return client;
 }

@@ -6,6 +6,7 @@
  */
 
 import type { MessageID, SessionID, TaskID } from './id';
+import type { WidgetMessageMetadata } from './widget';
 
 /**
  * Message role - who is speaking
@@ -17,20 +18,18 @@ export enum MessageRole {
 }
 
 /**
- * Message status for queueing
- */
-export type MessageStatus = 'queued' | null;
-
-/**
  * Message source - where the message originated
  * - 'gateway': Message came from external platform (Slack, Discord, etc.)
  * - 'agor': Message originated from Agor UI
+ * - 'cli-repl': Message originated from a Claude Code CLI REPL turn that
+ *   the user typed directly into the embedded xterm (not via Agor's
+ *   textarea / /prompt route). Written by the JSONL watcher.
  */
-export type MessageSource = 'gateway' | 'agor';
+export type MessageSource = 'gateway' | 'agor' | 'cli-repl';
 
 /**
- * Message type (from Claude transcript)
- * Distinguishes conversation messages from meta/snapshot messages
+ * Message type
+ * Distinguishes conversation messages from meta/synthetic messages
  */
 export type MessageType =
   | 'user'
@@ -38,7 +37,10 @@ export type MessageType =
   | 'system'
   | 'file-history-snapshot'
   | 'permission_request'
-  | 'input_request';
+  | 'input_request'
+  | 'daemon_restart'
+  | 'daemon_crash'
+  | 'widget_request';
 
 /**
  * Content block (for multi-modal messages)
@@ -139,8 +141,12 @@ export interface PermissionRequestContent {
 }
 
 /**
- * Input request status
- * Used when type === 'input_request' (AskUserQuestion tool)
+ * Input request status (legacy / pre-#1177).
+ *
+ * The `AskUserQuestion` tool was disallowed at the SDK layer in #1177
+ * because it hung the executor in gateway channels. New sessions never
+ * produce `input_request` messages; this enum is kept so historical rows
+ * still type-check when read from the DB.
  */
 export enum InputRequestStatus {
   PENDING = 'pending',
@@ -148,18 +154,14 @@ export enum InputRequestStatus {
   TIMED_OUT = 'timed_out',
 }
 
-/**
- * Input request question option
- */
+/** Input request question option (legacy / pre-#1177, see `InputRequestStatus`). */
 export interface InputRequestOption {
   label: string;
   description: string;
   markdown?: string;
 }
 
-/**
- * Input request question
- */
+/** Input request question (legacy / pre-#1177, see `InputRequestStatus`). */
 export interface InputRequestQuestion {
   question: string;
   header: string;
@@ -167,10 +169,7 @@ export interface InputRequestQuestion {
   multiSelect: boolean;
 }
 
-/**
- * Input request content
- * Used when type === 'input_request' (AskUserQuestion tool)
- */
+/** Input request content (legacy / pre-#1177, see `InputRequestStatus`). */
 export interface InputRequestContent {
   request_id: string;
   task_id?: TaskID;
@@ -226,11 +225,9 @@ export interface Message {
    */
   parent_tool_use_id?: string | null;
 
-  /** Message status (queued vs normal) */
-  status?: MessageStatus;
-
-  /** Position in queue (for queued messages only) */
-  queue_position?: number | null;
+  // NOTE: queueing moved off `messages` and onto `tasks.status='queued'` as
+  // of migration sqlite/0040 (postgres/0030). The `status` and `queue_position`
+  // fields are gone — see `Task.queue_position` instead.
 
   /** Agent-specific metadata */
   metadata?: {
@@ -259,6 +256,27 @@ export interface Message {
      * - undefined: Legacy message or source not tracked
      */
     source?: MessageSource;
+
+    /**
+     * Widget request state. Only populated on `type === 'widget_request'`
+     * messages. Discriminated by `widget_type`; see `types/widget.ts`.
+     */
+    widget?: WidgetMessageMetadata;
+
+    /**
+     * Marks the user-role message / task as having been authored by the
+     * daemon on behalf of the user, rather than typed by a human.
+     * Used by widget auto-resume prompts (see `widget_id`) and other
+     * system-injected prompts so the UI can label them appropriately.
+     */
+    system_authored?: boolean;
+
+    /**
+     * For system-authored tasks queued in response to widget resolution,
+     * the widget message that triggered them. Lets the UI link the queued
+     * prompt back to the originating widget for audit / debugging.
+     */
+    widget_id?: MessageID;
 
     /** Additional agent-specific fields */
     [key: string]: unknown;

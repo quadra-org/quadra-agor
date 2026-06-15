@@ -6,9 +6,11 @@
  */
 
 import { type ApiKeyName, resolveApiKey } from '@agor/core/config';
-import { generateId } from '@agor/core/db';
-import { getGitState } from '@agor/core/git';
+import { generateId, shortId } from '@agor/core/db';
+import { getCurrentBranch, getGitState } from '@agor/core/git';
 import type {
+  AgenticToolName,
+  ContextUsageSnapshot,
   MessageID,
   MessageSource,
   PermissionMode,
@@ -20,9 +22,18 @@ import type {
 import { MessageRole } from '@agor/core/types';
 import { createFeathersBackedRepositories } from '../../db/feathers-repositories.js';
 import type { StreamingCallbacks } from '../../sdk-handlers/base/types.js';
-import { computeCodexContextWindowFromPreviousTask } from '../../sdk-handlers/codex/context-window-fallback.js';
 import { normalizeRawSdkResponse } from '../../sdk-handlers/normalizer-factory.js';
 import type { AgorClient } from '../../services/feathers-client.js';
+import { configureSessionGitSafeDirectories } from './git-safe-directory.js';
+
+const DEBUG_SDK_EXECUTOR =
+  process.env.AGOR_DEBUG_SDK_EXECUTOR === '1' || process.env.DEBUG?.includes('sdk-executor');
+
+function sdkDebug(...args: unknown[]): void {
+  if (DEBUG_SDK_EXECUTOR) {
+    console.debug(...args);
+  }
+}
 
 /**
  * Tool interface that all SDK wrappers must implement
@@ -52,12 +63,20 @@ export interface BaseTool {
     errorDetails?: string[];
     /** Raw SDK response for token accounting - stored and normalized */
     rawSdkResponse?: unknown;
-    /** Raw SDK context usage from getContextUsage() — authoritative context window snapshot */
-    rawContextUsage?: {
-      totalTokens: number;
-      maxTokens: number;
-      percentage: number;
-    };
+    /**
+     * Authoritative context-window snapshot captured during the turn.
+     * - Claude: from the Agent SDK's `getContextUsage()` response.
+     * - Codex: from the CLI's `event_msg/token_count.last_token_usage` payload.
+     * When present, base-executor uses it as the source of truth for
+     * `Task.computed_context_window` and `normalized_sdk_response.contextUsageSnapshot`.
+     */
+    rawContextUsage?: ContextUsageSnapshot;
+    /**
+     * Resolved model the tool actually invoked. Leave undefined when
+     * unknown — never substitute a tool default. See
+     * `sdk-handlers/base/model-recording.ts`.
+     */
+    model?: string;
   }>;
 
   // Optional stopTask method for tools that support interruption
@@ -71,16 +90,12 @@ export interface BaseTool {
   }>;
 
   /**
-   * Compute cumulative context window usage for a session
+   * Fallback: compute current context-window occupancy for a session.
    *
-   * Each tool implements its own strategy:
-   * - Claude Code: Sum input+output tokens across tasks since last compaction
-   * - Codex/Gemini: May use SDK's cumulative reporting
-   *
-   * @param sessionId - Session ID to compute context for
-   * @param currentTaskId - Current task ID (optional)
-   * @param currentRawSdkResponse - Raw SDK response for current task (required during task completion)
-   * @returns Cumulative context window usage in tokens
+   * Only invoked when no authoritative `rawContextUsage` snapshot was
+   * captured during the turn. See the canonical doc on
+   * `ITool.computeContextWindow` in `sdk-handlers/base/tool.interface.ts`
+   * for the full source-precedence rules and per-tool strategy notes.
    */
   computeContextWindow?(
     sessionId: string,
@@ -210,54 +225,94 @@ export function createExecutionContext(
   };
 }
 
+type CapturedGitState = {
+  sha: string;
+  ref: string;
+};
+
 /**
- * Capture git state at task end and update session's current_sha
+ * Capture git state from inside the executor process.
  *
- * Fetches the worktree path from the session and captures the current git state.
- * Also updates the session's git_state.current_sha to keep it in sync.
- * Returns the SHA (with "-dirty" suffix if working directory has uncommitted changes)
- * or undefined if it cannot be determined.
+ * The daemon should not run git inside managed branch checkouts just to stamp
+ * task bookkeeping. The executor is already running with the correct Unix
+ * identity/environment, so task start/end snapshots belong here.
  */
-async function captureGitStateAtTaskEnd(
+async function captureGitStateForSession(
   client: AgorClient,
-  sessionId: SessionID
-): Promise<string | undefined> {
+  sessionId: SessionID,
+  phase: 'start' | 'end'
+): Promise<CapturedGitState | undefined> {
   try {
-    // Get session to find worktree
     const session = await client.service('sessions').get(sessionId);
-    if (!session.worktree_id) {
-      console.warn('[Git SHA Capture] Session has no worktree_id');
+    if (!session.branch_id) {
+      console.warn(`[Git SHA Capture] Session has no branch_id at task ${phase}`);
       return undefined;
     }
 
-    // Get worktree to find path
-    const worktree = await client.service('worktrees').get(session.worktree_id);
-    if (!worktree.path) {
-      console.warn('[Git SHA Capture] Worktree has no path');
+    const branch = await client.service('branches').get(session.branch_id);
+    if (!branch.path) {
+      console.warn(`[Git SHA Capture] Branch has no path at task ${phase}`);
       return undefined;
     }
 
-    // Get current git state (includes dirty detection)
-    const sha = await getGitState(worktree.path);
+    const sha = await getGitState(branch.path);
+    let ref = 'unknown';
+    try {
+      ref = await getCurrentBranch(branch.path);
+    } catch (error) {
+      console.warn(
+        `[Git SHA Capture] Failed to capture git ref at task ${phase}:`,
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+
     console.log(
-      `[Git SHA Capture] Captured git state at task end: ${sha.substring(0, 8)}${sha.endsWith('-dirty') ? ' (dirty)' : ''}`
+      `[Git SHA Capture] Captured git state at task ${phase}: ${sha.substring(0, 8)}${sha.endsWith('-dirty') ? ' (dirty)' : ''} ref=${ref}`
     );
 
-    // Update session's current_sha to keep it in sync as tasks complete
-    if (sha && sha !== 'unknown') {
+    // Update session's current_sha to keep it in sync as tasks complete.
+    if (phase === 'end' && sha && sha !== 'unknown') {
       try {
         await client.service('sessions').patch(sessionId, {
-          git_state: { ...session.git_state, current_sha: sha },
+          git_state: { ...session.git_state, current_sha: sha, ref },
         });
       } catch (sessionPatchError) {
         console.warn('[Git SHA Capture] Failed to update session current_sha:', sessionPatchError);
       }
     }
 
-    return sha;
+    return { sha, ref };
   } catch (error) {
-    console.warn('[Git SHA Capture] Failed to capture git SHA at task end:', error);
+    console.warn(`[Git SHA Capture] Failed to capture git state at task ${phase}:`, error);
     return undefined;
+  }
+}
+
+export async function captureGitStateAtTaskEnd(
+  client: AgorClient,
+  sessionId: SessionID
+): Promise<string | undefined> {
+  const gitState = await captureGitStateForSession(client, sessionId, 'end');
+  return gitState?.sha;
+}
+
+export async function stampGitStateAtTaskStart(
+  client: AgorClient,
+  sessionId: SessionID,
+  taskId: TaskID
+): Promise<void> {
+  const gitState = await captureGitStateForSession(client, sessionId, 'start');
+  if (!gitState) return;
+
+  try {
+    await client.service('tasks').patch(taskId, {
+      git_state: {
+        ref_at_start: gitState.ref,
+        sha_at_start: gitState.sha,
+      },
+    });
+  } catch (error) {
+    console.warn('[Git SHA Capture] Failed to stamp task start git state:', error);
   }
 }
 
@@ -270,22 +325,50 @@ async function captureGitStateAtTaskEnd(
  *
  * Returns resolution result with key, source, and useNativeAuth flag
  */
-async function resolveApiKeyForTask(
+function shouldFallbackToLocalApiKeyResolution(err: unknown): boolean {
+  const code = (err as { code?: number })?.code;
+  if (code === 400 || code === 401 || code === 403) {
+    return false;
+  }
+
+  const message = err instanceof Error ? err.message : String(err);
+  if (
+    message.includes('Executor token is not valid') ||
+    message.includes('not authorized') ||
+    message.includes('Forbidden')
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+export async function resolveApiKeyForTask(
   keyName: ApiKeyName,
   client: AgorClient,
-  taskId: TaskID
+  taskId: TaskID,
+  tool: AgenticToolName
 ): Promise<import('@agor/core/config').KeyResolutionResult> {
   // Call daemon service to resolve API key (no direct database access from executor!)
-  // This allows executors to run as different Unix users without needing database access
+  // This allows executors to run as different Unix users without needing database access.
+  // `tool` scopes the per-user lookup to the calling SDK's bucket so a Codex spawn
+  // never resolves a key stored under `agentic_tools['claude-code']`, and vice versa.
   try {
     const result = (await client.service('config/resolve-api-key').create({
       taskId,
       keyName,
+      tool,
     })) as import('@agor/core/config').KeyResolutionResult;
-    console.log(`[API Key Resolution] Resolved ${keyName} via daemon (source: ${result.source})`);
+    sdkDebug(`[API Key Resolution] Resolved ${keyName} via daemon (source: ${result.source})`);
     return result;
   } catch (err) {
-    console.warn('[API Key Resolution] Failed to resolve via daemon service:', err);
+    const message = err instanceof Error ? err.message : String(err);
+    if (!shouldFallbackToLocalApiKeyResolution(err)) {
+      sdkDebug(`[API Key Resolution] Daemon rejected API key resolution: ${message}`);
+      throw err;
+    }
+
+    console.warn(`[API Key Resolution] Falling back to local resolution: ${message}`);
     // Fall back to sync resolution (config + env only, no per-user keys)
     return resolveApiKey(keyName, {});
   }
@@ -301,9 +384,9 @@ export async function executeToolTask(params: {
   prompt: string;
   permissionMode?: PermissionMode;
   abortController: AbortController;
-  apiKeyEnvVar: string;
-  toolName: string;
-  messageSource?: 'gateway' | 'agor';
+  apiKeyEnvVar: ApiKeyName;
+  toolName: AgenticToolName;
+  messageSource?: MessageSource;
   createTool: (
     repos: ReturnType<typeof createFeathersBackedRepositories>,
     apiKey: string,
@@ -313,25 +396,40 @@ export async function executeToolTask(params: {
   const { client, sessionId, taskId, prompt, permissionMode, apiKeyEnvVar, toolName, createTool } =
     params;
 
-  console.log(`[${toolName}] Executing task ${taskId.substring(0, 8)}...`);
+  console.log(`[${toolName}] Executing task ${shortId(taskId)}...`);
 
-  // Resolve API key with proper precedence (user → config → env → native auth)
-  const resolution = await resolveApiKeyForTask(apiKeyEnvVar as ApiKeyName, client, taskId);
+  // Ensure plain git commands launched by the agent SDK inherit safe.directory
+  // trust for this managed checkout. Without this, Unix-isolated sessions can
+  // create and run successfully through executor-mediated git probes while
+  // `git status` inside the agent shell still fails with dubious ownership.
+  await configureSessionGitSafeDirectories(client, sessionId, `[${toolName} git.safe-directory]`);
+
+  // Capture and stamp task-start git state inside the executor as early as
+  // possible. The daemon transitions the task to RUNNING before spawn, but the
+  // authoritative branch git read belongs here with the rest of
+  // executor-mediated git work.
+  await stampGitStateAtTaskStart(client, sessionId, taskId);
+
+  // Resolve API key with proper precedence (user → config → env → native auth).
+  // Pass `toolName` so the daemon scopes the per-user lookup to this tool's
+  // credential bucket — prevents cross-SDK leak (e.g. Codex picking up an
+  // ANTHROPIC_API_KEY stored under claude-code).
+  const resolution = await resolveApiKeyForTask(apiKeyEnvVar, client, taskId, toolName);
 
   // Fail fast if stored key can't be decrypted (e.g. master secret changed)
   if (resolution.decryptionFailed) {
     throw new Error(
       `API key "${apiKeyEnvVar}" could not be decrypted. ` +
         `The stored key may have been encrypted with a different master secret. ` +
-        `Please re-enter your API key in Settings > API Keys.`
+        `Please re-enter your API key in Settings > ${toolName} > Authentication.`
     );
   }
 
   // Log resolution result
   if (resolution.apiKey) {
-    console.log(`[${toolName}] Using API key from ${resolution.source} level for ${apiKeyEnvVar}`);
+    sdkDebug(`[${toolName}] Using API key from ${resolution.source} level for ${apiKeyEnvVar}`);
   } else {
-    console.log(
+    sdkDebug(
       `[${toolName}] No API key found - SDK will use native authentication (OAuth/CLI login)`
     );
   }
@@ -389,7 +487,7 @@ export async function executeToolTask(params: {
     );
 
     // Capture git SHA at task end
-    const shaAtEnd = await captureGitStateAtTaskEnd(client, sessionId);
+    const gitStateAtEnd = await captureGitStateForSession(client, sessionId, 'end');
 
     // Determine task status based on SDK result
     // - wasStopped: user explicitly stopped the task
@@ -398,7 +496,7 @@ export async function executeToolTask(params: {
 
     if (result.hadError) {
       console.error(
-        `[${toolName}] SDK returned error result for session ${sessionId.substring(0, 8)}, marking task as failed${result.errorDetails?.length ? `: ${result.errorDetails.join('; ')}` : ''}`
+        `[${toolName}] SDK returned error result for session ${shortId(sessionId)}, marking task as failed${result.errorDetails?.length ? `: ${result.errorDetails.join('; ')}` : ''}`
       );
     }
 
@@ -410,10 +508,10 @@ export async function executeToolTask(params: {
 
     // Add git_state if we captured a SHA
     // Note: This will be deep-merged with existing git_state by the repository layer
-    if (shaAtEnd) {
+    if (gitStateAtEnd) {
       // @ts-expect-error - Partial update of nested git_state object is handled by repository deep merge
       patchData.git_state = {
-        sha_at_end: shaAtEnd,
+        sha_at_end: gitStateAtEnd.sha,
       };
     }
 
@@ -421,66 +519,55 @@ export async function executeToolTask(params: {
     // Store both raw (for debugging) and normalized (for UI/analytics)
     if (result.rawSdkResponse) {
       patchData.raw_sdk_response = result.rawSdkResponse;
-      // Normalize using tool-specific normalizer (toolName maps to agentic tool type)
-      const normalized = normalizeRawSdkResponse(toolName, result.rawSdkResponse);
+      // `modelHint` refines context-window lookup for tools whose SDK
+      // event omits the model; never used as primaryModel.
+      const normalized = normalizeRawSdkResponse(toolName, result.rawSdkResponse, {
+        modelHint: result.model,
+      });
       if (normalized) {
         patchData.normalized_sdk_response = normalized;
         console.log(
           `[${toolName}] Normalized SDK response: ${normalized.tokenUsage.totalTokens} tokens, $${normalized.costUsd?.toFixed(4) ?? 'N/A'}`
         );
-
-        // Extract model from normalized response to display correct model tag in UI
-        if (normalized.primaryModel) {
-          patchData.model = normalized.primaryModel;
-          console.log(`[${toolName}] Task model set to: ${normalized.primaryModel}`);
-        }
       }
     }
 
-    // Use SDK's authoritative context usage when available,
-    // fall back to tool-specific computation otherwise.
-    // Handled independently of rawSdkResponse since the two data sources are separate.
-    if (result.rawContextUsage && result.rawContextUsage.totalTokens > 0) {
+    // result.model (configured) wins over normalizer's primaryModel (SDK echo).
+    const resolvedTaskModel = result.model || patchData.normalized_sdk_response?.primaryModel;
+    if (resolvedTaskModel) {
+      patchData.model = resolvedTaskModel;
+      console.log(`[${toolName}] Task model set to: ${resolvedTaskModel}`);
+    }
+
+    // Prefer the authoritative context-window snapshot when the tool surfaced
+    // one (Claude: Agent SDK getContextUsage(); Codex: CLI event_msg/token_count
+    // last_token_usage). Falls back to tool-specific computation otherwise.
+    // Handled independently of rawSdkResponse — the two data sources are separate.
+    //
+    // The `maxTokens > 0` guard (vs `totalTokens > 0`) preserves the snapshot
+    // even at the moment of auto-compaction, when `totalTokens` can legitimately
+    // be near zero.
+    if (result.rawContextUsage && result.rawContextUsage.maxTokens > 0) {
       patchData.computed_context_window = result.rawContextUsage.totalTokens;
       console.log(
-        `[${toolName}] SDK context usage: ${result.rawContextUsage.totalTokens}/${result.rawContextUsage.maxTokens} tokens (${result.rawContextUsage.percentage}%)`
+        `[${toolName}] Authoritative context snapshot: ${result.rawContextUsage.totalTokens}/${result.rawContextUsage.maxTokens} tokens (${result.rawContextUsage.percentage}%)`
       );
 
-      // Override contextWindowLimit in normalized response with the authoritative
-      // maxTokens from getContextUsage() so the UI computes percentage correctly
-      if (
-        patchData.normalized_sdk_response &&
-        typeof patchData.normalized_sdk_response === 'object' &&
-        result.rawContextUsage.maxTokens > 0
-      ) {
-        const normalizedResponse = patchData.normalized_sdk_response as Record<string, unknown>;
-        normalizedResponse.contextWindowLimit = result.rawContextUsage.maxTokens;
-        normalizedResponse.contextUsageSnapshot = {
-          totalTokens: result.rawContextUsage.totalTokens,
-          maxTokens: result.rawContextUsage.maxTokens,
-          percentage: result.rawContextUsage.percentage,
-        };
+      // Override contextWindowLimit in the normalized response with the
+      // authoritative maxTokens so the UI computes percentage against the
+      // model's actual reported window, and attach the snapshot itself so
+      // UI consumers can prefer the agent's own displayed percentage.
+      if (patchData.normalized_sdk_response) {
+        patchData.normalized_sdk_response.contextWindowLimit = result.rawContextUsage.maxTokens;
+        patchData.normalized_sdk_response.contextUsageSnapshot = result.rawContextUsage;
       }
     } else {
-      if (toolName === 'codex' && result.rawSdkResponse) {
-        try {
-          const inferredWindow = await computeCodexContextWindowFromPreviousTask(
-            client,
-            sessionId,
-            taskId,
-            result.rawSdkResponse
-          );
-          if (inferredWindow && inferredWindow > 0) {
-            patchData.computed_context_window = inferredWindow;
-            console.log(
-              `[${toolName}] Inferred context window from previous-task running totals: ${inferredWindow} tokens`
-            );
-          }
-        } catch (error) {
-          console.warn(`[${toolName}] Failed to infer context window from previous task:`, error);
-        }
-      }
-
+      // No authoritative event_msg/token_count snapshot was captured during the
+      // turn. Fall through to the tool's `computeContextWindow()` which uses a
+      // last-resort heuristic. The previous "running totals across tasks" path
+      // was removed — it relied on subtracting prior tasks' input_tokens, but
+      // each turn.completed.input_tokens already includes the full transcript,
+      // so the delta represents "new content this turn," not occupancy.
       if (patchData.computed_context_window === undefined && tool.computeContextWindow) {
         try {
           const contextWindow = await tool.computeContextWindow(
@@ -508,7 +595,7 @@ export async function executeToolTask(params: {
     console.error(`[${toolName}] Execution failed:`, err);
 
     // Capture git SHA at task end (even for failed tasks)
-    const shaAtEnd = await captureGitStateAtTaskEnd(client, sessionId);
+    const gitStateAtEnd = await captureGitStateForSession(client, sessionId, 'end');
 
     // Build patch data
     const patchData: Partial<Task> = {
@@ -521,10 +608,10 @@ export async function executeToolTask(params: {
 
     // Add git_state if we captured a SHA
     // Note: This will be deep-merged with existing git_state by the repository layer
-    if (shaAtEnd) {
+    if (gitStateAtEnd) {
       // @ts-expect-error - Partial update of nested git_state object is handled by repository deep merge
       patchData.git_state = {
-        sha_at_end: shaAtEnd,
+        sha_at_end: gitStateAtEnd.sha,
       };
     }
 

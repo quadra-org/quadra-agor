@@ -4,7 +4,7 @@
  * Covers:
  *  - validateGitRef() rejects option-injection / whitespace / empty refs
  *    and accepts well-formed refs.
- *  - createWorktree() argv contains a `--` separator before positional
+ *  - createBranch() argv contains a `--` separator before positional
  *    args, so that even if a value slipped past validation it would not
  *    be interpreted as an option by git.
  *  - deleteBranch() refuses to pass attacker-shaped refs to `git branch -D`.
@@ -17,9 +17,14 @@ import { simpleGit } from 'simple-git';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   buildWorktreeAddArgs,
-  createWorktree,
+  createBranch,
   deleteBranch,
+  gitUrlHasUserinfo,
   isLikelyGitToken,
+  redactGitUrlCredentials,
+  scanGitConfigRemoteCredentials,
+  scrubGitConfigRemoteCredentials,
+  stripGitUrlCredentials,
   validateGitRef,
 } from './index';
 
@@ -74,7 +79,7 @@ describe('validateGitRef', () => {
   });
 });
 
-describe('createWorktree — argv hardening', () => {
+describe('createBranch — argv hardening', () => {
   let tmpRoot: string;
   let repoPath: string;
 
@@ -90,24 +95,24 @@ describe('createWorktree — argv hardening', () => {
 
   it('rejects attacker-shaped refs before reaching git', async () => {
     const wt = path.join(tmpRoot, 'wt');
-    await expect(
-      createWorktree(repoPath, wt, '--upload-pack=/tmp/x', false, false)
-    ).rejects.toThrow(/Invalid git ref/);
-    await expect(createWorktree(repoPath, wt, '-foo', false, false)).rejects.toThrow(
+    await expect(createBranch(repoPath, wt, '--upload-pack=/tmp/x', false, false)).rejects.toThrow(
       /Invalid git ref/
     );
-    await expect(createWorktree(repoPath, wt, 'bad\nref', false, false)).rejects.toThrow(
+    await expect(createBranch(repoPath, wt, '-foo', false, false)).rejects.toThrow(
       /Invalid git ref/
     );
-    await expect(createWorktree(repoPath, wt, '', false, false)).rejects.toThrow(/Invalid git ref/);
+    await expect(createBranch(repoPath, wt, 'bad\nref', false, false)).rejects.toThrow(
+      /Invalid git ref/
+    );
+    await expect(createBranch(repoPath, wt, '', false, false)).rejects.toThrow(/Invalid git ref/);
   });
 
-  it('places `--` before positional path argument in worktree add', async () => {
-    // End-to-end sanity: createWorktree actually succeeds against a real git.
+  it('places `--` before positional path argument in branch add', async () => {
+    // End-to-end sanity: createBranch actually succeeds against a real git.
     // Use createBranch=true with sourceBranch=main, because `main` is already
     // checked out at repoPath, so `git worktree add main` would fail.
     const wt = path.join(tmpRoot, 'wt-ok');
-    await createWorktree(repoPath, wt, 'feat/ok', true, false, 'main');
+    await createBranch(repoPath, wt, 'feat/ok', true, false, 'main');
     const exists = await fs
       .stat(wt)
       .then((s) => s.isDirectory())
@@ -120,14 +125,14 @@ describe('buildWorktreeAddArgs — argv shape', () => {
   it('always inserts `--` before positional arguments', () => {
     // createBranch=false, no sourceBranch
     const basic = buildWorktreeAddArgs({
-      worktreePath: '/tmp/wt',
+      branchPath: '/tmp/wt',
       ref: 'main',
       createBranch: false,
       fetchSucceeded: false,
     });
     const dashIdx = basic.indexOf('--');
     expect(dashIdx).toBeGreaterThanOrEqual(0);
-    // Every positional (worktreePath, ref) must come after `--`.
+    // Every positional (branchPath, ref) must come after `--`.
     expect(basic.indexOf('/tmp/wt')).toBeGreaterThan(dashIdx);
     expect(basic.indexOf('main')).toBeGreaterThan(dashIdx);
   });
@@ -135,7 +140,7 @@ describe('buildWorktreeAddArgs — argv shape', () => {
   it('keeps `-b <ref>` before `--` and positional path after it', () => {
     // createBranch=true — `-b` is an option flag, must be BEFORE `--`.
     const withBranch = buildWorktreeAddArgs({
-      worktreePath: '/tmp/wt',
+      branchPath: '/tmp/wt',
       ref: 'feat/new',
       createBranch: true,
       sourceBranch: 'main',
@@ -147,14 +152,14 @@ describe('buildWorktreeAddArgs — argv shape', () => {
     expect(withBranch.indexOf('-b')).toBeLessThan(dashIdx);
     // Branch name follows `-b` and is also before `--`.
     expect(withBranch.indexOf('feat/new')).toBeLessThan(dashIdx);
-    // worktreePath and the source ref are positionals, must be after `--`.
+    // branchPath and the source ref are positionals, must be after `--`.
     expect(withBranch.indexOf('/tmp/wt')).toBeGreaterThan(dashIdx);
     expect(withBranch.indexOf('origin/main')).toBeGreaterThan(dashIdx);
   });
 
   it('uses local ref (no origin/ prefix) when fetch failed', () => {
     const args = buildWorktreeAddArgs({
-      worktreePath: '/tmp/wt',
+      branchPath: '/tmp/wt',
       ref: 'feat/new',
       createBranch: true,
       sourceBranch: 'main',
@@ -166,7 +171,7 @@ describe('buildWorktreeAddArgs — argv shape', () => {
 
   it('uses tag name verbatim when refType is tag', () => {
     const args = buildWorktreeAddArgs({
-      worktreePath: '/tmp/wt',
+      branchPath: '/tmp/wt',
       ref: 'feat/from-tag',
       createBranch: true,
       sourceBranch: 'v1.2.3',
@@ -196,9 +201,143 @@ describe('isLikelyGitToken — credential helper shape check', () => {
   });
 
   it('accepts well-formed GitHub-style PATs', () => {
-    expect(isLikelyGitToken('ghp_' + 'a'.repeat(36))).toBe(true);
-    expect(isLikelyGitToken('github_pat_' + 'A'.repeat(40))).toBe(true);
+    expect(isLikelyGitToken(`ghp_${'a'.repeat(36)}`)).toBe(true);
+    expect(isLikelyGitToken(`github_pat_${'A'.repeat(40)}`)).toBe(true);
     expect(isLikelyGitToken('a'.repeat(40))).toBe(true);
+  });
+});
+
+describe('credential-bearing remote URL utilities', () => {
+  it('detects, redacts, and strips HTTP(S) userinfo without treating SSH syntax as credentials', () => {
+    const unsafe = 'https://user:REDACTED@example.com/org/repo.git';
+    expect(gitUrlHasUserinfo(unsafe)).toBe(true);
+    expect(redactGitUrlCredentials(unsafe)).toBe('https://<redacted>@example.com/org/repo.git');
+    expect(stripGitUrlCredentials(unsafe)).toBe('https://example.com/org/repo.git');
+
+    expect(gitUrlHasUserinfo('https://user@example.com/org/repo.git')).toBe(true);
+    expect(stripGitUrlCredentials('https://user@example.com/org/repo.git')).toBe(
+      'https://example.com/org/repo.git'
+    );
+
+    const rawAtInUserinfo = 'https://user:PASS@WORD@example.com/org/repo.git';
+    expect(gitUrlHasUserinfo(rawAtInUserinfo)).toBe(true);
+    expect(redactGitUrlCredentials(rawAtInUserinfo)).toBe(
+      'https://<redacted>@example.com/org/repo.git'
+    );
+    expect(stripGitUrlCredentials(rawAtInUserinfo)).toBe('https://example.com/org/repo.git');
+
+    const encodedAtInUserinfo = 'https://user:PASS%40WORD@example.com/org/repo.git';
+    expect(gitUrlHasUserinfo(encodedAtInUserinfo)).toBe(true);
+    expect(redactGitUrlCredentials(encodedAtInUserinfo)).toBe(
+      'https://<redacted>@example.com/org/repo.git'
+    );
+    expect(stripGitUrlCredentials(encodedAtInUserinfo)).toBe('https://example.com/org/repo.git');
+
+    expect(gitUrlHasUserinfo('git@example.com:org/repo.git')).toBe(false);
+    expect(stripGitUrlCredentials('git@example.com:org/repo.git')).toBe(
+      'git@example.com:org/repo.git'
+    );
+    expect(gitUrlHasUserinfo('ssh://git@example.com/org/repo.git')).toBe(false);
+    expect(stripGitUrlCredentials('ssh://git@example.com/org/repo.git')).toBe(
+      'ssh://git@example.com/org/repo.git'
+    );
+    expect(redactGitUrlCredentials('ssh://git@example.com/org/repo.git')).toBe(
+      'ssh://<redacted>@example.com/org/repo.git'
+    );
+  });
+
+  it('scans and repairs remote url and pushurl entries in .git/config', async () => {
+    const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agor-git-remote-sec-'));
+    try {
+      const repoPath = path.join(tmpRoot, 'repo');
+      await fs.mkdir(path.join(repoPath, '.git'), { recursive: true });
+      const configPath = path.join(repoPath, '.git', 'config');
+      await fs.writeFile(
+        configPath,
+        [
+          '[core]',
+          '\trepositoryformatversion = 0',
+          '[remote "origin"]',
+          '\turl = https://user:REDACTED@example.com/org/repo.git',
+          '\tpushurl = https://user:REDACTED@example.com/org/repo-push.git',
+          '[remote "ssh"]',
+          '\turl = git@example.com:org/repo.git',
+          '[remote "ssh-protocol"]',
+          '\turl = ssh://git@example.com/org/repo.git',
+          '',
+        ].join('\n')
+      );
+
+      const scan = await scanGitConfigRemoteCredentials(repoPath);
+      expect(scan.findings).toHaveLength(2);
+      expect(scan.findings.map((f) => `${f.remote}.${f.key}`)).toEqual([
+        'origin.url',
+        'origin.pushurl',
+      ]);
+
+      const scrub = await scrubGitConfigRemoteCredentials(repoPath);
+      expect(scrub.changed).toBe(true);
+      expect(scrub.findings).toHaveLength(2);
+
+      const repaired = await fs.readFile(configPath, 'utf8');
+      expect(repaired).toContain('url = https://example.com/org/repo.git');
+      expect(repaired).toContain('pushurl = https://example.com/org/repo-push.git');
+      expect(repaired).toContain('url = git@example.com:org/repo.git');
+      expect(repaired).toContain('url = ssh://git@example.com/org/repo.git');
+      expect(repaired).not.toContain('user:REDACTED@');
+    } finally {
+      await fs.rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('follows worktree .git pointer files to the shared common config', async () => {
+    const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agor-git-remote-sec-'));
+    try {
+      const baseGit = path.join(tmpRoot, 'base.git');
+      const worktreeGit = path.join(baseGit, 'worktrees', 'feature');
+      const branchPath = path.join(tmpRoot, 'branch');
+      await fs.mkdir(worktreeGit, { recursive: true });
+      await fs.mkdir(branchPath, { recursive: true });
+      await fs.writeFile(path.join(branchPath, '.git'), `gitdir: ${worktreeGit}\n`);
+      await fs.writeFile(path.join(worktreeGit, 'commondir'), '../..\n');
+      await fs.writeFile(
+        path.join(baseGit, 'config'),
+        ['[remote "origin"]', '\turl = https://user:REDACTED@example.com/org/repo.git', ''].join(
+          '\n'
+        )
+      );
+
+      const scan = await scanGitConfigRemoteCredentials(branchPath);
+      expect(scan.findings).toHaveLength(1);
+      expect(scan.findings[0].configPath).toBe(path.join(baseGit, 'config'));
+    } finally {
+      await fs.rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('scans per-worktree config.worktree files', async () => {
+    const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agor-git-remote-sec-'));
+    try {
+      const baseGit = path.join(tmpRoot, 'base.git');
+      const worktreeGit = path.join(baseGit, 'worktrees', 'feature');
+      const branchPath = path.join(tmpRoot, 'branch');
+      await fs.mkdir(worktreeGit, { recursive: true });
+      await fs.mkdir(branchPath, { recursive: true });
+      await fs.writeFile(path.join(branchPath, '.git'), `gitdir: ${worktreeGit}\n`);
+      await fs.writeFile(path.join(worktreeGit, 'commondir'), '../..\n');
+      await fs.writeFile(
+        path.join(worktreeGit, 'config.worktree'),
+        ['[remote "local"]', '\turl = https://user:REDACTED@example.com/org/repo.git', ''].join(
+          '\n'
+        )
+      );
+
+      const scan = await scanGitConfigRemoteCredentials(branchPath);
+      expect(scan.findings).toHaveLength(1);
+      expect(scan.findings[0].configPath).toBe(path.join(worktreeGit, 'config.worktree'));
+    } finally {
+      await fs.rm(tmpRoot, { recursive: true, force: true });
+    }
   });
 });
 

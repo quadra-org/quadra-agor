@@ -47,6 +47,8 @@ export const CommonSchemas = {
     Type.Literal('gemini'),
     Type.Literal('opencode'),
     Type.Literal('copilot'),
+    Type.Literal('claude-code-cli'),
+    Type.Literal('cursor'),
   ]),
 
   // Permission mode enum - union of all native SDK modes
@@ -103,9 +105,10 @@ export const sessionQuerySchema = createQuerySchema(
     status: Type.Optional(CommonSchemas.sessionStatus),
     agentic_tool: Type.Optional(CommonSchemas.agenticTool),
     board_id: Type.Optional(CommonSchemas.uuid),
-    worktree_id: Type.Optional(CommonSchemas.uuid),
+    branch_id: Type.Optional(CommonSchemas.uuid),
     parent_session_id: Type.Optional(CommonSchemas.uuid),
     forked_from_session_id: Type.Optional(CommonSchemas.uuid),
+    schedule_id: Type.Optional(CommonSchemas.uuid),
     created_by: Type.Optional(CommonSchemas.uuid),
     archived: Type.Optional(CommonSchemas.boolean),
     created_at: Type.Optional(CommonSchemas.timestamp),
@@ -122,7 +125,8 @@ export const taskQuerySchema = createQuerySchema(
     session_id: Type.Optional(CommonSchemas.uuid),
     status: Type.Optional(
       Type.Union([
-        Type.Literal('pending'),
+        Type.Literal('queued'),
+        Type.Literal('created'),
         Type.Literal('running'),
         Type.Literal('stopping'),
         Type.Literal('awaiting_permission'),
@@ -139,13 +143,14 @@ export const taskQuerySchema = createQuerySchema(
 );
 
 /**
- * Worktree query schema
+ * Branch query schema
  */
-export const worktreeQuerySchema = createQuerySchema(
+export const branchQuerySchema = createQuerySchema(
   Type.Object({
-    worktree_id: Type.Optional(CommonSchemas.uuid),
+    branch_id: Type.Optional(CommonSchemas.uuid),
     repo_id: Type.Optional(CommonSchemas.uuid),
     board_id: Type.Optional(CommonSchemas.uuid),
+    zone_id: Type.Optional(Type.String({ maxLength: 255 })),
     name: Type.Optional(Type.String({ maxLength: 255 })),
     archived: Type.Optional(CommonSchemas.boolean),
     created_at: Type.Optional(CommonSchemas.timestamp),
@@ -174,6 +179,12 @@ export const userQuerySchema = createQuerySchema(
   Type.Object({
     user_id: Type.Optional(CommonSchemas.uuid),
     email: Type.Optional(Type.String({ maxLength: 255 })),
+    search: Type.Optional(Type.String({ maxLength: 255 })),
+    query: Type.Optional(Type.String({ maxLength: 255 })),
+    q: Type.Optional(Type.String({ maxLength: 255 })),
+    limit: Type.Optional(Type.Integer({ minimum: 0, maximum: 10000 })),
+    skip: Type.Optional(Type.Integer({ minimum: 0, maximum: 10000 })),
+    offset: Type.Optional(Type.Integer({ minimum: 0, maximum: 10000 })),
     role: Type.Optional(
       Type.Union([
         Type.Literal('superadmin'),
@@ -194,7 +205,10 @@ export const userQuerySchema = createQuerySchema(
 export const boardObjectQuerySchema = createQuerySchema(
   Type.Object({
     board_id: Type.Optional(CommonSchemas.uuid),
-    worktree_id: Type.Optional(CommonSchemas.uuid),
+    branch_id: Type.Optional(CommonSchemas.uuid),
+    card_id: Type.Optional(CommonSchemas.uuid),
+    zone_id: Type.Optional(Type.String()),
+    entity_type: Type.Optional(Type.Union([Type.Literal('branch'), Type.Literal('card')])),
     created_at: Type.Optional(CommonSchemas.timestamp),
   })
 );
@@ -247,7 +261,7 @@ export const mcpServerQuerySchema = createQuerySchema(
  */
 export const sessionQueryValidator = getValidator(sessionQuerySchema, queryValidator);
 export const taskQueryValidator = getValidator(taskQuerySchema, queryValidator);
-export const worktreeQueryValidator = getValidator(worktreeQuerySchema, queryValidator);
+export const branchQueryValidator = getValidator(branchQuerySchema, queryValidator);
 export const boardQueryValidator = getValidator(boardQuerySchema, queryValidator);
 export const userQueryValidator = getValidator(userQuerySchema, queryValidator);
 export const boardObjectQueryValidator = getValidator(boardObjectQuerySchema, queryValidator);

@@ -1,18 +1,11 @@
 import type { AgorClient } from '@agor-live/client';
 import { CopyOutlined, DeleteOutlined, KeyOutlined, PlusOutlined } from '@ant-design/icons';
-import {
-  Alert,
-  Button,
-  Input,
-  Modal,
-  message,
-  Popconfirm,
-  Space,
-  Table,
-  Typography,
-  theme,
-} from 'antd';
-import { useCallback, useEffect, useState } from 'react';
+import { Alert, Button, Input, Modal, Popconfirm, Space, Table, Typography, theme } from 'antd';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { copyToClipboard } from '../../utils/clipboard';
+import { useThemedMessage } from '../../utils/message';
+import { filterBySettingsSearch } from '../../utils/settingsSearch';
+import { HighlightMatch } from '../HighlightMatch';
 
 interface ApiKeyEntry {
   id: string;
@@ -34,7 +27,9 @@ export const PersonalApiKeysTab: React.FC<PersonalApiKeysTabProps> = ({ client }
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [newlyCreatedKey, setNewlyCreatedKey] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [searchTerm, setSearchTerm] = useState('');
   const { token } = theme.useToken();
+  const { showSuccess, showError } = useThemedMessage();
 
   const fetchKeys = useCallback(async () => {
     if (!client) return;
@@ -64,7 +59,7 @@ export const PersonalApiKeysTab: React.FC<PersonalApiKeysTabProps> = ({ client }
       setNewKeyName('');
       await fetchKeys();
     } catch (err: unknown) {
-      message.error((err as Error)?.message || 'Failed to create API key');
+      showError((err as Error)?.message || 'Failed to create API key');
     } finally {
       setCreating(false);
     }
@@ -75,18 +70,22 @@ export const PersonalApiKeysTab: React.FC<PersonalApiKeysTabProps> = ({ client }
     setDeletingId(id);
     try {
       await client.service('api/v1/user/api-keys').remove(id);
-      message.success('API key revoked');
+      showSuccess('API key revoked');
       await fetchKeys();
     } catch (err: unknown) {
-      message.error((err as Error)?.message || 'Failed to delete API key');
+      showError((err as Error)?.message || 'Failed to delete API key');
     } finally {
       setDeletingId(null);
     }
   };
 
-  const handleCopy = (text: string) => {
-    navigator.clipboard.writeText(text);
-    message.success('Copied to clipboard');
+  const handleCopy = async (text: string) => {
+    const ok = await copyToClipboard(text);
+    if (ok) {
+      showSuccess('Copied to clipboard');
+    } else {
+      showError('Failed to copy to clipboard');
+    }
   };
 
   const columns = [
@@ -94,6 +93,7 @@ export const PersonalApiKeysTab: React.FC<PersonalApiKeysTabProps> = ({ client }
       title: 'Name',
       dataIndex: 'name',
       key: 'name',
+      render: (name: string) => <HighlightMatch text={name} query={searchTerm} />,
     },
     {
       title: 'Key',
@@ -101,7 +101,8 @@ export const PersonalApiKeysTab: React.FC<PersonalApiKeysTabProps> = ({ client }
       key: 'prefix',
       render: (prefix: string) => (
         <Typography.Text code style={{ fontSize: 12 }}>
-          {prefix}...
+          <HighlightMatch text={prefix} query={searchTerm} />
+          ...
         </Typography.Text>
       ),
     },
@@ -141,24 +142,40 @@ export const PersonalApiKeysTab: React.FC<PersonalApiKeysTabProps> = ({ client }
     },
   ];
 
+  const filteredKeys = useMemo(
+    () =>
+      filterBySettingsSearch(keys, searchTerm, [
+        (key) => key.name,
+        (key) => key.prefix,
+        (key) => key.id,
+        (key) => key.created_at,
+        (key) => key.last_used_at,
+      ]),
+    [keys, searchTerm]
+  );
+
   return (
     <div>
       <Typography.Paragraph type="secondary" style={{ marginBottom: 16 }}>
-        Personal API keys allow you to authenticate with the Agor API from scripts, CI pipelines,
-        and external tools. Keys have the same permissions as your user account.
+        Agor API tokens allow you to authenticate with the Agor API from scripts, CI pipelines, and
+        external tools. Tokens have the same permissions as your user account.
       </Typography.Paragraph>
 
-      <Button
-        type="primary"
-        icon={<PlusOutlined />}
-        onClick={() => setShowCreateModal(true)}
-        style={{ marginBottom: 16 }}
-      >
-        Create New Key
-      </Button>
+      <Space style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between' }}>
+        <Input
+          allowClear
+          placeholder="Search name, prefix, or dates"
+          value={searchTerm}
+          onChange={(event) => setSearchTerm(event.target.value)}
+          style={{ width: 300 }}
+        />
+        <Button type="primary" icon={<PlusOutlined />} onClick={() => setShowCreateModal(true)}>
+          Create New Key
+        </Button>
+      </Space>
 
       <Table
-        dataSource={keys}
+        dataSource={filteredKeys}
         columns={columns}
         rowKey="id"
         loading={loading}
@@ -215,7 +232,7 @@ export const PersonalApiKeysTab: React.FC<PersonalApiKeysTabProps> = ({ client }
         <Alert
           type="warning"
           showIcon
-          message="Copy your API key now"
+          title="Copy your API key now"
           description="This is the only time the full key will be shown. Store it securely."
           style={{ marginBottom: 16 }}
         />

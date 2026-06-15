@@ -7,29 +7,33 @@
 
 import {
   type AgorConfig,
-  getBaseUrl,
   PublicBaseUrlNotConfiguredError,
   requirePublicBaseUrl,
 } from '@agor/core/config';
 import {
   and,
+  BoardRepository,
+  BranchRepository,
   type Database,
   eq,
   inArray,
   MCPServerRepository,
+  SessionMCPServerRepository,
   type SessionMCPServerRow,
   select,
   sessionMcpServers,
+  shortId,
   UserMCPOAuthTokenRepository,
-  WorktreeRepository,
 } from '@agor/core/db';
 import type { Application } from '@agor/core/feathers';
-import { NotAuthenticated } from '@agor/core/feathers';
+import { Forbidden, NotAuthenticated } from '@agor/core/feathers';
 import type {
   AuthenticatedParams,
   HookContext,
+  MCPAuth,
   MCPServerID,
   MessageSource,
+  Params,
   SessionID,
   UserID,
 } from '@agor/core/types';
@@ -49,35 +53,62 @@ import {
   oauth21TokenCache,
   persistOAuthToken,
 } from './oauth-cache.js';
-import type { ArtifactsService } from './services/artifacts.js';
 import { createArtifactsService } from './services/artifacts.js';
 import { createBoardCommentsService } from './services/board-comments.js';
 import { createBoardObjectsService } from './services/board-objects.js';
+import { setupBoardOwnersService } from './services/board-owners.js';
 import { createBoardsService } from './services/boards.js';
+import { setupBranchOwnersService } from './services/branch-owners.js';
+import { createBranchesService } from './services/branches.js';
 import { createCardTypesService } from './services/card-types.js';
 import { createCardsService } from './services/cards.js';
+import { createCheckAuthService } from './services/check-auth.js';
 import { createConfigService } from './services/config.js';
 import { createContextService } from './services/context.js';
+import { createCopilotModelsService } from './services/copilot-models.js';
+import { createCursorModelsService } from './services/cursor-models.js';
 import { createFileService } from './services/file.js';
 import { createFilesService } from './services/files.js';
 import { createGatewayService } from './services/gateway.js';
 import { createGatewayChannelsService } from './services/gateway-channels.js';
 import { registerGitHubAppSetupRoutes } from './services/github-app-setup.js';
+import {
+  createGroupMembershipsService,
+  createGroupsService,
+  setupBoardGroupGrantsService,
+  setupBranchEffectiveAccessService,
+  setupBranchGroupGrantsService,
+} from './services/groups.js';
+import { createKnowledgeDocumentEditsService } from './services/knowledge-document-edits.js';
+import { createKnowledgeDocumentsService } from './services/knowledge-documents.js';
+import { createKnowledgeGraphService } from './services/knowledge-graph.js';
+import { createKnowledgeIndexingStatusService } from './services/knowledge-indexing.js';
+import { createKnowledgeNamespacesService } from './services/knowledge-namespaces.js';
+import { createKnowledgeReindexService } from './services/knowledge-reindex.js';
+import { createKnowledgeSearchService } from './services/knowledge-search.js';
+import { createKnowledgeSettingsService } from './services/knowledge-settings.js';
+import { createKnowledgeVersionsService } from './services/knowledge-versions.js';
 import { createLeaderboardService } from './services/leaderboard.js';
 import { createMCPServersService } from './services/mcp-servers.js';
 import { createMessagesService } from './services/messages.js';
 import { performOAuthDisconnect } from './services/oauth-disconnect.js';
 import { createReposService } from './services/repos.js';
+import { createSchedulesService } from './services/schedules.js';
 import { createSessionEnvSelectionsService } from './services/session-env-selections.js';
 import { createSessionMCPServersService } from './services/session-mcp-servers.js';
 import { createSessionsService } from './services/sessions.js';
 import { createTasksService } from './services/tasks.js';
+import { createTemplatesService } from './services/templates.js';
 import { TerminalsService } from './services/terminals.js';
 import { createThreadSessionMapService } from './services/thread-session-map.js';
 import { createUsersService } from './services/users.js';
-import { setupWorktreeOwnersService } from './services/worktree-owners.js';
-import { createWorktreesService } from './services/worktrees.js';
+import { userRoomName } from './setup/socketio.js';
+import { appendSystemMessage } from './utils/append-system-message.js';
 import { escapeHtml } from './utils/html.js';
+import {
+  shouldExposeMCPServerSecrets,
+  shouldExposeMCPServerSecretsForSessionToken,
+} from './utils/mcp-header-secrets.js';
 import {
   computeFileHash,
   findCodexSessionFile,
@@ -85,6 +116,7 @@ import {
   getSessionFilePath,
 } from './utils/session-state.js';
 import { pullIfNeeded, pushAsync } from './utils/session-state-hooks.js';
+import { spawnExecutor } from './utils/spawn-executor.js';
 
 /**
  * Interface for dependencies needed by service registration.
@@ -96,10 +128,11 @@ export interface RegisterServicesContext {
   svcEnabled: (group: string) => boolean;
   jwtSecret: string;
   daemonUrl: string;
-  isProduction: boolean;
+  /** True when the daemon is serving the bundled UI itself at /ui (installed agor-live). */
+  bundledUiAvailable: boolean;
   DAEMON_PORT: number;
   UI_PORT: number;
-  worktreeRbacEnabled: boolean;
+  branchRbacEnabled: boolean;
   allowSuperadmin: boolean;
   requireAuth: (context: HookContext) => Promise<HookContext>;
 }
@@ -111,7 +144,7 @@ export interface RegisteredServices {
   sessionsService: SessionsServiceImpl;
   messagesService: MessagesServiceImpl;
   boardsService: BoardsServiceImpl | undefined;
-  worktreeRepository: WorktreeRepository;
+  branchRepository: BranchRepository;
   usersRepository: import('@agor/core/db').UsersRepository;
   sessionsRepository: import('@agor/core/db').SessionRepository;
   sessionMCPServersService: ReturnType<typeof createSessionMCPServersService>;
@@ -125,16 +158,8 @@ export interface RegisteredServices {
  * Register all FeathersJS services on the app.
  */
 export async function registerServices(ctx: RegisterServicesContext): Promise<RegisteredServices> {
-  const {
-    db,
-    app,
-    config,
-    svcEnabled,
-    jwtSecret,
-    daemonUrl,
-    worktreeRbacEnabled,
-    allowSuperadmin,
-  } = ctx;
+  const { db, app, config, svcEnabled, jwtSecret, daemonUrl, branchRbacEnabled, allowSuperadmin } =
+    ctx;
 
   const _superadminOpts = { allowSuperadmin };
 
@@ -179,10 +204,18 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   );
 
   app.use('/tasks', createTasksService(db, app), {
-    // 'failed' is emitted by the prompt route when executor spawn throws so
-    // clients can surface the error instead of silently seeing an idle
-    // session with a ghost task.
-    events: ['tool:start', 'tool:complete', 'thinking:chunk', 'failed'],
+    // Custom events not in this list are dropped at the FeathersJS transport
+    // boundary — they fire on the local EventEmitter but never reach socket
+    // clients. Keep this in sync with every `app.service('tasks').emit(...)`
+    // call site.
+    //   - 'queued': prompt route auto-queues a task (session not idle / queue
+    //      not empty) — UI's queue drawer subscribes to this.
+    //   - 'failed': prompt route reports executor-spawn failures so clients
+    //      surface the error instead of seeing an idle session with a ghost
+    //      task.
+    //   - 'tool:start' / 'tool:complete' / 'thinking:chunk': forwarded from
+    //      the executor for live tool/thinking visualization.
+    events: ['queued', 'tool:start', 'tool:complete', 'thinking:chunk', 'failed'],
   });
   if (svcEnabled('leaderboard')) {
     app.use('/leaderboard', createLeaderboardService(db));
@@ -212,7 +245,6 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
       'thinking:chunk',
       'thinking:end',
       'permission_resolved',
-      'input_resolved',
     ],
     docs: {
       description: 'Conversation messages within AI agent sessions',
@@ -242,21 +274,30 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   // ============================================================================
 
   if (svcEnabled('boards')) {
-    app.use('/boards', createBoardsService(db), {
-      methods: [
-        'find',
-        'get',
-        'create',
-        'update',
-        'patch',
-        'remove',
-        'toBlob',
-        'fromBlob',
-        'toYaml',
-        'fromYaml',
-        'clone',
-      ],
-    });
+    app.use(
+      '/boards',
+      createBoardsService(db, (boardObject) => {
+        app.service('board-objects').emit('patched', boardObject);
+      }),
+      {
+        methods: [
+          'find',
+          'get',
+          'create',
+          'update',
+          'patch',
+          'remove',
+          'toBlob',
+          'fromBlob',
+          'toYaml',
+          'fromYaml',
+          'clone',
+          'setPrimaryAssistant',
+          'clearPrimaryAssistant',
+          'ensureAssistantWelcomeNote',
+        ],
+      }
+    );
     app.use('/board-objects', createBoardObjectsService(db));
   }
 
@@ -268,25 +309,12 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   }
 
   if (svcEnabled('artifacts')) {
-    app.use('/artifacts', createArtifactsService(db, app));
-
-    // Detect self-hosted Sandpack bundler
-    {
-      const pathMod = await import('node:path');
-      const { fileURLToPath: toPath } = await import('node:url');
-      const { existsSync: exists } = await import('node:fs');
-      const dir =
-        typeof __dirname !== 'undefined' ? __dirname : pathMod.dirname(toPath(import.meta.url));
-      const sandpackPath = pathMod.resolve(dir, '../static/sandpack');
-      if (exists(sandpackPath)) {
-        const baseUrl = await getBaseUrl();
-        const origin = new URL(baseUrl).origin;
-        const bundlerURL = `${origin}/static/sandpack/`;
-        const artifactsService = app.service('artifacts') as unknown as ArtifactsService;
-        artifactsService.selfHostedBundlerURL = bundlerURL;
-        console.log(`🧩 Self-hosted Sandpack bundler detected: ${bundlerURL}`);
-      }
-    }
+    // `agor-query` is the runtime-introspection fan-out event (daemon →
+    // viewer's browser tab). Feathers' default `serviceEvents` is just
+    // ['created','updated','patched','removed'], so without this it
+    // fires locally on the server's EventEmitter and never reaches any
+    // socket. See queryArtifactRuntime in services/artifacts.ts.
+    app.use('/artifacts', createArtifactsService(db, app), { events: ['agor-query'] });
   }
 
   if (svcEnabled('boards')) {
@@ -294,33 +322,111 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   }
 
   // ============================================================================
-  // Worktrees, repos
+  // Branches, repos
   // ============================================================================
 
-  app.use('/worktrees', createWorktreesService(db, app));
+  app.use('/branches', createBranchesService(db, app), {
+    methods: [
+      'find',
+      'get',
+      'create',
+      'update',
+      'patch',
+      'remove',
+      'initializeUnixGroup',
+      'ensureAssistantKnowledgeNamespace',
+    ],
+  });
 
-  console.log(`[RBAC] Worktree RBAC ${worktreeRbacEnabled ? 'Enabled' : 'Disabled'}`);
+  console.log(`[RBAC] Branch RBAC ${branchRbacEnabled ? 'Enabled' : 'Disabled'}`);
   console.log(`[RBAC] Superadmin bypass ${allowSuperadmin ? 'Enabled' : 'Disabled'}`);
 
   if (
-    worktreeRbacEnabled &&
-    !app.services['worktrees/:id/owners'] &&
-    !app.services['worktrees/:id/owners/:userId']
+    branchRbacEnabled &&
+    !app.services['branches/:id/owners'] &&
+    !app.services['branches/:id/owners/:userId']
   ) {
-    const worktreeRepo = new WorktreeRepository(db);
-    setupWorktreeOwnersService(app, worktreeRepo, {
+    const branchRepo = new BranchRepository(db);
+    setupBranchOwnersService(app, branchRepo, {
       jwtSecret,
       daemonUser: config.daemon?.unix_user,
       allowSuperadmin,
     });
   }
 
-  if (worktreeRbacEnabled) {
+  if (branchRbacEnabled) {
     const daemonUser = config.daemon?.unix_user || 'agor';
     console.log(`[Unix Integration] Executor-based sync enabled (daemon user: ${daemonUser})`);
   }
 
-  app.use('/repos', createReposService(db, app));
+  app.use('/groups', createGroupsService(db), {
+    methods: ['find', 'get', 'create', 'patch', 'remove'],
+  });
+  app.use('/group-memberships', createGroupMembershipsService(db), {
+    methods: ['find', 'create', 'remove'],
+  });
+  setupBranchEffectiveAccessService(app, new BranchRepository(db));
+  if (branchRbacEnabled) {
+    setupBoardOwnersService(app, new BoardRepository(db));
+    setupBoardGroupGrantsService(app, db);
+    setupBranchGroupGrantsService(app, db, new BranchRepository(db));
+  }
+
+  app.use('/repos', createReposService(db, app), {
+    methods: ['find', 'get', 'create', 'update', 'patch', 'remove', 'initializeUnixGroup'],
+  });
+
+  // First-class schedules. RBAC hooks wired in register-hooks.ts.
+  // See docs/internal/schedules-first-class-design-2026-05-24.md §4.4.
+  app.use('/schedules', createSchedulesService(db));
+
+  // ============================================================================
+  // Knowledge (backend/data foundations)
+  // ============================================================================
+
+  app.use('/kb/namespaces', createKnowledgeNamespacesService(db), {
+    methods: [
+      'find',
+      'get',
+      'create',
+      'update',
+      'patch',
+      'remove',
+      'saveWithAcl',
+      'listAcl',
+      'setAcl',
+      'removeAcl',
+    ],
+  });
+  const knowledgeDocumentsService = createKnowledgeDocumentsService(db, app);
+  app.use('/kb/documents', knowledgeDocumentsService, {
+    methods: ['find', 'get', 'create', 'update', 'patch', 'remove', 'getDocument', 'putDocument'],
+  });
+  app.use(
+    '/kb/document-edits',
+    createKnowledgeDocumentEditsService(db, app, knowledgeDocumentsService),
+    {
+      methods: ['create'],
+    }
+  );
+  app.use('/kb/versions', createKnowledgeVersionsService(db), {
+    methods: ['find'],
+  });
+  app.use('/kb/search', createKnowledgeSearchService(db), {
+    methods: ['find', 'create'],
+  });
+  app.use('/kb/settings', createKnowledgeSettingsService(db, app), {
+    methods: ['find', 'create', 'patch'],
+  });
+  app.use('/kb/indexing/status', createKnowledgeIndexingStatusService(db, app), {
+    methods: ['find'],
+  });
+  app.use('/kb/indexing/reindex', createKnowledgeReindexService(db, app), {
+    methods: ['create'],
+  });
+  app.use('/kb/graph', createKnowledgeGraphService(db), {
+    methods: ['find', 'create', 'link', 'neighbors'],
+  });
 
   // ============================================================================
   // MCP Servers (conditionally registered)
@@ -345,8 +451,7 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
       methods: ['create', 'routeMessage'],
     });
 
-    const isProduction = ctx.isProduction;
-    const uiUrl = isProduction ? `${daemonUrl}/ui` : `http://localhost:${ctx.UI_PORT}`;
+    const uiUrl = ctx.bundledUiAvailable ? `${daemonUrl}/ui` : `http://localhost:${ctx.UI_PORT}`;
     registerGitHubAppSetupRoutes(app, { uiUrl, daemonUrl, db });
   }
 
@@ -360,21 +465,48 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
 
   app.use('/config/resolve-api-key', {
     // biome-ignore lint/suspicious/noExplicitAny: taskId is branded UUID at runtime
-    async create(data: any) {
-      return await configService.resolveApiKey(data);
+    async create(data: any, params?: Params) {
+      return await configService.resolveApiKey(data, params);
+    },
+  });
+  app.service('/config/resolve-api-key').hooks({
+    before: {
+      create: [ctx.requireAuth],
     },
   });
 
-  const worktreeRepository = new WorktreeRepository(db);
+  app.use('/check-auth', createCheckAuthService(db));
+  app.service('/check-auth').hooks({ before: { create: [ctx.requireAuth] } });
+
+  // Copilot dynamic model discovery via @github/copilot-sdk's listModels().
+  // Resolves the GitHub token per-user (with config.yaml + env fallback)
+  // and falls back to the static list at @agor/core/models/copilot if no
+  // token is configured or the SDK call fails.
+  app.use('/copilot-models', createCopilotModelsService(db));
+  app.service('/copilot-models').hooks({ before: { find: [ctx.requireAuth] } });
+
+  // Cursor dynamic model discovery via @cursor/sdk's Cursor.models.list().
+  // Resolves CURSOR_API_KEY per-user (with config.yaml + env fallback) and
+  // falls back to composer-latest if no key is configured or the SDK call fails.
+  app.use('/cursor-models', createCursorModelsService(db));
+  app.service('/cursor-models').hooks({ before: { find: [ctx.requireAuth] } });
+
+  const branchRepository = new BranchRepository(db);
   const { UsersRepository, SessionRepository } = await import('@agor/core/db');
   const usersRepository = new UsersRepository(db);
   const sessionsRepository = new SessionRepository(db);
 
   if (svcEnabled('file_browser')) {
-    app.use('/context', createContextService(worktreeRepository));
-    app.use('/file', createFileService(worktreeRepository));
-    app.use('/files', createFilesService(db));
+    app.use('/context', createContextService(branchRepository));
+    app.use('/file', createFileService(branchRepository));
+    app.use('/files', createFilesService(db, app));
   }
+
+  // Server-side Handlebars renderer. UI calls POST /templates so the browser
+  // bundle can stay free of Handlebars (which uses `new Function` and would
+  // require CSP `script-src 'unsafe-eval'`).
+  app.use('/templates', createTemplatesService());
+  app.service('/templates').hooks({ before: { create: [ctx.requireAuth] } });
 
   const terminalsService = svcEnabled('terminals') ? new TerminalsService(app, db) : null;
   if (terminalsService) {
@@ -394,7 +526,7 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   // Unlike /session-mcp-servers, selection NAMES are a confidentiality
   // concern (they reveal which of the session creator's private env vars
   // are wired into a session), so we deliberately do NOT surface a
-  // queryable read here — a worktree collaborator with `view`/`prompt`
+  // queryable read here — a branch collaborator with `view`/`prompt`
   // must not see another user's selection names.
   //
   // Reads go exclusively through `/sessions/:id/env-selections`, which
@@ -460,7 +592,12 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   // ============================================================================
 
   const usersService = createUsersService(db);
-  app.use('/users', usersService);
+  // UsersService implements find/get/create/patch/remove (no `update`), plus
+  // the custom `getGitEnvironment`. Listing `update` here makes Feathers' hook
+  // wiring throw "Can not apply hooks. 'update' is not a function" at startup.
+  app.use('/users', usersService, {
+    methods: ['find', 'get', 'create', 'patch', 'remove', 'getGitEnvironment'],
+  });
 
   // Bootstrap superadmin users
   await bootstrapSuperadminUsers(config, usersService, allowSuperadmin);
@@ -475,7 +612,7 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
     sessionsService,
     messagesService,
     boardsService,
-    worktreeRepository,
+    branchRepository,
     usersRepository,
     sessionsRepository,
     sessionMCPServersService,
@@ -509,10 +646,6 @@ function createExecuteHandler(
     // biome-ignore lint/suspicious/noExplicitAny: FeathersJS params type varies by context
     params: any
   ) => {
-    const { spawn } = await import('node:child_process');
-    const path = await import('node:path');
-    const { fileURLToPath } = await import('node:url');
-
     const session = await sessionsService.get(sessionId, params);
     if (!session) {
       throw new Error(`Session ${sessionId} not found`);
@@ -541,61 +674,41 @@ function createExecuteHandler(
     if (!appWithExecutor.sessionTokenService) {
       throw new Error('Session token service not initialized');
     }
+    // Hook chain enforces auth before we get here.
     const sessionToken = await appWithExecutor.sessionTokenService.generateToken(
       sessionId,
-      (params as AuthenticatedParams).user?.user_id || 'anonymous'
+      (params as AuthenticatedParams).user!.user_id,
+      {
+        taskId: data.taskId,
+        branchId: session.branch_id,
+        // Executor JWTs authenticate on every daemon API call over the runtime
+        // connection, so low per-call max-use limits make normal execution
+        // fail after startup. Keep expiry + in-memory revocation for these
+        // scoped runtime credentials; revisit max-use semantics once they can
+        // be counted per connection/task instead of per service method.
+        maxUses: -1,
+      }
     );
 
     const taskId = data.taskId;
 
-    // Get worktree path
+    // Get branch path
     let cwd = process.cwd();
-    if (session.worktree_id) {
+    if (session.branch_id) {
       try {
-        const worktree = await app.service('worktrees').get(session.worktree_id, params);
-        cwd = worktree.path;
+        const branch = await app.service('branches').get(session.branch_id, params);
+        cwd = branch.path;
       } catch (error) {
-        console.warn(`Could not get worktree path for ${session.worktree_id}:`, error);
+        console.warn(`Could not get branch path for ${session.branch_id}:`, error);
       }
     }
-
-    // Validate cwd exists before spawning — a non-existent cwd causes
-    // spawn to emit ENOENT which is confusingly reported as "spawn node ENOENT"
-    const { existsSync: cwdExists } = await import('node:fs');
-    if (!cwdExists(cwd)) {
-      throw new Error(
-        `Worktree path does not exist on this host: ${cwd}. ` +
-          `The target worktree may have been created on a different machine. ` +
-          `Create the worktree on this host or change the gateway channel's target worktree.`
-      );
-    }
-
-    // Find executor binary
-    const dirname =
-      typeof __dirname !== 'undefined' ? __dirname : path.dirname(fileURLToPath(import.meta.url));
-    const { existsSync } = await import('node:fs');
-    const possiblePaths = [
-      path.join(dirname, '../executor/cli.js'),
-      path.join(dirname, '../../../packages/executor/bin/agor-executor'),
-      path.join(dirname, '../../../packages/executor/dist/cli.js'),
-    ];
-    const executorPath = possiblePaths.find((p) => existsSync(p));
-    if (!executorPath) {
-      throw new Error(
-        `Executor binary not found. Tried:\n${possiblePaths.map((p) => `  - ${p}`).join('\n')}`
-      );
-    }
-    console.log(`[Daemon] Using executor at: ${executorPath}`);
 
     // Determine Unix user for executor
     const {
       resolveUnixUserForImpersonation,
       validateResolvedUnixUser,
       UnixUserNotFoundError,
-      buildSpawnArgs,
       getHomedirFromUsername,
-      prepareImpersonationEnv,
-      attachEnvFileCleanup,
     } = await import('@agor/core/unix');
 
     const unixUserMode = (config.execution?.unix_user_mode ?? 'simple') as UnixUserMode;
@@ -603,7 +716,7 @@ function createExecuteHandler(
     const sessionUnixUser = session.unix_username;
 
     console.log('[Daemon] Determining executor Unix user:', {
-      sessionId: session.session_id.slice(0, 8),
+      sessionId: shortId(session.session_id),
       unixUserMode,
       sessionUnixUser,
       configExecutorUser,
@@ -668,25 +781,23 @@ function createExecuteHandler(
       }
     }
 
+    // SDK spawn: scope per-tool credentials to the session's agentic_tool, so
+    // an Anthropic key on the user never leaks into a Codex/Gemini executor.
     const executorEnv = await createUserProcessEnvironment(
       userId,
       db,
       undefined,
       !!executorUnixUser,
       gatewayEnv,
-      sessionId as SessionID
+      sessionId as SessionID,
+      session.agentic_tool
     );
 
     // Validate required user environment variables
-    const { SessionRepository: SessRepo, MessagesRepository: _MsgRepo } = await import(
-      '@agor/core/db'
-    );
-    const sessionsRepository = new SessRepo(db);
     const requiredUserEnvVars = config.execution?.required_user_env_vars;
     if (requiredUserEnvVars && requiredUserEnvVars.length > 0) {
       const missingVars = requiredUserEnvVars.filter((v: string) => !executorEnv[v]);
       if (missingVars.length > 0) {
-        const { generateId } = await import('@agor/core/db');
         const missingList = missingVars.map((v: string) => `\`${v}\``).join(', ');
         const errorContent = [
           `**Missing required environment variables:** ${missingList}`,
@@ -697,19 +808,14 @@ function createExecuteHandler(
           '',
           'This is a one-time setup — once configured, this message will not appear again.',
         ].join('\n');
-        const messagesService = app.service('messages') as unknown as MessagesServiceImpl;
-        const systemMessage = {
-          message_id: generateId() as import('@agor/core/types').Message['message_id'],
-          session_id: sessionId as import('@agor/core/types').Message['session_id'],
-          task_id: data.taskId as import('@agor/core/types').Message['task_id'],
-          type: 'system' as const,
-          role: 'system' as import('@agor/core/types').Message['role'],
+        await appendSystemMessage({
+          app,
+          db,
+          sessionId,
+          taskId: data.taskId,
           content: errorContent,
-          content_preview: `Missing required env vars: ${missingVars.join(', ')}`,
-          index: await sessionsRepository.countMessages(sessionId),
-          timestamp: new Date().toISOString(),
-        };
-        await messagesService.create(systemMessage);
+          contentPreview: `Missing required env vars: ${missingVars.join(', ')}`,
+        });
         throw new Error(`Missing required environment variables: ${missingVars.join(', ')}`);
       }
     }
@@ -726,34 +832,18 @@ function createExecuteHandler(
         sessionId,
         taskId,
         prompt: data.prompt,
-        tool: session.agentic_tool as 'claude-code' | 'gemini' | 'codex' | 'opencode' | 'copilot',
+        tool: session.agentic_tool as
+          | 'claude-code'
+          | 'gemini'
+          | 'codex'
+          | 'opencode'
+          | 'copilot'
+          | 'cursor',
         permissionMode: permissionModeForPayload as 'ask' | 'auto' | 'allow-all' | undefined,
         cwd,
         messageSource: data.messageSource,
       },
     };
-
-    // Route secret-looking env vars through an on-disk env file owned by the
-    // target user (mode 0600) so API keys/tokens never appear in argv.
-    const prepared = executorUnixUser
-      ? prepareImpersonationEnv({ asUser: executorUnixUser, env: executorEnv })
-      : { inlineEnv: undefined, envFilePath: undefined };
-
-    const { cmd, args } = buildSpawnArgs('node', [executorPath, '--stdin'], {
-      asUser: executorUnixUser || undefined,
-      env: executorUnixUser ? prepared.inlineEnv : undefined,
-      envFilePath: prepared.envFilePath,
-    });
-
-    if (executorUnixUser) {
-      console.log(
-        `[Daemon] Spawning executor as user=${executorUnixUser}${
-          prepared.envFilePath ? ' (secrets in env-file)' : ''
-        }`
-      );
-    } else {
-      console.log(`[Daemon] Spawning executor as current user (no impersonation)`);
-    }
 
     // Stateless FS mode: resolve executor home dir for session file path
     const executorHomeDir = executorUnixUser ? getHomedirFromUsername(executorUnixUser) : undefined;
@@ -765,7 +855,7 @@ function createExecuteHandler(
           db,
           sessionId,
           sdkSessionId: session.sdk_session_id,
-          worktreePath: cwd,
+          branchPath: cwd,
           tool: session.agentic_tool,
           executorHomeDir,
         });
@@ -778,163 +868,149 @@ function createExecuteHandler(
       }
     }
 
-    const executorProcess = spawn(cmd, args, {
+    const logPrefix = `[Executor ${shortId(sessionId)}]`;
+
+    spawnExecutor(executorPayload, {
       cwd,
-      env: executorUnixUser ? undefined : executorEnv,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-
-    // Handle spawn errors (e.g. ENOENT if node binary or cwd not found)
-    // Without this handler, the 'error' event becomes an uncaught exception
-    // that crashes the daemon.
-    executorProcess.on('error', (error) => {
-      console.error(
-        `❌ [Executor ${sessionId.slice(0, 8)}] Spawn error: ${error.message} (cwd: ${cwd})`
-      );
-      untrackExecutorProcess(sessionId);
-    });
-
-    // Safety-net cleanup for the env file. The inner bash script `rm -f`s
-    // the file before exec in the normal path, so this only fires if sudo
-    // or bash failed to launch at all, or `set -eu` aborted the source
-    // step. Uses sudo when asUser is set so it works under sticky /tmp.
-    attachEnvFileCleanup(executorProcess, {
-      envFilePath: prepared.envFilePath,
       asUser: executorUnixUser || undefined,
-    });
+      preparedEnv: executorEnv,
+      logPrefix,
+      templateVariables: {
+        session_id: sessionId,
+        task_id: taskId,
+        unix_user: executorUnixUser || undefined,
+      },
+      onSpawn: (child) => {
+        if (child.pid) {
+          trackExecutorProcess(sessionId, child.pid);
+          console.log(`${logPrefix} PID: ${child.pid}`);
+        }
+      },
+      onExit: async (code) => {
+        console.log(`${logPrefix} Exited with code ${code}`);
+        untrackExecutorProcess(sessionId);
 
-    if (executorProcess.pid) {
-      trackExecutorProcess(sessionId, executorProcess.pid);
-      console.log(`[Executor ${sessionId.slice(0, 8)}] PID: ${executorProcess.pid}`);
-    }
+        // Safety net: check if task is still running
+        try {
+          const currentSession = await app.service('sessions').get(sessionId, params);
+          const latestTaskId = currentSession.tasks?.[currentSession.tasks.length - 1];
 
-    executorProcess.stdin?.write(JSON.stringify(executorPayload));
-    executorProcess.stdin?.end();
+          if (latestTaskId && latestTaskId !== taskId) {
+            console.log(
+              `⏭️ [Executor] Task ${shortId(taskId)} is not the latest (latest: ${shortId(latestTaskId)}), skipping safety net`
+            );
+          } else if (
+            currentSession.status === SessionStatus.RUNNING ||
+            currentSession.status === SessionStatus.AWAITING_PERMISSION ||
+            currentSession.status === SessionStatus.AWAITING_INPUT ||
+            currentSession.status === SessionStatus.STOPPING ||
+            currentSession.status === SessionStatus.TIMED_OUT
+          ) {
+            try {
+              const currentTask = await app.service('tasks').get(taskId, params);
+              const isTaskStillActive =
+                currentTask.status === TaskStatus.RUNNING ||
+                currentTask.status === 'awaiting_permission' ||
+                currentTask.status === 'awaiting_input' ||
+                currentTask.status === 'stopping' ||
+                currentTask.status === 'timed_out';
 
-    executorProcess.stdout?.on('data', (data) => {
-      console.log(`[Executor ${sessionId.slice(0, 8)}] ${data.toString().trim()}`);
-    });
-    executorProcess.stderr?.on('data', (data) => {
-      console.error(`[Executor ${sessionId.slice(0, 8)}] ${data.toString().trim()}`);
-    });
-
-    executorProcess.on('exit', async (code) => {
-      console.log(`[Executor ${sessionId.slice(0, 8)}] Exited with code ${code}`);
-      untrackExecutorProcess(sessionId);
-
-      // Safety net: check if task is still running
-      try {
-        const currentSession = await app.service('sessions').get(sessionId, params);
-        const latestTaskId = currentSession.tasks?.[currentSession.tasks.length - 1];
-
-        if (latestTaskId && latestTaskId !== taskId) {
-          console.log(
-            `⏭️ [Executor] Task ${taskId.slice(0, 8)} is not the latest (latest: ${latestTaskId.slice(0, 8)}), skipping safety net`
-          );
-        } else if (
-          currentSession.status === SessionStatus.RUNNING ||
-          currentSession.status === SessionStatus.AWAITING_PERMISSION ||
-          currentSession.status === SessionStatus.AWAITING_INPUT ||
-          currentSession.status === SessionStatus.STOPPING ||
-          currentSession.status === SessionStatus.TIMED_OUT
-        ) {
-          try {
-            const currentTask = await app.service('tasks').get(taskId, params);
-            const isTaskStillActive =
-              currentTask.status === TaskStatus.RUNNING ||
-              currentTask.status === 'awaiting_permission' ||
-              currentTask.status === 'awaiting_input' ||
-              currentTask.status === 'stopping' ||
-              currentTask.status === 'timed_out';
-
-            if (isTaskStillActive) {
-              await app.service('tasks').patch(taskId, { status: TaskStatus.FAILED }, params);
-              console.log(
-                `✅ [Executor] Task ${taskId.slice(0, 8)} marked as FAILED after executor exit (code: ${code})`
-              );
-            } else {
-              console.log(
-                `⚠️  [Executor] Task ${taskId.slice(0, 8)} already ${currentTask.status}, but session still ${currentSession.status} — repairing session state`
+              if (isTaskStillActive) {
+                await app.service('tasks').patch(
+                  taskId,
+                  {
+                    status: TaskStatus.FAILED,
+                    error_message: `Executor exited unexpectedly with code ${code ?? 'unknown'}.`,
+                  },
+                  params
+                );
+                console.log(
+                  `✅ [Executor] Task ${shortId(taskId)} marked as FAILED after executor exit (code: ${code})`
+                );
+              } else {
+                console.log(
+                  `⚠️  [Executor] Task ${shortId(taskId)} already ${currentTask.status}, but session still ${currentSession.status} — repairing session state`
+                );
+                await app
+                  .service('sessions')
+                  .patch(sessionId, { status: SessionStatus.IDLE, ready_for_prompt: true }, params);
+              }
+            } catch (taskError) {
+              console.error(
+                `⚠️  [Executor] Failed to mark task ${shortId(taskId)} as FAILED, falling back to session IDLE update:`,
+                taskError
               );
               await app
                 .service('sessions')
                 .patch(sessionId, { status: SessionStatus.IDLE, ready_for_prompt: true }, params);
-            }
-          } catch (taskError) {
-            console.error(
-              `⚠️  [Executor] Failed to mark task ${taskId.slice(0, 8)} as FAILED, falling back to session IDLE update:`,
-              taskError
-            );
-            await app
-              .service('sessions')
-              .patch(sessionId, { status: SessionStatus.IDLE, ready_for_prompt: true }, params);
-            console.log(
-              `✅ [Executor] Session ${sessionId.slice(0, 8)} status updated to IDLE after executor exit (was: ${currentSession.status})`
-            );
-          }
-        } else {
-          console.log(
-            `ℹ️  [Executor] Session ${sessionId.slice(0, 8)} already in ${currentSession.status} state, skipping IDLE update`
-          );
-        }
-      } catch (error) {
-        console.error(`❌ [Executor] Failed to handle executor exit:`, error);
-      }
-
-      // Stateless FS mode: serialize session file to DB after executor exits
-      if (config.execution?.stateless_fs_mode) {
-        try {
-          // Re-fetch session to get sdk_session_id (may have been set during execution)
-          const freshSession = await app.service('sessions').get(sessionId, params);
-          if (freshSession.sdk_session_id) {
-            pushAsync({
-              db,
-              sessionId,
-              worktreeId: freshSession.worktree_id,
-              taskId,
-              sdkSessionId: freshSession.sdk_session_id,
-              worktreePath: cwd,
-              tool: freshSession.agentic_tool,
-              executorHomeDir,
-            });
-
-            // Also compute and write session_md5 to the task record
-            try {
-              let filePath: string;
-              if (freshSession.agentic_tool === 'codex') {
-                const codexHome = getCodexHome(sessionId);
-                const found = await findCodexSessionFile(codexHome, freshSession.sdk_session_id);
-                filePath = found || '';
-              } else {
-                filePath = getSessionFilePath(
-                  freshSession.agentic_tool,
-                  cwd,
-                  freshSession.sdk_session_id,
-                  executorHomeDir
-                );
-              }
-              if (filePath) {
-                const md5 = await computeFileHash(filePath);
-                if (md5) {
-                  await app.service('tasks').patch(taskId, { session_md5: md5 }, params);
-                }
-              }
-            } catch (md5Err) {
-              console.error(
-                '[stateless-fs] Failed to write session_md5 to task:',
-                md5Err instanceof Error ? md5Err.message : md5Err
+              console.log(
+                `✅ [Executor] Session ${shortId(sessionId)} status updated to IDLE after executor exit (was: ${currentSession.status})`
               );
             }
+          } else {
+            console.log(
+              `ℹ️  [Executor] Session ${shortId(sessionId)} already in ${currentSession.status} state, skipping IDLE update`
+            );
           }
-        } catch (pushErr) {
-          console.error(
-            '[stateless-fs] pushAsync setup failed:',
-            pushErr instanceof Error ? pushErr.message : pushErr
-          );
+        } catch (error) {
+          console.error(`❌ [Executor] Failed to handle executor exit:`, error);
         }
-      }
 
-      appWithExecutor.sessionTokenService?.revokeToken(sessionToken);
+        // Stateless FS mode: serialize session file to DB after executor exits
+        if (config.execution?.stateless_fs_mode) {
+          try {
+            // Re-fetch session to get sdk_session_id (may have been set during execution)
+            const freshSession = await app.service('sessions').get(sessionId, params);
+            if (freshSession.sdk_session_id) {
+              pushAsync({
+                db,
+                sessionId,
+                branchId: freshSession.branch_id,
+                taskId,
+                sdkSessionId: freshSession.sdk_session_id,
+                branchPath: cwd,
+                tool: freshSession.agentic_tool,
+                executorHomeDir,
+              });
+
+              // Also compute and write session_md5 to the task record
+              try {
+                let filePath: string;
+                if (freshSession.agentic_tool === 'codex') {
+                  const codexHome = getCodexHome(executorHomeDir);
+                  const found = await findCodexSessionFile(codexHome, freshSession.sdk_session_id);
+                  filePath = found || '';
+                } else {
+                  filePath = getSessionFilePath(
+                    freshSession.agentic_tool,
+                    cwd,
+                    freshSession.sdk_session_id,
+                    executorHomeDir
+                  );
+                }
+                if (filePath) {
+                  const md5 = await computeFileHash(filePath);
+                  if (md5) {
+                    await app.service('tasks').patch(taskId, { session_md5: md5 }, params);
+                  }
+                }
+              } catch (md5Err) {
+                console.error(
+                  '[stateless-fs] Failed to write session_md5 to task:',
+                  md5Err instanceof Error ? md5Err.message : md5Err
+                );
+              }
+            }
+          } catch (pushErr) {
+            console.error(
+              '[stateless-fs] pushAsync setup failed:',
+              pushErr instanceof Error ? pushErr.message : pushErr
+            );
+          }
+        }
+
+        appWithExecutor.sessionTokenService?.revokeToken(sessionToken);
+      },
     });
 
     return {
@@ -1060,10 +1136,34 @@ async function registerMCPServices(
    *     which need to return the token-validation result in the same HTTP
    *     response. Bounded by {@link AWAIT_TOKEN_TIMEOUT_MS}.
    */
+  /**
+   * Human-readable enumeration of every discovery strategy
+   * `resolveMCPOAuthDiscovery` walks. Kept in sync with the cascade in
+   * `@agor/core/tools/mcp/oauth-mcp-transport.ts` so error messages don't
+   * drift when strategies are added or reordered.
+   */
+  const DISCOVERY_CASCADE_TRIED =
+    'Tried: (1) WWW-Authenticate resource_metadata hint, ' +
+    '(2) /.well-known/oauth-protected-resource (RFC 9728), ' +
+    '(3) /.well-known/oauth-authorization-server at MCP origin (RFC 8414), ' +
+    '(4) /.well-known/openid-configuration at MCP origin (OIDC).';
+
   type StartTwoPhaseOAuthOptions = {
     mcpUrl: string;
     wwwAuthenticate: string;
-    resourceMetadataUrl: string;
+    /**
+     * RFC 9728 Protected Resource Metadata URL. Set when discovery hit the
+     * standard MCP spec path. Mutually exclusive with
+     * `prefetchedAuthServerMetadata` — exactly one must be provided.
+     */
+    resourceMetadataUrl?: string;
+    /**
+     * Pre-discovered Authorization Server metadata, set when discovery hit the
+     * AS-direct fallback (`<mcp-origin>/.well-known/oauth-authorization-server`).
+     * Mutually exclusive with `resourceMetadataUrl` — exactly one must be
+     * provided.
+     */
+    prefetchedAuthServerMetadata?: import('@agor/core/tools/mcp/oauth-mcp-transport').AuthorizationServerMetadata;
     mcpServerId?: string;
     userId?: string;
     oauthMode?: 'per_user' | 'shared';
@@ -1110,12 +1210,27 @@ async function registerMCPServices(
     const baseUrl = await requirePublicBaseUrl();
     const redirectUri = new URL('/mcp-servers/oauth-callback', baseUrl).toString();
 
+    const hasRfc9728 = !!opts.resourceMetadataUrl;
+    const hasAsDirect = !!opts.prefetchedAuthServerMetadata;
+    if (hasRfc9728 === hasAsDirect) {
+      // Both set → ambiguous; neither set → no path forward.
+      throw new Error(
+        'startTwoPhaseMCPOAuthFlow requires exactly one of resourceMetadataUrl ' +
+          '(RFC 9728) or prefetchedAuthServerMetadata (AS-direct discovery), ' +
+          `received resourceMetadataUrl=${hasRfc9728}, prefetchedAuthServerMetadata=${hasAsDirect}.`
+      );
+    }
+
     const context = await startMCPOAuthFlow(opts.wwwAuthenticate, opts.clientId, redirectUri, {
       authorizationUrlOverride: opts.authorizationUrlOverride,
       tokenUrlOverride: opts.tokenUrlOverride,
       clientSecret: opts.clientSecret,
       scope: opts.scope,
       resourceMetadataUrl: opts.resourceMetadataUrl,
+      prefetchedAuthServerMetadata: opts.prefetchedAuthServerMetadata,
+      // Cache key for AS-direct path: use the MCP URL itself (origin matches
+      // what `getCachedOAuth21Token` looks up later).
+      cacheKey: opts.prefetchedAuthServerMetadata ? opts.mcpUrl : undefined,
     });
 
     let tokenPromise: Promise<OAuthTokenResponse> | undefined;
@@ -1244,6 +1359,7 @@ async function registerMCPServices(
             ...pendingFlow,
             clientId: pendingFlow.context.clientId,
             clientSecret: pendingFlow.context.clientSecret,
+            tokenEndpoint: pendingFlow.context.tokenEndpoint,
           },
           'OAuth Callback'
         );
@@ -1255,10 +1371,29 @@ async function registerMCPServices(
             mcp_server_id: pendingFlow.mcpServerId,
             oauth_mode: pendingFlow.oauthMode || 'per_user',
           };
-          if (pendingFlow.socketId) {
+          // Targeting precedence:
+          //   1. `per_user` mode + `userId` known — emit to the user's room so
+          //      every tab the user owns updates (including the tab that
+          //      kicked off the flow, which already auto-joined the room on
+          //      connect/login). Targeting only the originating socket would
+          //      leave that user's other tabs stuck on the pre-auth state.
+          //   2. `shared` mode — broadcast: shared tokens live on the server
+          //      record itself, every tab on every user needs to refetch.
+          //   3. Originating socket — defensive fallback for the unusual case
+          //      where we have a `socketId` but no `userId` (shouldn't happen
+          //      for normal flows but keeps single-tab UX working).
+          //   4. Otherwise log + skip; the UI will catch up on its next
+          //      `mcp-servers` fetch.
+          if (oauthEvent.oauth_mode === 'per_user' && pendingFlow.userId) {
+            app.io.to(userRoomName(pendingFlow.userId)).emit('oauth:completed', oauthEvent);
+          } else if (oauthEvent.oauth_mode === 'shared') {
+            app.io.emit('oauth:completed', oauthEvent);
+          } else if (pendingFlow.socketId) {
             app.io.to(pendingFlow.socketId).emit('oauth:completed', oauthEvent);
           } else {
-            app.io.emit('oauth:completed', oauthEvent);
+            console.warn(
+              `[OAuth Callback] per_user flow ${state} has no userId or socketId — skipping oauth:completed emit (UI will catch up on next mcp-servers find)`
+            );
           }
         }
 
@@ -1374,18 +1509,27 @@ async function registerMCPServices(
         });
 
         let metadataUrl: string | null = null;
+        let prefetchedAuthServerMetadata:
+          | import('@agor/core/tools/mcp/oauth-mcp-transport').AuthorizationServerMetadata
+          | null = null;
+        let discoverySource: string | null = null;
         if (probeResponse.status === 401) {
-          const { resolveResourceMetadataUrl } = await import(
+          const { resolveMCPOAuthDiscovery } = await import(
             '@agor/core/tools/mcp/oauth-mcp-transport'
           );
-          const resolved = await resolveResourceMetadataUrl(wwwAuthenticate, data.mcp_url);
-          if (resolved) {
-            metadataUrl = resolved.metadataUrl;
-            console.log(`[OAuth Test] Resolved metadata URL (${resolved.source}):`, metadataUrl);
+          const discovery = await resolveMCPOAuthDiscovery(wwwAuthenticate, data.mcp_url);
+          if (discovery?.kind === 'resource-metadata') {
+            metadataUrl = discovery.metadataUrl;
+            discoverySource = `RFC 9728 ${discovery.source}`;
+            console.log(`[OAuth Test] Resolved metadata URL (${discovery.source}):`, metadataUrl);
+          } else if (discovery?.kind === 'authorization-server') {
+            prefetchedAuthServerMetadata = discovery.authServerMetadata;
+            discoverySource = `AS-direct (${discovery.discoveredAt})`;
+            console.log('[OAuth Test] Resolved AS metadata directly at:', discovery.discoveredAt);
           }
         }
 
-        if (probeResponse.status === 401 && metadataUrl) {
+        if (probeResponse.status === 401 && (metadataUrl || prefetchedAuthServerMetadata)) {
           console.log('[OAuth Test] OAuth 2.1 auto-discovery detected');
 
           if (data.start_browser_flow) {
@@ -1405,7 +1549,8 @@ async function registerMCPServices(
                 started = await startTwoPhaseMCPOAuthFlowAndAwaitToken({
                   mcpUrl: data.mcp_url,
                   wwwAuthenticate: wwwAuthenticate || '',
-                  resourceMetadataUrl: metadataUrl,
+                  resourceMetadataUrl: metadataUrl ?? undefined,
+                  prefetchedAuthServerMetadata: prefetchedAuthServerMetadata ?? undefined,
                   mcpServerId: data.mcp_server_id,
                   userId: (params as AuthenticatedParams)?.user?.user_id,
                   // Test endpoint mirrors the previous saveOAuth21TokenToDB
@@ -1454,13 +1599,37 @@ async function registerMCPServices(
 
           // Just validate metadata without browser flow
           try {
-            const metadataResponse = await fetch(metadataUrl);
+            // AS-direct path: we already have AS metadata, no resource metadata
+            // to fetch. Short-circuit with what we discovered.
+            if (prefetchedAuthServerMetadata) {
+              return {
+                success: true,
+                oauthType: 'oauth2.1',
+                message: prefetchedAuthServerMetadata.registration_endpoint
+                  ? `OAuth 2.1 auto-discovery successful via ${discoverySource} (DCR supported). Click "Start OAuth Flow" to authenticate.`
+                  : `OAuth 2.1 auto-discovery successful via ${discoverySource}. Click "Start OAuth Flow" to authenticate.`,
+                authServerMetadata: {
+                  authorizationEndpoint: prefetchedAuthServerMetadata.authorization_endpoint,
+                  tokenEndpoint: prefetchedAuthServerMetadata.token_endpoint,
+                  registrationEndpoint: prefetchedAuthServerMetadata.registration_endpoint,
+                },
+                supportsDynamicClientRegistration:
+                  !!prefetchedAuthServerMetadata.registration_endpoint,
+                requiresBrowserFlow: true,
+                discoverySource,
+              };
+            }
+
+            // RFC 9728 path: fetch resource metadata to get the AS URL.
+            // (Above guard ensures `metadataUrl` is set when we reach here.)
+            const rfc9728Url = metadataUrl as string;
+            const metadataResponse = await fetch(rfc9728Url);
             if (!metadataResponse.ok) {
               return {
                 success: false,
                 error: `OAuth resource metadata endpoint returned ${metadataResponse.status}`,
                 oauthType: 'oauth2.1',
-                metadataUrl,
+                metadataUrl: rfc9728Url,
                 requiresBrowserFlow: true,
               };
             }
@@ -1474,36 +1643,33 @@ async function registerMCPServices(
                 success: false,
                 error: 'OAuth resource metadata missing authorization_servers',
                 oauthType: 'oauth2.1',
-                metadataUrl,
+                metadataUrl: rfc9728Url,
                 metadata,
               };
             }
 
             const authServerUrl = metadata.authorization_servers[0];
+            // Reuse core's fetchAuthorizationServerMetadata so we get RFC 8414
+            // path-aware insertion + OIDC path-append fallback. The previous
+            // hand-rolled `${authServerUrl}${wellKnownPath}` loop only worked
+            // for root-issuer servers and silently mis-reported "no metadata"
+            // for path-bearing issuers.
+            const { fetchAuthorizationServerMetadata } = await import(
+              '@agor/core/tools/mcp/oauth-mcp-transport'
+            );
             let authServerMetadata: {
               authorization_endpoint?: string;
               token_endpoint?: string;
               registration_endpoint?: string;
             } | null = null;
-
-            for (const wellKnownPath of [
-              '/.well-known/oauth-authorization-server',
-              '/.well-known/openid-configuration',
-            ]) {
-              try {
-                const authMetaResponse = await fetch(`${authServerUrl}${wellKnownPath}`);
-                if (authMetaResponse.ok) {
-                  authServerMetadata = (await authMetaResponse.json()) as {
-                    authorization_endpoint?: string;
-                    token_endpoint?: string;
-                    registration_endpoint?: string;
-                  };
-                  console.log('[OAuth Test] Auth server metadata:', authServerMetadata);
-                  break;
-                }
-              } catch {
-                /* Try next */
-              }
+            try {
+              authServerMetadata = await fetchAuthorizationServerMetadata(authServerUrl);
+              console.log('[OAuth Test] Auth server metadata:', authServerMetadata);
+            } catch (asMetaError) {
+              console.log(
+                '[OAuth Test] Auth server metadata unavailable:',
+                asMetaError instanceof Error ? asMetaError.message : String(asMetaError)
+              );
             }
 
             return {
@@ -1512,7 +1678,7 @@ async function registerMCPServices(
               message: authServerMetadata?.registration_endpoint
                 ? 'OAuth 2.1 auto-discovery successful (DCR supported). Click "Start OAuth Flow" to authenticate.'
                 : 'OAuth 2.1 auto-discovery successful. Click "Start OAuth Flow" to authenticate.',
-              metadataUrl,
+              metadataUrl: rfc9728Url,
               authorizationServers: metadata.authorization_servers,
               scopesSupported: metadata.scopes_supported,
               authServerMetadata: authServerMetadata
@@ -1530,7 +1696,7 @@ async function registerMCPServices(
               success: false,
               error: `Failed to fetch OAuth metadata: ${metadataError instanceof Error ? metadataError.message : String(metadataError)}`,
               oauthType: 'oauth2.1',
-              metadataUrl,
+              metadataUrl: metadataUrl ?? undefined,
             };
           }
         }
@@ -1609,13 +1775,17 @@ async function registerMCPServices(
 
           return {
             success: false,
-            error: `Server requires authentication (401) but no OAuth 2.1 auto-discovery headers found.`,
+            error:
+              'Server requires authentication (401) but OAuth 2.1 auto-discovery failed at every step.',
             oauthType: 'unknown',
             mcpStatus: probeResponse.status,
             wwwAuthenticate: wwwAuthenticate || '<not present>',
             responseHeaders: allHeaders,
             responseBody: responseBody.substring(0, 500),
-            hint: 'The server may require: (1) OAuth 2.1 setup on server side, (2) Client Credentials with explicit token URL, or (3) Different auth method.',
+            hint:
+              `${DISCOVERY_CASCADE_TRIED} ` +
+              'None returned valid metadata. Options: (a) provide Client Credentials with explicit token URL, ' +
+              '(b) ask the MCP server operator to publish OAuth metadata, or (c) configure manual OAuth URLs in the server settings.',
           };
         }
 
@@ -1676,15 +1846,14 @@ async function registerMCPServices(
         }
 
         const wwwAuthenticate = probeResponse.headers.get('www-authenticate') || '';
-        const { resolveResourceMetadataUrl } = await import(
+        const { resolveMCPOAuthDiscovery } = await import(
           '@agor/core/tools/mcp/oauth-mcp-transport'
         );
-        const resolved = await resolveResourceMetadataUrl(wwwAuthenticate, data.mcp_url);
-        if (!resolved) {
+        const discovery = await resolveMCPOAuthDiscovery(wwwAuthenticate, data.mcp_url);
+        if (!discovery) {
           return {
             success: false,
-            error:
-              'Server returned 401 but does not advertise OAuth metadata. No resource_metadata in WWW-Authenticate header and no .well-known/oauth-protected-resource endpoint found.',
+            error: `Server returned 401 but does not advertise OAuth metadata. ${DISCOVERY_CASCADE_TRIED} None succeeded.`,
           };
         }
 
@@ -1696,7 +1865,10 @@ async function registerMCPServices(
           result = await startTwoPhaseMCPOAuthFlow({
             mcpUrl: data.mcp_url,
             wwwAuthenticate,
-            resourceMetadataUrl: resolved.metadataUrl,
+            resourceMetadataUrl:
+              discovery.kind === 'resource-metadata' ? discovery.metadataUrl : undefined,
+            prefetchedAuthServerMetadata:
+              discovery.kind === 'authorization-server' ? discovery.authServerMetadata : undefined,
             mcpServerId: data.mcp_server_id,
             userId,
             oauthMode,
@@ -1767,6 +1939,7 @@ async function registerMCPServices(
             ...pendingFlow,
             clientId: pendingFlow.context.clientId,
             clientSecret: pendingFlow.context.clientSecret,
+            tokenEndpoint: pendingFlow.context.tokenEndpoint,
           },
           'OAuth Complete'
         );
@@ -1783,7 +1956,7 @@ async function registerMCPServices(
   app.use('/mcp-servers/oauth-disconnect', {
     async create(data: { mcp_server_id: string }, params?: AuthenticatedParams) {
       const { clearAuthCodeTokenCache } = await import('@agor/core/tools/mcp/oauth-mcp-transport');
-      return performOAuthDisconnect({
+      const result = await performOAuthDisconnect({
         userId: params?.user?.user_id,
         mcpServerId: data.mcp_server_id,
         userTokenRepo: new UserMCPOAuthTokenRepository(db),
@@ -1791,6 +1964,16 @@ async function registerMCPServices(
         oauthTokenCache: oauth21TokenCache,
         clearCoreTokenCache: clearAuthCodeTokenCache,
       });
+
+      // Notify all of the user's tabs so the UI can flip pills to "needs auth"
+      // immediately — mirrors the additive `oauth:completed` event.
+      if (result.success && params?.user?.user_id) {
+        app.io
+          .to(userRoomName(params.user.user_id))
+          .emit('oauth:disconnected', { mcp_server_id: data.mcp_server_id });
+      }
+
+      return result;
     },
   });
   app.service('mcp-servers/oauth-disconnect').hooks({ before: { create: [ctx.requireAuth] } });
@@ -1841,7 +2024,7 @@ async function registerMCPServices(
       headers: Record<string, { authorization?: string; error?: string }>;
     }> {
       const userId = params?.user?.user_id;
-      if (!userId) {
+      if (!userId && params?.provider) {
         throw new NotAuthenticated('oauth-auth-headers requires authentication');
       }
 
@@ -1852,14 +2035,39 @@ async function registerMCPServices(
         return { headers };
       }
 
+      const sessionId = (params as (AuthenticatedParams & { session_id?: string }) | undefined)
+        ?.session_id;
+      const trustedInternalOrService = shouldExposeMCPServerSecrets(params);
+      const trustedSessionExecutor = shouldExposeMCPServerSecretsForSessionToken(params, {
+        sessionId,
+      });
+      if (!trustedInternalOrService && !trustedSessionExecutor) {
+        throw new Forbidden('oauth-auth-headers is only available to trusted executor paths');
+      }
+
       const userTokenRepo = new UserMCPOAuthTokenRepository(db);
       const mcpServerRepo = new MCPServerRepository(db);
+      if (trustedSessionExecutor) {
+        const sessionMcpRepo = new SessionMCPServerRepository(db);
+        const attachedServers = await sessionMcpRepo.listServers(sessionId as SessionID, true);
+        const globalServers = await mcpServerRepo.findAll({ scope: 'global', enabled: true });
+        const allowedServerIds = new Set([
+          ...globalServers.map((server) => server.mcp_server_id),
+          ...attachedServers.map((server) => server.mcp_server_id),
+        ]);
+        for (const serverId of serverIds) {
+          if (!allowedServerIds.has(serverId as MCPServerID)) {
+            headers[serverId] = { error: 'server_not_in_session_scope' };
+          }
+        }
+      }
       const { needsRefresh, refreshAndPersistToken, InvalidGrantError } = await import(
         '@agor/core/tools/mcp/oauth-refresh'
       );
 
       await Promise.all(
         serverIds.map(async (serverId) => {
+          if (headers[serverId]) return;
           try {
             const server = await mcpServerRepo.findById(serverId);
             if (!server) {
@@ -1872,6 +2080,10 @@ async function registerMCPServices(
             }
 
             const mode = server.auth.oauth_mode ?? 'per_user';
+            if (mode === 'per_user' && !userId) {
+              headers[serverId] = { error: 'needs_user_context' };
+              return;
+            }
             const tokenUserId: UserID | null = mode === 'per_user' ? (userId as UserID) : null;
 
             const row = await userTokenRepo.getToken(tokenUserId, serverId as MCPServerID);
@@ -1910,10 +2122,11 @@ async function registerMCPServices(
 
             headers[serverId] = { authorization: `Bearer ${accessToken}` };
           } catch (err) {
-            console.error(`[OAuth AuthHeaders] Error for ${serverId}:`, err);
-            headers[serverId] = {
-              error: err instanceof Error ? err.message : 'unknown_error',
-            };
+            console.error(
+              `[OAuth AuthHeaders] Error for ${serverId}:`,
+              err instanceof Error ? err.name : 'unknown_error'
+            );
+            headers[serverId] = { error: 'unknown_error' };
           }
         })
       );
@@ -1957,9 +2170,13 @@ async function registerMCPServices(
 
       const userTokenRepo = new UserMCPOAuthTokenRepository(db);
       const mcpServerRepo = new MCPServerRepository(db);
-      const { refreshAndPersistToken, InvalidGrantError, MissingRefreshTokenError } = await import(
-        '@agor/core/tools/mcp/oauth-refresh'
-      );
+      const {
+        refreshAndPersistToken,
+        InvalidGrantError,
+        MissingRefreshTokenError,
+        MissingTokenEndpointError,
+        MissingClientIdError,
+      } = await import('@agor/core/tools/mcp/oauth-refresh');
 
       try {
         const server = await mcpServerRepo.findById(serverId);
@@ -1986,10 +2203,19 @@ async function registerMCPServices(
         if (err instanceof InvalidGrantError || err instanceof MissingRefreshTokenError) {
           return { success: false, error: 'needs_reauth' };
         }
-        console.error(`[OAuth Refresh] ${serverId}:`, err);
+        if (err instanceof MissingTokenEndpointError) {
+          return { success: false, error: 'missing_token_endpoint' };
+        }
+        if (err instanceof MissingClientIdError) {
+          return { success: false, error: 'missing_client_id' };
+        }
+        console.error(
+          `[OAuth Refresh] ${serverId}:`,
+          err instanceof Error ? `${err.name}: ${err.message}` : 'unknown_error'
+        );
         return {
           success: false,
-          error: err instanceof Error ? err.message : 'unknown_error',
+          error: 'token_refresh_failed',
         };
       }
     },
@@ -2018,6 +2244,7 @@ async function registerMCPServices(
           oauth_grant_type?: string;
           oauth_mode?: 'per_user' | 'shared';
         };
+        headers?: Record<string, string>;
       },
       params?: AuthenticatedParams
     ) {
@@ -2026,7 +2253,11 @@ async function registerMCPServices(
         const { StreamableHTTPClientTransport } = await import(
           '@modelcontextprotocol/sdk/client/streamableHttp.js'
         );
+        const { restoreRedactedMCPAuthSecrets } = await import('@agor/core/tools/mcp/auth-secrets');
         const { resolveMCPAuthHeaders } = await import('@agor/core/tools/mcp/jwt-auth');
+        const { mergeMCPRemoteHeaders, restoreRedactedMCPCustomHeaders } = await import(
+          '@agor/core/tools/mcp/http-headers'
+        );
         const { hasMinimumRole, ROLES } = await import('@agor/core/types');
 
         const mcpServerRepo = new MCPServerRepository(db);
@@ -2043,11 +2274,22 @@ async function registerMCPServices(
           }
         };
 
+        // Skip pre-resolution URL validation for templated URLs — `new URL()`
+        // rejects whitespace inside `{{ user.env.X }}` (and full-URL templates
+        // like `{{ user.env.MCP_URL }}` have no scheme yet), so validating
+        // pre-resolution would block legitimate templates from ever reaching
+        // the resolver. The resolved URL is re-validated below before use.
+        const isTemplated = (url: string): boolean => url.includes('{{');
+
         const hasInlineConfig = !!data.url;
+        // `auth` is typed as the canonical MCPAuth (rather than narrowing to
+        // `typeof data.auth`) so the resolved auth from
+        // `resolveProbeServerTemplates` flows back in without casts.
         let serverConfig: {
           url: string;
           transport: 'http' | 'sse' | 'stdio';
-          auth?: typeof data.auth;
+          auth?: MCPAuth;
+          headers?: Record<string, string>;
           name?: string;
           scope?: string;
           owner_user_id?: string;
@@ -2055,12 +2297,15 @@ async function registerMCPServices(
         let serverId: string | undefined;
 
         if (hasInlineConfig) {
-          const urlValidation = validateUrl(data.url!);
-          if (!urlValidation.valid) return { success: false, error: urlValidation.error };
+          if (!isTemplated(data.url!)) {
+            const urlValidation = validateUrl(data.url!);
+            if (!urlValidation.valid) return { success: false, error: urlValidation.error };
+          }
           serverConfig = {
             url: data.url!,
             transport: data.transport || 'http',
             auth: data.auth,
+            headers: data.headers,
             name: 'inline-test',
           };
           if (data.mcp_server_id) {
@@ -2082,6 +2327,14 @@ async function registerMCPServices(
                   error: 'Access denied: admin role required to update session-scoped MCP servers',
                 };
             }
+            serverConfig.auth = restoreRedactedMCPAuthSecrets({
+              current: server.auth,
+              next: data.auth,
+            });
+            serverConfig.headers = restoreRedactedMCPCustomHeaders({
+              current: server.headers,
+              next: data.headers,
+            });
             serverId = data.mcp_server_id;
           }
         } else if (data.mcp_server_id) {
@@ -2103,7 +2356,7 @@ async function registerMCPServices(
                 error: 'Access denied: admin role required to discover session-scoped MCP servers',
               };
           }
-          if (server.url) {
+          if (server.url && !isTemplated(server.url)) {
             const urlValidation = validateUrl(server.url);
             if (!urlValidation.valid) return { success: false, error: urlValidation.error };
           }
@@ -2111,6 +2364,7 @@ async function registerMCPServices(
             url: server.url || '',
             transport: (server.transport as 'http' | 'sse') || (server.url ? 'http' : 'stdio'),
             auth: server.auth,
+            headers: server.headers,
             name: server.name,
             scope: server.scope,
             owner_user_id: server.owner_user_id,
@@ -2127,6 +2381,56 @@ async function registerMCPServices(
           };
         }
 
+        // Resolve {{ user.env.X }} templates in url/auth using the caller's
+        // user env vars. The executor does this at session runtime via
+        // process.env + AGOR_USER_ENV_KEYS, but the daemon's process.env
+        // never holds user secrets — so we pull them from the DB here. Without
+        // this, Test Connection sends the literal `Bearer {{ user.env.X }}`
+        // string and the MCP server returns 401, even though the server works
+        // fine in real sessions.
+        //
+        // The endpoint is gated by `requireAuth` (see hook registration
+        // below), so a missing user_id here means the auth contract was
+        // bypassed somewhere upstream — fail loud rather than silently
+        // skip resolution and ship literal templates upstream.
+        const userId = params?.user?.user_id as UserID | undefined;
+        if (!userId) {
+          throw new NotAuthenticated('MCP discover requires an authenticated user');
+        }
+
+        const { resolveUserEnvironment } = await import('@agor/core/config');
+        const { resolveProbeServerTemplates } = await import('./utils/mcp-probe-templates.js');
+
+        const userEnv = await resolveUserEnvironment(userId, db);
+        const resolution = resolveProbeServerTemplates(
+          {
+            url: serverConfig.url,
+            transport: serverConfig.transport,
+            auth: serverConfig.auth,
+            headers: serverConfig.headers,
+            name: serverConfig.name,
+            mcpServerId: serverId,
+          },
+          userEnv
+        );
+
+        if (!resolution.ok) {
+          return { success: false, error: resolution.error };
+        }
+
+        serverConfig.auth = resolution.resolved.auth;
+        serverConfig.headers = resolution.resolved.headers;
+        // Re-validate whenever the input URL was templated, even if the
+        // resolved string happens to match the input (e.g., a user env
+        // value that itself looks like the template). Pre-resolution
+        // validation is skipped for templated URLs, so this is the only
+        // gate that runs for them.
+        if (resolution.resolved.url !== serverConfig.url || isTemplated(serverConfig.url)) {
+          const recheck = validateUrl(resolution.resolved.url);
+          if (!recheck.valid) return { success: false, error: recheck.error };
+          serverConfig.url = resolution.resolved.url;
+        }
+
         console.log('[MCP Discovery] Starting test for:', serverConfig.name || 'inline-config');
 
         let authHeaders = await resolveMCPAuthHeaders(serverConfig.auth, serverConfig.url);
@@ -2135,15 +2439,18 @@ async function registerMCPServices(
           try {
             const probeResponse = await fetch(mcpUrl, {
               method: 'GET',
-              headers: { Accept: 'application/json' },
+              headers: mergeMCPRemoteHeaders({
+                base: { Accept: 'application/json' },
+                custom: serverConfig.headers,
+              }) ?? { Accept: 'application/json' },
             });
             const wwwAuthenticate = probeResponse.headers.get('www-authenticate');
             if (probeResponse.status !== 401) return undefined;
-            const { resolveResourceMetadataUrl } = await import(
+            const { resolveMCPOAuthDiscovery } = await import(
               '@agor/core/tools/mcp/oauth-mcp-transport'
             );
-            const resolved = await resolveResourceMetadataUrl(wwwAuthenticate, mcpUrl);
-            if (!resolved) return undefined;
+            const discovery = await resolveMCPOAuthDiscovery(wwwAuthenticate, mcpUrl);
+            if (!discovery) return undefined;
 
             // Route through the daemon's two-phase flow (callback → daemon's
             // public URL) instead of the legacy 127.0.0.1 callback server, so
@@ -2152,7 +2459,12 @@ async function registerMCPServices(
             const started = await startTwoPhaseMCPOAuthFlowAndAwaitToken({
               mcpUrl,
               wwwAuthenticate: wwwAuthenticate || '',
-              resourceMetadataUrl: resolved.metadataUrl,
+              resourceMetadataUrl:
+                discovery.kind === 'resource-metadata' ? discovery.metadataUrl : undefined,
+              prefetchedAuthServerMetadata:
+                discovery.kind === 'authorization-server'
+                  ? discovery.authServerMetadata
+                  : undefined,
               mcpServerId: serverId,
               userId: params?.user?.user_id,
               // Discover writes the token via the shared MCP server row when
@@ -2207,8 +2519,11 @@ async function registerMCPServices(
           if (cachedToken) authHeaders = { Authorization: `Bearer ${cachedToken}` };
         }
 
-        const headers: Record<string, string> = { Accept: 'application/json, text/event-stream' };
-        if (authHeaders) Object.assign(headers, authHeaders);
+        const headers = mergeMCPRemoteHeaders({
+          base: { Accept: 'application/json, text/event-stream' },
+          custom: serverConfig.headers,
+          auth: authHeaders,
+        }) ?? { Accept: 'application/json, text/event-stream' };
 
         const createMCPConnection = (connHeaders: Record<string, string>) => {
           let sessionId: string | undefined;
@@ -2260,10 +2575,11 @@ async function registerMCPServices(
               clearOAuth21Token(serverConfig.url);
               const freshToken = await probeAndAcquireOAuthToken(serverConfig.url);
               if (freshToken) {
-                const freshHeaders: Record<string, string> = {
-                  Accept: 'application/json, text/event-stream',
-                  Authorization: `Bearer ${freshToken}`,
-                };
+                const freshHeaders = mergeMCPRemoteHeaders({
+                  base: { Accept: 'application/json, text/event-stream' },
+                  custom: serverConfig.headers,
+                  auth: { Authorization: `Bearer ${freshToken}` },
+                }) ?? { Accept: 'application/json, text/event-stream' };
                 const retry = createMCPConnection(freshHeaders);
                 httpTransport = retry.transport;
                 client = retry.client;
@@ -2414,11 +2730,11 @@ async function bootstrapSuperadminUsers(
       await usersService.patch(userId as any, { role: ROLES.SUPERADMIN });
       promotedCount++;
       console.log(
-        `[RBAC] Bootstrap promoted user ${userId.substring(0, 8)} (${user.email}) to superadmin`
+        `[RBAC] Bootstrap promoted user ${shortId(userId)} (${user.email}) to superadmin`
       );
     } catch (error) {
       console.warn(
-        `[RBAC] Failed to bootstrap superadmin for user ${userId.substring(0, 8)}: ${error instanceof Error ? error.message : String(error)}`
+        `[RBAC] Failed to bootstrap superadmin for user ${shortId(userId)}: ${error instanceof Error ? error.message : String(error)}`
       );
     }
   }

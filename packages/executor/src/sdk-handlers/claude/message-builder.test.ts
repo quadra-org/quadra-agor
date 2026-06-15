@@ -2,7 +2,7 @@ import { generateId } from '@agor/core';
 import type { MessageID, SessionID, TaskID } from '@agor/core/types';
 import { MessageRole } from '@agor/core/types';
 import { describe, expect, it, vi } from 'vitest';
-import type { MessagesService, TasksService } from './claude-tool.js';
+import type { MessagesService, TasksService } from '../base/index.js';
 import {
   createAssistantMessage,
   createUserMessage,
@@ -297,6 +297,146 @@ describe('createUserMessage', () => {
 
     expect(result.content).toBe(multilinePrompt);
     expect(result.content_preview).toBe(multilinePrompt);
+  });
+
+  describe('skip-if-exists guard (Alt D — never-lose-prompt)', () => {
+    it('should skip create and return existing user message when one exists for taskId', async () => {
+      const messagesService = createMockMessagesService();
+      const sessionId = generateId() as SessionID;
+      const taskId = generateId() as TaskID;
+      const existingId = generateId() as MessageID;
+
+      const existingMessages = [
+        {
+          message_id: existingId,
+          session_id: sessionId,
+          type: 'user' as const,
+          role: MessageRole.USER,
+          index: 5,
+          timestamp: '2026-04-24T00:00:00.000Z',
+          content_preview: 'Daemon wrote this',
+          content: 'Daemon wrote this',
+          task_id: taskId,
+        },
+      ];
+
+      const result = await createUserMessage(
+        sessionId,
+        'Executor would re-write this',
+        taskId,
+        99, // would-be next index — should be ignored when skipping
+        messagesService,
+        { existingMessages }
+      );
+
+      // Returned the existing row, not a new insert
+      expect(result.message_id).toBe(existingId);
+      expect(result.index).toBe(5);
+      expect(result.content).toBe('Daemon wrote this');
+      // No second insert happened
+      expect(messagesService.create).not.toHaveBeenCalled();
+    });
+
+    it('should skip create for callback-shaped row (type:system, role:user) — blocker regression', async () => {
+      // Daemon writes Agor callback prompts as `type:'system', role:'user'`
+      // so the UI applies callback styling. The skip-if-exists guard MUST
+      // match by role only — a type-strict predicate would miss this row,
+      // causing the executor to double-insert the callback prompt.
+      const messagesService = createMockMessagesService();
+      const sessionId = generateId() as SessionID;
+      const taskId = generateId() as TaskID;
+      const existingId = generateId() as MessageID;
+
+      const existingMessages = [
+        {
+          message_id: existingId,
+          session_id: sessionId,
+          type: 'system' as const, // <-- callback shape
+          role: MessageRole.USER,
+          index: 3,
+          timestamp: '2026-04-24T00:00:00.000Z',
+          content_preview: 'Callback prompt from parent',
+          content: 'Callback prompt from parent',
+          task_id: taskId,
+          metadata: { is_agor_callback: true },
+        },
+      ];
+
+      const result = await createUserMessage(
+        sessionId,
+        'Executor would re-write this',
+        taskId,
+        99,
+        messagesService,
+        { existingMessages }
+      );
+
+      expect(result.message_id).toBe(existingId);
+      expect(result.type).toBe('system');
+      expect(messagesService.create).not.toHaveBeenCalled();
+    });
+
+    it('should still create when existingMessages has no row for taskId', async () => {
+      const messagesService = createMockMessagesService();
+      const sessionId = generateId() as SessionID;
+      const taskId = generateId() as TaskID;
+      const otherTaskId = generateId() as TaskID;
+
+      const existingMessages = [
+        {
+          message_id: generateId() as MessageID,
+          session_id: sessionId,
+          type: 'user' as const,
+          role: MessageRole.USER,
+          index: 0,
+          timestamp: '2026-04-24T00:00:00.000Z',
+          content_preview: 'Other task',
+          content: 'Other task',
+          task_id: otherTaskId,
+        },
+      ];
+
+      const result = await createUserMessage(sessionId, 'New prompt', taskId, 1, messagesService, {
+        existingMessages,
+      });
+
+      expect(result.task_id).toBe(taskId);
+      expect(result.index).toBe(1);
+      expect(result.content).toBe('New prompt');
+      expect(messagesService.create).toHaveBeenCalledWith(result);
+    });
+
+    it('should still create when no taskId is provided (skip guard requires taskId)', async () => {
+      const messagesService = createMockMessagesService();
+      const sessionId = generateId() as SessionID;
+
+      const existingMessages = [
+        {
+          message_id: generateId() as MessageID,
+          session_id: sessionId,
+          type: 'user' as const,
+          role: MessageRole.USER,
+          index: 0,
+          timestamp: '2026-04-24T00:00:00.000Z',
+          content_preview: 'old',
+          content: 'old',
+          task_id: generateId() as TaskID,
+        },
+      ];
+
+      const result = await createUserMessage(
+        sessionId,
+        'No task id',
+        undefined,
+        1,
+        messagesService,
+        { existingMessages }
+      );
+
+      expect(result.task_id).toBeUndefined();
+      expect(result.index).toBe(1);
+      expect(messagesService.create).toHaveBeenCalledWith(result);
+    });
   });
 });
 
@@ -698,7 +838,10 @@ describe('createAssistantMessage', () => {
     expect(result.content_preview).toBe('');
   });
 
-  it('should use default model when resolvedModel is undefined', async () => {
+  it('omits metadata.model entirely when resolvedModel is undefined', async () => {
+    // Regression: previously we silently substituted DEFAULT_CLAUDE_MODEL,
+    // which lied about what actually ran on legacy sessions / when the SDK
+    // didn't echo the model. Honest record = leave the key absent.
     const messagesService = createMockMessagesService();
     const sessionId = generateId() as SessionID;
     const messageId = generateId() as MessageID;
@@ -715,7 +858,7 @@ describe('createAssistantMessage', () => {
       messagesService
     );
 
-    expect(result.metadata?.model).toBe('claude-sonnet-4-6'); // DEFAULT_CLAUDE_MODEL
+    expect(result.metadata).not.toHaveProperty('model');
   });
 
   it('should update task with resolved model', async () => {

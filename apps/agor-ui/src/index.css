@@ -5,6 +5,14 @@
 
 /* Global styles for Agor UI */
 
+/* Header icon buttons are inline-flex by default in AntD, which lets the
+   inherited 64px header line-height place them on the text baseline. Force the
+   badge wrapper into flex layout so comment icon buttons center like the rest. */
+.app-header-icon-badge {
+  display: flex;
+  align-items: center;
+}
+
 /* Prevent long text from causing horizontal scroll in collapse headers,
    but allow vertical overflow so flex-wrapped pill rows aren't clipped (#869). */
 .ant-collapse-header {
@@ -371,4 +379,17 @@ html.dark .dark\:block {
 /* Dark mode: hide elements with dark:hidden class */
 html.dark .dark\:hidden {
   display: none;
+}
+
+/* Ant Tree defaults render as a small "well" in dark mode
+   (rgba background, rounded corners, 4px padding). In embedded trees
+   like branch sessions and file/doc browsing, the surrounding card/modal
+   already provides the surface, so keep the tree chrome flat. */
+.agor-flat-tree.ant-tree,
+.agor-flat-tree.ant-tree .ant-tree-list,
+.agor-flat-tree.ant-tree .ant-tree-list-holder,
+.agor-flat-tree.ant-tree .ant-tree-list-holder-inner {
+  background: transparent;
+  border-radius: 0;
+  padding: 0;
 }

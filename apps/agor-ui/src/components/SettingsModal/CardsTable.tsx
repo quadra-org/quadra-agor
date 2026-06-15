@@ -14,7 +14,6 @@ import {
   Form,
   Input,
   Layout,
-  List,
   Modal,
   Popconfirm,
   Space,
@@ -25,9 +24,12 @@ import {
 import { useMemo, useState } from 'react';
 import { mapToArray } from '@/utils/mapHelpers';
 import { useThemedMessage } from '@/utils/message';
+import { filterBySettingsSearch } from '@/utils/settingsSearch';
 import CardModal from '../CardModal/CardModal';
 import { FormEmojiPickerInput } from '../EmojiPickerInput';
+import { HighlightMatch } from '../HighlightMatch';
 import { JSONEditor, validateJSON } from '../JSONEditor';
+import { MetaRow } from '../MetaRow';
 
 const { Sider, Content } = Layout;
 
@@ -55,12 +57,24 @@ export const CardsTable: React.FC<CardsTableProps> = ({
   const [editTypeModalOpen, setEditTypeModalOpen] = useState(false);
   const [editingType, setEditingType] = useState<CardType | null>(null);
   const [cardModalCard, setCardModalCard] = useState<CardWithType | null>(null);
+  const [typeSearchTerm, setTypeSearchTerm] = useState('');
+  const [cardSearchTerm, setCardSearchTerm] = useState('');
   const [form] = Form.useForm();
 
   // Derived data
   const cardTypes = useMemo(
     () => mapToArray(cardTypeById).sort((a, b) => a.name.localeCompare(b.name)),
     [cardTypeById]
+  );
+
+  const filteredCardTypes = useMemo(
+    () =>
+      filterBySettingsSearch(cardTypes, typeSearchTerm, [
+        (cardType) => cardType.name,
+        (cardType) => cardType.emoji,
+        (cardType) => JSON.stringify(cardType.json_schema ?? {}),
+      ]),
+    [cardTypes, typeSearchTerm]
   );
 
   // Build card_id → zone info lookup from board_objects
@@ -85,10 +99,22 @@ export const CardsTable: React.FC<CardsTableProps> = ({
 
   const cardsForType = useMemo(() => {
     if (!selectedTypeId) return [];
-    return mapToArray(cardById)
+    const cards = mapToArray(cardById)
       .filter((c) => c.card_type_id === selectedTypeId && !c.archived)
       .sort((a, b) => a.title.localeCompare(b.title));
-  }, [cardById, selectedTypeId]);
+    return filterBySettingsSearch(cards, cardSearchTerm, [
+      (card) => card.title,
+      (card) => {
+        const board = boardById.get(card.board_id);
+        return [board?.name, board?.slug, card.board_id];
+      },
+      (card) => {
+        const zone = cardZoneInfo.get(card.card_id);
+        return zone?.zoneName;
+      },
+      (card) => JSON.stringify(card.data ?? {}),
+    ]);
+  }, [cardById, selectedTypeId, cardSearchTerm, boardById, cardZoneInfo]);
 
   // Card type CRUD handlers
   const handleCreateType = async () => {
@@ -172,7 +198,9 @@ export const CardsTable: React.FC<CardsTableProps> = ({
       render: (title: string, record: CardWithType) => (
         <Space>
           {record.effective_emoji && <span>{record.effective_emoji}</span>}
-          <Typography.Text>{title}</Typography.Text>
+          <Typography.Text>
+            <HighlightMatch text={title} query={cardSearchTerm} />
+          </Typography.Text>
         </Space>
       ),
     },
@@ -185,7 +213,14 @@ export const CardsTable: React.FC<CardsTableProps> = ({
         const board = boardById.get(boardId);
         return (
           <Typography.Text type="secondary">
-            {board ? `${board.icon ? `${board.icon} ` : ''}${board.name}` : '—'}
+            {board ? (
+              <HighlightMatch
+                text={`${board.icon ? `${board.icon} ` : ''}${board.name}`}
+                query={cardSearchTerm}
+              />
+            ) : (
+              '—'
+            )}
           </Typography.Text>
         );
       },
@@ -200,7 +235,9 @@ export const CardsTable: React.FC<CardsTableProps> = ({
         return (
           <Space size={4}>
             {info.zoneColor && <PushpinFilled style={{ color: info.zoneColor, fontSize: 12 }} />}
-            <Typography.Text style={{ fontSize: 13 }}>{info.zoneName}</Typography.Text>
+            <Typography.Text style={{ fontSize: 13 }}>
+              <HighlightMatch text={info.zoneName} query={cardSearchTerm} />
+            </Typography.Text>
           </Space>
         );
       },
@@ -318,70 +355,78 @@ export const CardsTable: React.FC<CardsTableProps> = ({
               New
             </Button>
           </div>
+          {cardTypes.length > 0 && (
+            <div style={{ padding: '8px 12px' }}>
+              <Input
+                allowClear
+                size="small"
+                placeholder="Search types"
+                value={typeSearchTerm}
+                onChange={(event) => setTypeSearchTerm(event.target.value)}
+              />
+            </div>
+          )}
           {cardTypes.length === 0 ? (
             <div style={{ padding: 24, textAlign: 'center' }}>
               <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No card types yet" />
             </div>
           ) : (
-            <List
-              dataSource={cardTypes}
-              split={false}
-              renderItem={(ct) => (
-                <List.Item
-                  key={ct.card_type_id}
-                  onClick={() => setSelectedTypeId(ct.card_type_id)}
-                  style={{
-                    padding: '8px 16px',
-                    cursor: 'pointer',
-                    background:
-                      selectedTypeId === ct.card_type_id ? token.colorBgTextHover : 'transparent',
-                    borderLeft:
-                      selectedTypeId === ct.card_type_id
-                        ? `3px solid ${ct.color || token.colorPrimary}`
-                        : '3px solid transparent',
-                  }}
-                  actions={[
+            filteredCardTypes.map((ct) => (
+              <div
+                key={ct.card_type_id}
+                onClick={() => setSelectedTypeId(ct.card_type_id)}
+                style={{
+                  padding: '8px 16px',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 16,
+                  background:
+                    selectedTypeId === ct.card_type_id ? token.colorBgTextHover : 'transparent',
+                  borderLeft:
+                    selectedTypeId === ct.card_type_id
+                      ? `3px solid ${ct.color || token.colorPrimary}`
+                      : '3px solid transparent',
+                }}
+              >
+                <MetaRow
+                  avatar={<span style={{ fontSize: 18 }}>{ct.emoji || '📋'}</span>}
+                  title={
+                    <Typography.Text style={{ fontSize: 13 }} ellipsis>
+                      <HighlightMatch text={ct.name} query={typeSearchTerm} />
+                    </Typography.Text>
+                  }
+                />
+                <Space size="small" onClick={(e) => e.stopPropagation()}>
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<EditOutlined />}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      openEditType(ct);
+                    }}
+                  />
+                  <Popconfirm
+                    title="Delete card type?"
+                    description="Cards using this type will become untyped."
+                    onConfirm={(e) => {
+                      e?.stopPropagation();
+                      handleDeleteType(ct.card_type_id);
+                    }}
+                    onCancel={(e) => e?.stopPropagation()}
+                  >
                     <Button
-                      key="edit"
                       type="text"
                       size="small"
-                      icon={<EditOutlined />}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        openEditType(ct);
-                      }}
-                    />,
-                    <Popconfirm
-                      key="delete"
-                      title="Delete card type?"
-                      description="Cards using this type will become untyped."
-                      onConfirm={(e) => {
-                        e?.stopPropagation();
-                        handleDeleteType(ct.card_type_id);
-                      }}
-                      onCancel={(e) => e?.stopPropagation()}
-                    >
-                      <Button
-                        type="text"
-                        size="small"
-                        icon={<DeleteOutlined />}
-                        danger
-                        onClick={(e) => e.stopPropagation()}
-                      />
-                    </Popconfirm>,
-                  ]}
-                >
-                  <List.Item.Meta
-                    avatar={<span style={{ fontSize: 18 }}>{ct.emoji || '📋'}</span>}
-                    title={
-                      <Typography.Text style={{ fontSize: 13 }} ellipsis>
-                        {ct.name}
-                      </Typography.Text>
-                    }
-                  />
-                </List.Item>
-              )}
-            />
+                      icon={<DeleteOutlined />}
+                      danger
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  </Popconfirm>
+                </Space>
+              </div>
+            ))
           )}
         </Sider>
 
@@ -389,7 +434,14 @@ export const CardsTable: React.FC<CardsTableProps> = ({
         <Content style={{ minWidth: 0 }}>
           {selectedType ? (
             <div>
-              <div style={{ marginBottom: 12 }}>
+              <div
+                style={{
+                  marginBottom: 12,
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                }}
+              >
                 <Space>
                   <span style={{ fontSize: 20 }}>{selectedType.emoji || '📋'}</span>
                   <Typography.Title level={5} style={{ margin: 0 }}>
@@ -399,6 +451,13 @@ export const CardsTable: React.FC<CardsTableProps> = ({
                     ({cardsForType.length} card{cardsForType.length !== 1 ? 's' : ''})
                   </Typography.Text>
                 </Space>
+                <Input
+                  allowClear
+                  placeholder="Search title, board, zone, or data"
+                  value={cardSearchTerm}
+                  onChange={(event) => setCardSearchTerm(event.target.value)}
+                  style={{ width: 300 }}
+                />
               </div>
               <Table
                 dataSource={cardsForType}

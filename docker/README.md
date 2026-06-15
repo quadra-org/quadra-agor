@@ -112,21 +112,30 @@ docker run --rm -v agor_agor-home:/data -v $(pwd):/backup \
   alpine tar xzf /backup/agor-backup.tar.gz -C /data
 ```
 
-## Default Credentials (Production)
+## First-Run Admin Bootstrap (Production)
 
-On first startup, production mode creates a default admin user:
+Production images do **not** create a fixed default password.
 
-```
-Email:    admin@agor.live
-Password: admin
-```
+On first startup with an empty users table, the daemon creates
+`admin@agor.live` as the bootstrap superadmin using one of these paths:
 
-**IMPORTANT:** Change this password immediately after first login!
+1. Set `AGOR_ADMIN_PASSWORD` in the container environment. Agor uses that
+   operator-provided password and does not print it.
+2. Leave `AGOR_ADMIN_PASSWORD` unset. Agor generates a random password and
+   writes it to `/home/agor/.agor/admin-credentials` with mode `0600`; logs
+   only point at that file path.
+
+The bootstrap admin is forced to change its password on first login.
+`AGOR_ADMIN_PASSWORD` is only used while the users table is empty. If you
+forget to set it before first startup, read the generated credentials file and
+change the password after logging in; setting `AGOR_ADMIN_PASSWORD` on a later
+restart will not reset an existing user's password.
 
 ```bash
-# From inside the container
+# Retrieve generated credentials from inside the container when
+# AGOR_ADMIN_PASSWORD was not provided.
 docker compose -f docker-compose.prod.yml exec agor-prod \
-  agor user update admin@agor.live --password <new-password>
+  cat /home/agor/.agor/admin-credentials
 ```
 
 ## Building Images
@@ -161,31 +170,31 @@ docker compose -f docker-compose.prod.yml build
 
 ## Advanced Usage
 
-### Multiple Worktrees (Dev)
+### Multiple Branches (Dev)
 
-Each git worktree can run its own isolated Docker environment with:
+Each git branch can run its own isolated Docker environment with:
 
 - **Separate images** (tagged per project name)
 - **Separate volumes** (node_modules, database, config)
 - **Separate ports** (using unique_id offset)
-- **Automatic dependency sync** (based on each worktree's pnpm-lock.yaml)
+- **Automatic dependency sync** (based on each branch's pnpm-lock.yaml)
 
 This is configured in `.agor.yml`:
 
 ```yaml
 environment:
-  start: DAEMON_PORT={{add 3000 worktree.unique_id}} UI_PORT={{add 5000 worktree.unique_id}} docker compose -p agor-{{worktree.name}} up -d
-  stop: docker compose -p agor-{{worktree.name}} down
+  start: DAEMON_PORT={{add 3000 branch.unique_id}} UI_PORT={{add 5000 branch.unique_id}} docker compose -p agor-{{branch.name}} up -d
+  stop: docker compose -p agor-{{branch.name}} down
 ```
 
 Manual example:
 
 ```bash
-# Worktree 1 (postgres-support branch)
+# Branch 1 (postgres-support branch)
 cd ~/.agor/worktrees/preset-io/agor/postgres-support
 DAEMON_PORT=3001 UI_PORT=5001 docker compose -p agor-postgres-support up -d
 
-# Worktree 2 (main branch)
+# Branch 2 (main branch)
 cd ~/.agor/worktrees/preset-io/agor/main
 DAEMON_PORT=3002 UI_PORT=5002 docker compose -p agor-main up -d
 ```
@@ -194,13 +203,13 @@ DAEMON_PORT=3002 UI_PORT=5002 docker compose -p agor-main up -d
 
 1. **Image isolation**: `${COMPOSE_PROJECT_NAME}-agor-dev` means each `-p` project builds its own image
 2. **Volume isolation**: Docker Compose creates separate volumes per project (named volumes + anonymous volumes for node_modules)
-3. **Dependency sync**: Entrypoint runs `pnpm install` on startup, syncing to the mounted worktree's `pnpm-lock.yaml`
-4. **No conflicts**: Worktree A with PostgreSQL deps won't conflict with Worktree B without them
+3. **Dependency sync**: Entrypoint runs `pnpm install` on startup, syncing to the mounted branch's `pnpm-lock.yaml`
+4. **No conflicts**: Branch A with PostgreSQL deps won't conflict with Branch B without them
 
 **Benefits:**
 
 - Work on multiple branches simultaneously
-- Each worktree has correct dependencies (even if branches diverge)
+- Each branch has correct dependencies (even if branches diverge)
 - No manual dependency management needed
 - Clean separation of databases and configs
 
@@ -327,7 +336,7 @@ Expected image sizes:
 
 - **Development**: Edit code in your editor, changes hot-reload automatically
 - **Production**: Deploy to your server, configure reverse proxy (nginx/caddy)
-- **Security**: Change default admin password, configure HTTPS, set CORS_ORIGIN
+- **Security**: Secure bootstrap credentials, configure HTTPS, set CORS_ORIGIN
 - **Monitoring**: Check `/health` endpoint, monitor logs, set up alerts
 
 ## Architecture Notes

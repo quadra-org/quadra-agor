@@ -7,6 +7,7 @@
 
 import { PAGINATION } from '@agor/core/config';
 import {
+  BranchRepository,
   type Database,
   SessionEnvSelectionRepository,
   SessionMCPServerRepository,
@@ -15,14 +16,18 @@ import {
   UsersRepository,
 } from '@agor/core/db';
 import { type Application, Forbidden } from '@agor/core/feathers';
+import { formatModelToolMismatchWarning, lintModelToolMatch } from '@agor/core/models';
+import { resolveChildSessionConfig } from '@agor/core/sessions';
 import type {
   AuthenticatedParams,
+  Branch,
   MCPServerID,
   Paginated,
   QueryParams,
   Session,
   SessionID,
   TaskID,
+  UUID,
 } from '@agor/core/types';
 import { ROLES, SessionStatus } from '@agor/core/types';
 import { DrizzleService } from '../adapters/drizzle';
@@ -31,7 +36,8 @@ import {
   isSuperAdmin,
   loadUnixUsernameForUser,
   resolveChildUnixUsername,
-} from '../utils/worktree-authorization.js';
+} from '../utils/branch-authorization.js';
+import { parseLastMessageTruncationLength } from '../utils/query-params.js';
 
 /**
  * Session runtime configuration that should be inherited across forks, spawns, and btw.
@@ -94,31 +100,6 @@ export type ExecuteTaskData = {
 };
 
 /**
- * Parse and validate last_message_truncation_length parameter
- * Feathers delivers query params as strings, so we need to parse and validate
- */
-function parseTruncationLength(value: unknown): number {
-  // Default value
-  const DEFAULT = 500;
-  const MIN = 50;
-  const MAX = 10000;
-
-  if (value === undefined || value === null) {
-    return DEFAULT;
-  }
-
-  // Parse to number
-  const parsed = typeof value === 'number' ? value : Number(value);
-
-  // Validate: must be finite, positive, and within bounds
-  if (!Number.isFinite(parsed) || parsed < MIN || parsed > MAX) {
-    return DEFAULT;
-  }
-
-  return Math.floor(parsed); // Ensure integer
-}
-
-/**
  * Extended sessions service with custom methods
  */
 export class SessionsService extends DrizzleService<Session, Partial<Session>, SessionParams> {
@@ -127,6 +108,7 @@ export class SessionsService extends DrizzleService<Session, Partial<Session>, S
   private sessionMCPRepo: SessionMCPServerRepository;
   private sessionEnvSelectionRepo: SessionEnvSelectionRepository;
   private usersRepo: UsersRepository;
+  private branchRepo: BranchRepository;
 
   constructor(db: Database, app: Application) {
     const sessionRepo = new SessionRepository(db);
@@ -144,6 +126,7 @@ export class SessionsService extends DrizzleService<Session, Partial<Session>, S
     this.app = app;
     this.sessionMCPRepo = new SessionMCPServerRepository(db);
     this.sessionEnvSelectionRepo = new SessionEnvSelectionRepository(db);
+    this.branchRepo = new BranchRepository(db);
     // Used by resolveChildIdentity to stamp unix_username on fork/spawn children
     // without going through app.service('users') — matches the convention used
     // by scheduler.ts / gateway.ts / terminals.ts.
@@ -206,7 +189,7 @@ export class SessionsService extends DrizzleService<Session, Partial<Session>, S
    * for the rules.
    *
    * Defaults the child to the MCP-authenticated caller; only inherits the
-   * parent's identity when the worktree explicitly opts in via the
+   * parent's identity when the branch explicitly opts in via the
    * `dangerously_allow_session_sharing` flag (and the caller is not an admin
    * acting on someone else's session).
    *
@@ -251,19 +234,26 @@ export class SessionsService extends DrizzleService<Session, Partial<Session>, S
       throw new Forbidden('Cannot spawn/fork session without an authenticated caller identity.');
     }
 
-    // Look up the parent's worktree to read the opt-in flag.
-    let worktree: { worktree_id: string; dangerously_allow_session_sharing?: boolean } | undefined;
+    // Look up the parent's branch to read the opt-in flag.
+    let branch: { branch_id: string; dangerously_allow_session_sharing?: boolean } | undefined;
     try {
-      const wt = await this.app
-        .service('worktrees')
-        .get(parent.worktree_id, { provider: undefined });
-      worktree = wt as typeof worktree;
+      const wt = await this.app.service('branches').get(parent.branch_id, { provider: undefined });
+      branch = wt as typeof branch;
+      if (caller.user_id) {
+        const effective = await this.branchRepo.resolveUserAccess(
+          wt as Branch,
+          caller.user_id as UUID
+        );
+        if (branch) {
+          branch.dangerously_allow_session_sharing = effective.dangerously_allow_session_sharing;
+        }
+      }
     } catch {
-      // If we can't load the worktree, default to the safe (caller-as-owner) path.
-      worktree = undefined;
+      // If we can't load the branch, default to the safe (caller-as-owner) path.
+      branch = undefined;
     }
 
-    const result = determineSpawnIdentity(parent, caller, worktree);
+    const result = determineSpawnIdentity(parent, caller, branch);
     const createdBy = result.created_by as Session['created_by'];
 
     // Legacy sharing → inherit parent's unix_username (identity borrowing by design).
@@ -309,7 +299,7 @@ export class SessionsService extends DrizzleService<Session, Partial<Session>, S
 
     // Default: attribute the child to the MCP-authenticated caller, not the
     // parent owner. Legacy parent-inheriting "identity borrowing" is preserved
-    // only when the worktree opts in via dangerously_allow_session_sharing.
+    // only when the branch opts in via dangerously_allow_session_sharing.
     const { created_by, unix_username } = await this.resolveChildIdentity(parent, params);
 
     const forkedSession = await this.create(
@@ -318,7 +308,7 @@ export class SessionsService extends DrizzleService<Session, Partial<Session>, S
         status: SessionStatus.IDLE,
         title: data.prompt.substring(0, 100), // First 100 chars as title
         description: data.prompt,
-        worktree_id: parent.worktree_id,
+        branch_id: parent.branch_id,
         created_by, // See resolveChildIdentity — defaults to caller, not parent owner
         unix_username, // Stamped by resolveChildIdentity — this.create() bypasses
         // the setSessionUnixUsername hook so we must set it explicitly here.
@@ -380,112 +370,90 @@ export class SessionsService extends DrizzleService<Session, Partial<Session>, S
   }
 
   /**
-   * Custom method: Spawn a child session
+   * Spawn a child session, optionally delegating to a different agentic tool.
    *
-   * Creates a new session for delegating a subsession to another agent.
+   * Config resolution is centralized in {@link resolveChildSessionConfig}
+   * (`@agor/core/sessions`):
    *
-   * Settings inheritance:
-   * - If spawning the same agentic tool → inherit parent's settings (permission_config, model_config)
-   * - If spawning a different tool → use user's preferred settings for that tool
-   * - Explicit overrides in SpawnConfig take precedence over both
+   *   model_config:      request → parent (same tool only) → user default → undefined
+   *   permission_config: request → parent (same tool only) → user default → mapped system default
+   *
+   * The "same tool only" gate prevents cross-tool inheritance bugs: a Codex
+   * child spawned from a Claude parent must not inherit `claude-opus-4-7`,
+   * because Codex cannot run Claude models. When no per-tool default exists,
+   * the helper returns `model_config: undefined` and the SDK picks its own
+   * default rather than running with a poisoned value.
+   *
+   * Identity resolution runs *before* defaults lookup so per-tool defaults
+   * come from the resolved child owner (the caller in normal cross-user
+   * spawns), not the parent owner. Otherwise a collaborator spawning a
+   * subsession would get the parent owner's preferences stamped on their
+   * own session.
+   *
+   * MCP server inheritance is handled inline below — MCPs are tool-agnostic
+   * and follow "explicit list > copy from parent" regardless of tool match.
    */
   async spawn(
     id: string,
     data: Partial<import('@agor/core/types').SpawnConfig>,
     params?: SessionParams
   ): Promise<Session> {
-    // Validate required fields
     if (!data.prompt) {
       throw new Error('Spawn requires a prompt');
     }
     const parent = await this.get(id, params);
     const targetTool = data.agent || parent.agentic_tool;
-    const isSameTool = targetTool === parent.agentic_tool;
 
-    // Determine settings based on:
-    // 1. Explicit overrides in SpawnConfig (highest priority)
-    // 2. User preferences (if spawning different tool)
-    // 3. Parent settings (fallback via getInheritableConfig)
+    // Resolve identity first so per-tool defaults come from the resolved
+    // child owner, not the parent owner. (For internal/provider-less calls,
+    // `resolveChildIdentity` returns `parent.created_by` anyway.)
+    const { created_by, unix_username } = await this.resolveChildIdentity(parent, params);
 
-    const inherited = getInheritableConfig(parent);
-    let permissionConfig = inherited.permission_config;
-    let modelConfig = inherited.model_config;
-
-    // If spawning a different tool and no explicit overrides, fetch user preferences
-    if (!isSameTool && !data.permissionMode && !data.modelConfig) {
-      const userId = parent.created_by;
-      if (userId && this.app) {
-        try {
-          const user = await this.app.service('users').get(userId, params);
-          const toolDefaults = user?.default_agentic_config?.[targetTool];
-
-          if (toolDefaults) {
-            // Use user's preferred settings for this tool
-            permissionConfig = {
-              mode: toolDefaults.permissionMode,
-              ...(targetTool === 'codex' &&
-              toolDefaults.codexSandboxMode &&
-              toolDefaults.codexApprovalPolicy
-                ? {
-                    codex: {
-                      sandboxMode: toolDefaults.codexSandboxMode,
-                      approvalPolicy: toolDefaults.codexApprovalPolicy,
-                      networkAccess: toolDefaults.codexNetworkAccess,
-                    },
-                  }
-                : {}),
-            };
-
-            if (toolDefaults.modelConfig) {
-              modelConfig = {
-                mode: toolDefaults.modelConfig.mode || 'alias',
-                model: toolDefaults.modelConfig.model || '',
-                updated_at: new Date().toISOString(),
-                effort: toolDefaults.modelConfig.effort,
-              };
-            }
-          }
-        } catch (error) {
-          // If we can't fetch user preferences, fall back to parent settings
-          console.warn(
-            'Could not fetch user preferences for spawned session, using parent settings:',
-            error
-          );
-        }
+    // Load the child owner's per-tool defaults. Failing this lookup is
+    // non-fatal — the resolver falls through to the mapped system default
+    // when `user` is null.
+    let user: import('@agor/core/types').User | null = null;
+    if (created_by && this.app) {
+      try {
+        user = (await this.app
+          .service('users')
+          .get(created_by, params)) as import('@agor/core/types').User;
+      } catch (error) {
+        console.warn(
+          'Could not fetch user preferences for spawned session, using system defaults:',
+          error
+        );
       }
     }
 
-    // Apply explicit overrides from SpawnConfig
-    if (data.permissionMode) {
-      permissionConfig = {
-        mode: data.permissionMode,
-        ...(targetTool === 'codex' && data.codexSandboxMode && data.codexApprovalPolicy
-          ? {
-              codex: {
-                sandboxMode: data.codexSandboxMode,
-                approvalPolicy: data.codexApprovalPolicy,
-                networkAccess: data.codexNetworkAccess,
-              },
-            }
-          : permissionConfig?.codex
-            ? { codex: permissionConfig.codex }
-            : {}),
-      };
+    const resolved = resolveChildSessionConfig({
+      parent,
+      effectiveTool: targetTool,
+      user,
+      overrides: {
+        permissionMode: data.permissionMode,
+        modelConfig: data.modelConfig,
+        codexSandboxMode: data.codexSandboxMode,
+        codexApprovalPolicy: data.codexApprovalPolicy,
+        codexNetworkAccess: data.codexNetworkAccess,
+      },
+    });
+    const permissionConfig = resolved.permission_config;
+    const modelConfig = resolved.model_config;
+
+    // Soft validation: warn (don't block) when the resolved model looks like
+    // it belongs to a different tool. Custom model strings are accepted.
+    const lintWarning = formatModelToolMismatchWarning(
+      lintModelToolMatch(modelConfig?.model, targetTool)
+    );
+    if (lintWarning) {
+      console.warn(`[SessionsService.spawn] ${lintWarning}`);
     }
 
-    if (data.modelConfig) {
-      modelConfig = {
-        mode: data.modelConfig.mode || 'alias',
-        model: data.modelConfig.model || '',
-        updated_at: new Date().toISOString(),
-        effort: data.modelConfig.effort,
-      };
-    }
-
-    // Build callback configuration
-    // callback_session_id is the single source of truth for where to deliver callbacks.
-    // Default to parent session when callbacks are enabled (which is the default for spawn).
-    const isCallbackEnabled = data.enableCallback !== false; // default: true for spawn
+    // callback_session_id is the single source of truth for where to deliver
+    // callbacks. Default to parent session when callbacks are enabled (which
+    // is the default for spawn).
+    const isCallbackEnabled = data.enableCallback !== false;
     const callbackConfig = {
       ...(data.enableCallback !== undefined ? { enabled: data.enableCallback } : {}),
       ...(isCallbackEnabled
@@ -497,20 +465,13 @@ export class SessionsService extends DrizzleService<Session, Partial<Session>, S
       ...(data.includeOriginalPrompt !== undefined
         ? { include_original_prompt: data.includeOriginalPrompt }
         : {}),
-      // Default callback mode to "once" — fires once then auto-disables
       callback_mode: data.callbackMode ?? 'once',
     };
 
-    // Build final prompt (append extra instructions if provided)
     let finalPrompt = data.prompt;
     if (data.extraInstructions) {
       finalPrompt = `${data.prompt}\n\n${data.extraInstructions}`;
     }
-
-    // Default: attribute the child to the MCP-authenticated caller, not the
-    // parent owner. Legacy parent-inheriting "identity borrowing" is preserved
-    // only when the worktree opts in via dangerously_allow_session_sharing.
-    const { created_by, unix_username } = await this.resolveChildIdentity(parent, params);
 
     const spawnedSession = await this.create(
       {
@@ -518,7 +479,7 @@ export class SessionsService extends DrizzleService<Session, Partial<Session>, S
         status: SessionStatus.IDLE,
         title: data.title || data.prompt.substring(0, 100), // Use provided title or first 100 chars
         description: finalPrompt, // Use final prompt with extra instructions if provided
-        worktree_id: parent.worktree_id,
+        branch_id: parent.branch_id,
         created_by, // See resolveChildIdentity — defaults to caller, not parent owner
         unix_username, // Stamped by resolveChildIdentity — this.create() bypasses
         // the setSessionUnixUsername hook so we must set it explicitly here.
@@ -645,7 +606,7 @@ export class SessionsService extends DrizzleService<Session, Partial<Session>, S
   /**
    * Custom method: Trigger queue processing
    *
-   * Processes the next queued message for an idle session.
+   * Drains the next queued task for an idle session.
    * Used by callback system to trigger immediate queue processing.
    *
    * NOTE: The actual implementation is provided by index.ts via setQueueProcessor
@@ -753,7 +714,9 @@ export class SessionsService extends DrizzleService<Session, Partial<Session>, S
     if (includeLastMessage === true || includeLastMessage === 'true') {
       const truncationLengthQuery = params?.query?.last_message_truncation_length;
       const truncationLengthRoot = params?._last_message_truncation_length;
-      const truncationLength = parseTruncationLength(truncationLengthRoot ?? truncationLengthQuery);
+      const truncationLength = parseLastMessageTruncationLength(
+        truncationLengthRoot ?? truncationLengthQuery
+      );
       const result = await this.sessionRepo.enrichWithLastMessage(
         session as Session,
         truncationLength

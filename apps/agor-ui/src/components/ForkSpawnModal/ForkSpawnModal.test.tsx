@@ -42,8 +42,12 @@ const mockSession: Partial<Session> = {
   agentic_tool: 'claude-code',
 };
 
-describe('ForkSpawnModal prompt preservation', () => {
+// 10s timeout per test: these exercise full Antd Modal mount + async
+// confirm + waitFor cycles which intermittently brush against vitest's
+// 5s default on slower CI runners (observed flaking on multiple PRs).
+describe('ForkSpawnModal prompt preservation', { timeout: 10_000 }, () => {
   it('keeps the modal open and preserves the typed prompt when fork fails', async () => {
+    // Bumped from default 5s — flaked on CI under load (this PR and others).
     const typedPrompt = 'please investigate the failing migration';
     const onConfirm = vi.fn().mockRejectedValue(new Error('Executor spawn failed'));
     const onCancel = vi.fn();
@@ -74,7 +78,7 @@ describe('ForkSpawnModal prompt preservation', () => {
     // prompt must still be in the textarea so the user can retry.
     expect(onCancel).not.toHaveBeenCalled();
     expect((screen.getByTestId('prompt-textarea') as HTMLTextAreaElement).value).toBe(typedPrompt);
-  });
+  }, 10000);
 
   it('clears the form and closes only after a successful confirm', async () => {
     const onConfirm = vi.fn().mockResolvedValue(undefined);

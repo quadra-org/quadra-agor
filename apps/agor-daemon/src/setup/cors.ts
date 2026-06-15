@@ -15,7 +15,6 @@
  *
  * Environment-derived inputs (not part of the config block) remain here:
  *   - UI port (for the localhost allow-list)
- *   - Codespaces detection (`*.github.dev`, `*.githubpreview.dev`)
  *
  * Backcompat: the legacy `daemon.cors_origins`, `daemon.cors_allow_sandpack`,
  * and `CORS_ORIGIN` env var continue to work via `resolveSecurity()` — by the
@@ -29,10 +28,16 @@ import type { CorsOptions } from 'cors';
 export type CorsOrigin = CorsOptions['origin'];
 
 export interface CorsConfigOptions {
-  /** UI port for localhost origins */
+  /** UI port for localhost origins (Vite dev server) */
   uiPort: number;
-  /** Whether running in GitHub Codespaces */
-  isCodespaces: boolean;
+  /**
+   * Daemon port. Must be in the localhost allow-list because in npm-installed
+   * deployments the daemon serves the UI from its own origin (e.g.
+   * `http://localhost:3030/ui/`), so same-origin XHR / Socket.io requests
+   * carry `Origin: http://localhost:<daemonPort>` and would otherwise be
+   * rejected by the cors() callback. Bug surfaced in 0.17.3 — see PR #1106.
+   */
+  daemonPort: number;
   /** Resolved CORS config (from `@agor/core/config` `resolveSecurity()`). */
   resolved: ResolvedCors;
 }
@@ -106,10 +111,13 @@ function parseRegexPattern(entry: string): RegExp | null {
  * PNA, credential stripping, etc.
  */
 export function buildCorsConfig(options: CorsConfigOptions): CorsConfigResult {
-  const { uiPort, isCodespaces, resolved } = options;
+  const { uiPort, daemonPort, resolved } = options;
 
-  // Support UI port and 3 additional ports (for parallel dev servers)
+  // Localhost allow-list:
+  //   - daemon port (npm-installed mode serves the UI from the daemon origin)
+  //   - UI port + 3 successors (Vite + parallel dev servers)
   const localhostOrigins = [
+    `http://localhost:${daemonPort}`,
     `http://localhost:${uiPort}`,
     `http://localhost:${uiPort + 1}`,
     `http://localhost:${uiPort + 2}`,
@@ -162,25 +170,19 @@ export function buildCorsConfig(options: CorsConfigOptions): CorsConfigResult {
     };
   }
 
-  // --- List mode: localhost + codespaces + sandpack + user-provided. ------
+  // --- List mode: localhost + sandpack + user-provided. ------
   const exactOrigins = new Set(localhostOrigins);
   const patterns: RegExp[] = [];
 
-  // Tightened localhost regex: only the configured UI port range, not "any port".
-  // We accept both http and https for localhost so that operators terminating
-  // TLS in front of a local UI dev server still work.
-  const uiPortRange = [uiPort, uiPort + 1, uiPort + 2, uiPort + 3].join('|');
-  patterns.push(new RegExp(`^https?:\\/\\/localhost:(${uiPortRange})$`));
+  // Tightened localhost regex: only the daemon port + configured UI port range,
+  // not "any port". We accept both http and https for localhost so that
+  // operators terminating TLS in front of a local UI dev server still work.
+  const localhostPortRange = [daemonPort, uiPort, uiPort + 1, uiPort + 2, uiPort + 3].join('|');
+  patterns.push(new RegExp(`^https?:\\/\\/localhost:(${localhostPortRange})$`));
 
   // Sandpack/CodeSandbox bundler (on by default, configurable).
   if (resolved.allowSandpack) {
     patterns.push(SANDPACK_ORIGIN_PATTERN);
-  }
-
-  // GitHub Codespaces
-  if (isCodespaces) {
-    patterns.push(/\.github\.dev$/, /\.githubpreview\.dev$/, /\.preview\.app\.github\.dev$/);
-    console.log('🔒 CORS configured for GitHub Codespaces (*.github.dev, *.githubpreview.dev)');
   }
 
   // Additional origins from resolved config (security.cors.origins merged

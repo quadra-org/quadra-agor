@@ -5,7 +5,8 @@
  * through messaging platforms (Slack, Discord, etc.)
  */
 
-export type { GatewayConnector, InboundMessage } from './connector';
+export type { GatewayConnector, InboundMessage, OutboundPayload } from './connector';
+export { normalizeOutbound } from './connector';
 export { getConnector, hasConnector, registerConnector } from './connector-registry';
 export { GitHubConnector, parseThreadId as parseGitHubThreadId } from './connectors/github';
 export { SlackConnector } from './connectors/slack';
@@ -16,3 +17,4 @@ export {
 } from './connectors/teams';
 export type { GatewayContext } from './context';
 export { formatGatewayContext } from './context';
+export { formatGatewaySystemMessage } from './system-message';

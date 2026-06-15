@@ -1,26 +1,21 @@
 ---
 title: agor Documentation
-description: Complete guide to agor - next-gen agent orchestration for AI coding. Learn about multiplayer workspaces, git worktrees, session trees, and real-time collaboration for Claude Code, Codex, and Gemini.
+description: Team command center for all things agentic. A shared canvas for coding agents and long-lived assistants, anchored on git branches, with real-time multiplayer and an MCP surface agents drive themselves.
 ---
 
 <div style={{ textAlign: 'center', marginTop: '2rem', marginBottom: '2rem' }}>
   <img
     src="/logo.png"
-    alt="agor logo - AI agent orchestration platform"
+    alt="agor logo - team command center for all things agentic"
     style={{ width: '135px', height: '135px', borderRadius: '50%', opacity: 0.9 }}
   />
 </div>
 
 # <span className="gradient-text">agor</span>
 
-**Think Figma, but for AI coding assistants.**
+**Team command center for all things agentic.**
 
-**Next-gen agent orchestration for AI coding.** The multiplayer-ready, spatial layer that connects Claude Code, Codex, Gemini, and any agentic coding tool into one unified workspace.
-
-> **TL;DR:** Agor is a multiplayer spatial canvas where you coordinate multiple AI coding assistants on parallel tasks, with GitHub-linked worktrees, automated workflow zones, and isolated test environments—all running simultaneously.
-
-Visualize, coordinate, and automate your AI workflows across tools solo or with your team.
-Agor offers a place where you can coordinate entire swarms of AI agents.
+Agor is a shared canvas where coding agents (Claude Code, Codex, Gemini) and long-lived assistants run side-by-side on isolated git branches — the anchor entity where sessions, dev environments, prompts, and PRs converge. Your whole team rallies around the same live work in real time, and the agents themselves drive Agor over MCP.
 
 import { GifGallery } from '../../components';
 
@@ -34,6 +29,8 @@ import { GifGallery } from '../../components';
 
 ## Getting Started
 
+Requires Node.js ≥ 22.12.
+
 ```bash
 npm install -g agor-live
 agor init
@@ -41,91 +38,21 @@ agor daemon start
 agor open
 ```
 
-**Try in GitHub Codespaces (up in 1-2 minutes):**
+Prefer Homebrew on macOS or Linux? See the [Getting Started Guide](/guide/getting-started) for that install path, then add your first repo. For Docker, source builds, and other options, see [Extended Installation](/guide/extended-install).
 
-[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://github.com/codespaces/new?skip_quickstart=true&machine=basicLinux32gb&repo=1069864589&ref=main&devcontainer_path=.devcontainer%2Fdevcontainer.json&geo=UsWest)
+**Then dive in:**
 
-See the [Getting Started Guide](/guide/getting-started) for detailed instructions, or the [Development Guide](/guide/development) for Docker setup.
-
----
-
-## Key Features
-
-### 🧩 Agent Swarm Control
-
-- Run as many **Claude Code**, **Codex**, and **Gemini** sessions as you can handle—simultaneously.
-- Agents in Agor can coordinate and supervise through the internal Agor MCP service.
-- Built-in **scheduler** triggers templated prompts on your cadence.
-
-### 🌐 Multiplayer Spatial Canvas
-
-- Figma-esque board layout organizes your AI coding sessions across boards (full 2D canvases).
-- **Scoped/spatial comments** + reactions pinned to boards, zones, or worktrees (Figma-style).
-- WebSocket-powered cursor broadcasting and facepiles show teammates in real time.
-
-### 🌲 Session Trees — Fork, Spawn, Coordinate
-
-- **Fork sessions** to explore alternatives without losing the original path.
-- **Spawn subsessions** for focused subtasks that report back to the parent.
-- Visualize the session genealogy in "session trees"
-
-### ⚙️ Zone Triggers — Workflows Made Spatial
-
-- Define **zones** on your board that trigger templated prompts when worktrees are dropped.
-- Build **kanban-style flows** or custom pipelines: analyze → develop → review → deploy.
-- **GitHub-native workflow**: Link worktrees to issues/PRs, auto-inject context into prompts
-  - Template syntax: `"deeply analyze this github issue: {{ worktree.issue_url }}"`
-  - Each worktree = isolated branch for a specific issue/PR
-  - AI agents automatically read the linked issue/PR context
-
-### 🌳 Isolated Development Environments
-
-**The Problem:** Working on 3 PRs simultaneously? Each needs different ports, dependencies, database states.
-
-**Agor's Solution:**
-
-- Each worktree gets its own **isolated environment** with auto-managed unique ports
-- Configure start/stop commands once with templates: `PORT={{ add 9000 worktree.unique_id }} docker compose up -d`
-- Everyone on your team can **one-click start/stop** any worktree's environment
-- Multiple AI agents work in parallel without stepping on each other
-- Health monitoring tracks if services are running properly
-
-**No more:** "Kill your local server, I need to test my branch"
-
-### 🕹️ Real-Time Strategy for AI Teams
-
-- Coordinate agentic work like a multiplayer RTS.
-- Watch teammates or agents move across tasks live.
-- Cluster sessions, delegate, pivot, and iterate together.
-
-### 📱 Mobile-Friendly Prompting
-
-- **Keep sessions cooking on the go** — mobile-optimized UI for sending prompts and monitoring progress.
-- Access conversations, send follow-ups, and check agent status from your phone.
-- Full conversation view with hamburger navigation to switch between sessions.
-
----
-
-## Use Case: Parallel PR Workflow
-
-Your team has 3 bug fixes and 2 features in flight. With Agor:
-
-1. **Create 5 worktrees**, each linked to its GitHub issue/PR
-2. **Spawn AI sessions** for each worktree (Claude, Codex, Gemini)
-3. **Drop into zones** → "Analyze" zone triggers: `"Review this issue: {{ worktree.issue_url }}"`
-4. **Watch in real-time** as all 5 agents work simultaneously on the spatial canvas
-5. **Isolated environments** with unique ports prevent conflicts
-6. **Push directly** from worktrees to GitHub when ready
-
-**No context switching. No port collisions. No waiting.**
+- **[Features Overview](/guide/features-overview)** — A map of what Agor does, starting with branches, sessions, and boards
+- **[Architecture](/guide/architecture)** — System design and the typed TypeScript client
+- **[Development Guide](/guide/development)** — Run Agor in Agor and contribute
 
 ---
 
 ## Screenshots
 
-![Agor multiplayer spatial canvas showing AI agent sessions organized on a board with real-time cursors, zones, and worktree cards](/hero.png)
+![Agor board with custom-styled zones organizing branches into a pipeline (MAIN SESH, Agor Coding Tasks, Create a pull request, Codex review, Human review). Each branch card shows its session tree, env tabs, and PR badge.](/screenshots/board-hero.png)
 
-_Multiplayer spatial canvas with zones, real-time cursors, and session organization_
+_Multiplayer spatial canvas with custom-styled zones, session trees, and branch pipelines_
 
 <div
   style={{
@@ -149,61 +76,61 @@ _Multiplayer spatial canvas with zones, real-time cursors, and session organizat
   <div>
     <img
       src="/screenshots/settings_modal.png"
-      alt="Agor settings modal for configuring MCP servers, managing worktrees, and agent preferences"
+      alt="Agor settings modal for configuring MCP servers, managing branches, and agent preferences"
       style={{ width: '100%', borderRadius: '8px' }}
     />
     <p style={{ textAlign: 'center', marginTop: '8px', opacity: 0.5 }}>
-      <em>MCP server and worktree management</em>
+      <em>MCP server and branch management</em>
     </p>
   </div>
   <div>
     <img
-      src="/screenshots/zone_trigger_modal.png"
-      alt="Agor zone trigger modal displaying automated workflow prompts when dragging sessions into board zones"
+      src="/screenshots/zone-trigger.png"
+      alt="Agor zone trigger modal showing a templated prompt with mustache placeholders ({{ branch.name }}, {{ branch.pull_request_url }}) and Prompt/Fork/Spawn action choices"
       style={{ width: '100%', borderRadius: '8px' }}
     />
     <p style={{ textAlign: 'center', marginTop: '8px', opacity: 0.5 }}>
-      <em>Zone trigger on session drop</em>
+      <em>Zone trigger with templated prompt</em>
     </p>
   </div>
   <div>
     <img
-      src="/screenshots/zone_trigger_config.png"
-      alt="Agor zone trigger configuration interface for setting up kanban-style workflows and automated prompts"
+      src="/screenshots/tool-blocks.png"
+      alt="Agor chat showing structured tool blocks: collapsible thinking, Grep with pattern badge, Edit with red/green inline diff, and Bash with expandable output"
       style={{ width: '100%', borderRadius: '8px' }}
     />
     <p style={{ textAlign: 'center', marginTop: '8px', opacity: 0.5 }}>
-      <em>Zone trigger configuration</em>
+      <em>Structured tool blocks with inline diffs</em>
     </p>
   </div>
   <div>
     <img
-      src="/screenshots/env_configuration.png"
-      alt="Agor worktree environment configuration showing Docker compose commands and port management templates"
+      src="/screenshots/env-variants-full.png"
+      alt="Agor branch environment tab showing YAML config with named variants (docs, full, sqlite, postgres) and Docker compose commands"
       style={{ width: '100%', borderRadius: '8px' }}
     />
     <p style={{ textAlign: 'center', marginTop: '8px', opacity: 0.5 }}>
-      <em>Worktree environment setup</em>
+      <em>Branch environment with named variants</em>
     </p>
   </div>
   <div>
     <img
-      src="/screenshots/create_session_modal.png"
-      alt="Agor create session modal with agent selection options for Claude Code, Codex, and Gemini"
+      src="/screenshots/create-session-modal.png"
+      alt="Agor create session modal showing five agent runtime cards side-by-side: Claude Code, Codex, Gemini, OpenCode (BETA), GitHub Copilot (BETA)"
       style={{ width: '100%', borderRadius: '8px' }}
     />
     <p style={{ textAlign: 'center', marginTop: '8px', opacity: 0.5 }}>
-      <em>Session creation with agent selection</em>
+      <em>Pick any SDK: Claude, Codex, Gemini, OpenCode, Copilot</em>
     </p>
   </div>
   <div>
     <img
       src="/screenshots/baked_in_terminal.png"
-      alt="Agor built-in terminal with automatic worktree context and environment variable injection"
+      alt="Agor built-in terminal with automatic branch context and environment variable injection"
       style={{ width: '100%', borderRadius: '8px' }}
     />
     <p style={{ textAlign: 'center', marginTop: '8px', opacity: 0.5 }}>
-      <em>Built-in terminal with worktree context</em>
+      <em>Built-in terminal with branch context</em>
     </p>
   </div>
   <div>
@@ -238,8 +165,8 @@ See the [Architecture Guide](/guide/architecture) for details.
 Highlights:
 
 - **Match CLI-Native Features** — SDKs are evolving rapidly and exposing more functionality. Our goal is to push integrations deeper to match all key features available in the underlying CLIs, closing the gap between SDK-based orchestration and native tool capabilities
-- **Bring Your Own IDE** — Connect VSCode, Cursor, or any IDE directly to Agor-managed worktrees via SSH/Remote. Keep your familiar editor and agent while Agor orchestrates sessions, tracks progress, and enables team visibility on the multiplayer board
-- **Unix User Integration** — Enable true multi-tenancy with per-user Unix isolation for secure collaboration. [Read the exploration →](https://github.com/preset-io/agor/blob/main/context/explorations/unix-user-integration.md)
+- **Bring Your Own IDE** — Connect VSCode, Cursor, or any IDE directly to Agor-managed branches via SSH/Remote. Keep your familiar editor and agent while Agor orchestrates sessions, tracks progress, and enables team visibility on the multiplayer board
+- **Unix User Integration** — Enable true multi-tenancy with per-user Unix isolation for secure collaboration. [Read the guide →](/guide/multiplayer-unix-isolation)
 
 ---
 
@@ -254,7 +181,3 @@ Read the [Development Guide](/guide/development) for dev workflow and detailed r
 ## License
 
 Business Source License 1.1 — see the [GitHub repository](https://github.com/preset-io/agor/blob/main/LICENSE) for details
-
----
-
-> "git tracks code, Agor tracks the conversations that produced it."

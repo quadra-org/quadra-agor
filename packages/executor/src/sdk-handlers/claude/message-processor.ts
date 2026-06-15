@@ -11,6 +11,11 @@
  * - Yield structured events for database persistence
  */
 
+import {
+  SUPPRESSED_CLAUDE_STATUSES,
+  shouldSuppressClaudeSystemEvent,
+} from '@agor/core/client/claude-system-suppression';
+import { shortId } from '@agor/core/db';
 import type {
   SDKAssistantMessage,
   SDKCompactBoundaryMessage,
@@ -23,6 +28,15 @@ import type {
 } from '@agor/core/sdk';
 import type { SessionID } from '@agor/core/types';
 import { MessageRole } from '@agor/core/types';
+
+const DEBUG_CLAUDE_MESSAGES =
+  process.env.AGOR_DEBUG_CLAUDE_MESSAGES === '1' || process.env.DEBUG?.includes('claude-messages');
+
+function claudeMessageDebug(...args: unknown[]): void {
+  if (DEBUG_CLAUDE_MESSAGES) {
+    console.debug(...args);
+  }
+}
 
 /**
  * Content block interface for SDK messages
@@ -242,7 +256,7 @@ export class SDKMessageProcessor {
 
     // Log message type for debugging (skip stream_event as it's too verbose)
     if (this.state.messageCount % 10 === 0 && msg.type !== 'stream_event') {
-      console.debug(`📨 SDK message ${this.state.messageCount}: type=${msg.type}`);
+      claudeMessageDebug(`📨 SDK message ${this.state.messageCount}: type=${msg.type}`);
     }
 
     // Add detailed logging for debugging SDK behavior
@@ -351,7 +365,7 @@ export class SDKMessageProcessor {
   private handleUser(msg: SDKUserMessage | SDKUserMessageReplay): ProcessedEvent[] {
     // Check if this is a replay message (already processed)
     if ('isReplay' in msg && msg.isReplay) {
-      console.debug(`🔄 User message replay (uuid: ${msg.uuid?.substring(0, 8)})`);
+      console.debug(`🔄 User message replay (uuid: ${msg.uuid ? shortId(msg.uuid) : 'unknown'})`);
       return []; // Skip replays - already in our database
     }
 
@@ -367,7 +381,7 @@ export class SDKMessageProcessor {
       const toolResults = content.filter((b) => b.type === 'tool_result');
       const errorCount = toolResults.filter((tr) => tr.is_error).length;
       const successCount = toolResults.length - errorCount;
-      console.log(
+      claudeMessageDebug(
         `🔧 SDK user message with ${toolResults.length} tool result(s) (✅ ${successCount}, ❌ ${errorCount})`
       );
 
@@ -386,7 +400,9 @@ export class SDKMessageProcessor {
     } else if (hasText) {
       const textBlocks = content.filter((b) => b.type === 'text');
       const textPreview = textBlocks[0]?.text?.substring(0, 100) || '';
-      console.log(`👤 SDK user message (uuid: ${uuid?.substring(0, 8)}): "${textPreview}"`);
+      claudeMessageDebug(
+        `👤 SDK user message (uuid: ${uuid ? shortId(uuid) : 'unknown'}): "${textPreview}"`
+      );
 
       // Regular user text messages - also save for completeness
       return [
@@ -401,8 +417,8 @@ export class SDKMessageProcessor {
         },
       ];
     } else {
-      console.log(`👤 SDK user message (uuid: ${uuid?.substring(0, 8)})`);
-      console.log(
+      claudeMessageDebug(`👤 SDK user message (uuid: ${uuid ? shortId(uuid) : 'unknown'})`);
+      claudeMessageDebug(
         `   Content types:`,
         Array.isArray(content) ? content.map((b) => b.type) : 'no content'
       );
@@ -423,7 +439,7 @@ export class SDKMessageProcessor {
 
     // Message start event
     if (event?.type === 'message_start') {
-      console.debug(`🎬 Message start`);
+      claudeMessageDebug(`🎬 Message start`);
       events.push({
         type: 'message_start',
         agentSessionId: this.state.capturedAgentSessionId,
@@ -462,7 +478,7 @@ export class SDKMessageProcessor {
           agentSessionId: this.state.capturedAgentSessionId,
         });
       } else if (block?.type === 'thinking') {
-        console.debug(`🧠 Thinking block start`);
+        claudeMessageDebug(`🧠 Thinking block start`);
         // Track thinking blocks
         this.state.contentBlockStack.push({
           index: blockIndex,
@@ -535,7 +551,7 @@ export class SDKMessageProcessor {
           agentSessionId: this.state.capturedAgentSessionId,
         });
       } else {
-        console.debug(`🏁 Content block ${blockIndex} complete`);
+        claudeMessageDebug(`🏁 Content block ${blockIndex} complete`);
       }
 
       // Remove from stack
@@ -546,7 +562,7 @@ export class SDKMessageProcessor {
 
     // Message stop event
     if (event?.type === 'message_stop') {
-      console.debug(`🏁 Message complete`);
+      claudeMessageDebug(`🏁 Message complete`);
       events.push({
         type: 'message_complete',
         agentSessionId: this.state.capturedAgentSessionId,
@@ -683,6 +699,17 @@ export class SDKMessageProcessor {
       ];
     }
 
+    // Suppress noisy status values (e.g. 'requesting' — fires on every API call).
+    // Other status variants (null, permissionMode change, compact_result/error) still
+    // flow through and get surfaced as generic sdk_event messages below.
+    if (
+      'status' in msg &&
+      typeof msg.status === 'string' &&
+      (SUPPRESSED_CLAUDE_STATUSES as ReadonlySet<string>).has(msg.status)
+    ) {
+      return [];
+    }
+
     if ('subtype' in msg && msg.subtype === 'init') {
       const initMsg = msg as SDKSystemMessage;
       console.debug(`ℹ️  SDK system init:`, {
@@ -726,7 +753,7 @@ export class SDKMessageProcessor {
     const subtype =
       ('subtype' in msg ? (msg as { subtype?: string }).subtype : undefined) || 'unknown';
 
-    if (SDKMessageProcessor.SUPPRESSED_SYSTEM_SUBTYPES.has(subtype)) {
+    if (shouldSuppressClaudeSystemEvent(msg as { subtype?: string; [key: string]: unknown })) {
       console.debug(`🔇 Suppressed system subtype: ${subtype}`);
       return [];
     }
@@ -807,18 +834,6 @@ export class SDKMessageProcessor {
   ]);
 
   /**
-   * System message subtypes to suppress (log-only, don't surface to users).
-   * Everything NOT in this set (and not already handled) is surfaced by default.
-   */
-  private static readonly SUPPRESSED_SYSTEM_SUBTYPES = new Set([
-    'files_persisted', // Internal SDK bookkeeping
-    'session_state_changed', // Internal SDK state transitions
-    'task_started', // SDK task lifecycle — no user-facing value
-    'task_progress', // SDK task lifecycle — fires repeatedly, very noisy
-    'task_notification', // SDK task lifecycle notification
-  ]);
-
-  /**
    * Handle unknown/unhandled top-level message types.
    * Blacklist approach: surface everything by default, suppress only known-noisy types.
    */
@@ -826,7 +841,7 @@ export class SDKMessageProcessor {
     const msgType = msg.type || 'unknown';
 
     if (SDKMessageProcessor.SUPPRESSED_MESSAGE_TYPES.has(msgType)) {
-      console.debug(`🔇 Suppressed SDK message type: ${msgType}`);
+      claudeMessageDebug(`🔇 Suppressed SDK message type: ${msgType}`);
       return [];
     }
 

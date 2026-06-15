@@ -5,8 +5,18 @@
  * Tokens are also persisted to the database for cross-process access.
  */
 
-import { UserMCPOAuthTokenRepository } from '@agor/core/db';
+import { MCPServerRepository, UserMCPOAuthTokenRepository } from '@agor/core/db';
+import { resolveTokenExpiry } from '@agor/core/tools/mcp/oauth-token-expiry';
 import type { MCPServerID, UserID } from '@agor/core/types';
+
+/**
+ * Default in-memory cache TTL when the provider gives us no expiry signal at
+ * all. This is ONLY used to bound the lifetime of the daemon-local
+ * `oauth21TokenCache` map (so it doesn't grow unbounded), NOT to fabricate
+ * an expiry on the persisted DB row. The DB row gets `expires_at = NULL`
+ * via `resolveTokenExpiry` → `saveToken({ expiresAt: null })`.
+ */
+const UNKNOWN_EXPIRY_CACHE_TTL_SECONDS = 3600;
 
 // ============================================================================
 // In-memory OAuth 2.1 Token Cache
@@ -56,6 +66,36 @@ export { oauth21TokenCache };
 // Database Token Storage
 // ============================================================================
 
+async function backfillOAuthTokenEndpoint(
+  // biome-ignore lint/suspicious/noExplicitAny: db type is complex (Drizzle instance), callers always pass the correct value
+  db: any,
+  opts: { mcpServerId: string; tokenEndpoint: string; logPrefix: string }
+): Promise<void> {
+  try {
+    const mcpServerRepo = new MCPServerRepository(db);
+    const server = await mcpServerRepo.findById(opts.mcpServerId);
+    if (server?.auth?.type === 'oauth' && !server.auth.oauth_token_url) {
+      await mcpServerRepo.update(opts.mcpServerId, {
+        auth: {
+          ...server.auth,
+          oauth_token_url: opts.tokenEndpoint,
+        },
+      });
+      console.log(
+        `[${opts.logPrefix}] Saved discovered OAuth token endpoint for server ${opts.mcpServerId}`
+      );
+    }
+  } catch (error) {
+    // Token persistence already succeeded; do not fail the OAuth callback.
+    // The manual refresh path will still surface a typed endpoint error if
+    // this best-effort config backfill fails.
+    console.warn(
+      `[${opts.logPrefix}] Failed to save discovered OAuth token endpoint for server ${opts.mcpServerId}:`,
+      error instanceof Error ? error.message : error
+    );
+  }
+}
+
 /**
  * Cache + persist an OAuth token after a successful flow completion.
  *
@@ -83,13 +123,34 @@ export async function persistOAuthToken(
     clientId?: string;
     /** client_secret used for the grant (absent for public clients). */
     clientSecret?: string;
+    /**
+     * Token endpoint discovered/used for this grant. Persisted back onto the
+     * server config when it was previously blank so later refreshes do not
+     * have to guess from the MCP resource URL.
+     */
+    tokenEndpoint?: string;
   },
   logPrefix: string
 ): Promise<void> {
-  const expiresIn = tokenResponse.expires_in ?? 3600;
+  // Walk the precedence cascade for the token TTL — see Phase 3.5 of
+  // `context/explorations/mcp-oauth-token-lifecycle.md`. Replaces the prior
+  // `tokenResponse.expires_in ?? 3600` defaulting that was asymmetric with
+  // the refresh path and lied to the DB for providers like Notion that omit
+  // `expires_in` entirely.
+  const expiry = resolveTokenExpiry(tokenResponse, tokenResponse.access_token);
 
-  // Cache the token at daemon level
-  cacheOAuth21Token(cacheKey, tokenResponse.access_token, expiresIn);
+  // The in-memory daemon cache still wants *some* TTL so its map doesn't
+  // grow unbounded. Derive seconds-from-now from the resolved Date when
+  // known, otherwise fall back to UNKNOWN_EXPIRY_CACHE_TTL_SECONDS (1h).
+  // This is local-cache hygiene only — the persisted DB row uses
+  // `expiry.expiresAt` directly so `NULL` makes it through to
+  // `oauth_token_expires_at` when the provider was silent, and the UI can
+  // correctly render "expires in: unknown".
+  const cacheTtlSeconds =
+    expiry.expiresAt !== null
+      ? Math.max(1, Math.floor((expiry.expiresAt.getTime() - Date.now()) / 1000))
+      : UNKNOWN_EXPIRY_CACHE_TTL_SECONDS;
+  cacheOAuth21Token(cacheKey, tokenResponse.access_token, cacheTtlSeconds);
 
   if (!pendingFlow.mcpServerId) {
     return;
@@ -111,15 +172,25 @@ export async function persistOAuthToken(
 
   await userTokenRepo.saveToken(tokenUserId, pendingFlow.mcpServerId as MCPServerID, {
     accessToken: tokenResponse.access_token,
-    expiresInSeconds: expiresIn,
+    expiresAt: expiry.expiresAt, // Date | null — null means "unknown"
     refreshToken: tokenResponse.refresh_token,
     clientId: pendingFlow.clientId,
     clientSecret: pendingFlow.clientSecret,
   });
 
+  if (pendingFlow.tokenEndpoint) {
+    await backfillOAuthTokenEndpoint(db, {
+      mcpServerId: pendingFlow.mcpServerId,
+      tokenEndpoint: pendingFlow.tokenEndpoint,
+      logPrefix,
+    });
+  }
+
   console.log(
     `[${logPrefix}] ${oauthMode === 'per_user' ? 'Per-user' : 'Shared'} token saved ` +
       `for user=${tokenUserId ?? '<shared>'} server=${pendingFlow.mcpServerId}` +
+      ` (expiry source: ${expiry.source}` +
+      `${expiry.expiresAt !== null ? `, expires=${expiry.expiresAt.toISOString()}` : ', expires=unknown'})` +
       `${pendingFlow.clientId ? ' (with DCR client creds)' : ''}`
   );
 }

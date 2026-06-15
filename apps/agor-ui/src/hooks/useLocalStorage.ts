@@ -1,4 +1,12 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { readLocalStorageJson, writeLocalStorageJson } from './localStorageJson';
+
+const LOCAL_STORAGE_CHANGE_EVENT = 'agor-local-storage-change';
+
+interface LocalStorageChangeDetail {
+  key: string;
+  value: unknown;
+}
 
 /**
  * Hook for persisting state to localStorage with type safety.
@@ -8,23 +16,11 @@ export function useLocalStorage<T>(
   key: string,
   initialValue: T
 ): [T, (value: T | ((val: T) => T)) => void] {
+  const readValue = useCallback(() => readLocalStorageJson(key, initialValue), [initialValue, key]);
+
   // State to store our value
   // Pass initial state function to useState so logic is only executed once
-  const [storedValue, setStoredValue] = useState<T>(() => {
-    if (typeof window === 'undefined') {
-      return initialValue;
-    }
-    try {
-      // Get from local storage by key
-      const item = window.localStorage.getItem(key);
-      // Parse stored json or if none return initialValue
-      return item ? JSON.parse(item) : initialValue;
-    } catch (error) {
-      // If error also return initialValue
-      console.error(`Error reading localStorage key "${key}":`, error);
-      return initialValue;
-    }
-  });
+  const [storedValue, setStoredValue] = useState<T>(readValue);
 
   // Keep key in a ref so the callback doesn't depend on it
   const keyRef = useRef(key);
@@ -35,8 +31,13 @@ export function useLocalStorage<T>(
     try {
       setStoredValue((prev) => {
         const valueToStore = value instanceof Function ? value(prev) : value;
+        writeLocalStorageJson(keyRef.current, valueToStore);
         if (typeof window !== 'undefined') {
-          window.localStorage.setItem(keyRef.current, JSON.stringify(valueToStore));
+          window.dispatchEvent(
+            new CustomEvent<LocalStorageChangeDetail>(LOCAL_STORAGE_CHANGE_EVENT, {
+              detail: { key: keyRef.current, value: valueToStore },
+            })
+          );
         }
         return valueToStore;
       });
@@ -44,6 +45,30 @@ export function useLocalStorage<T>(
       console.error(`Error setting localStorage key "${keyRef.current}":`, error);
     }
   }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === key) {
+        setStoredValue(readValue());
+      }
+    };
+
+    const handleLocalStorageChange = (event: Event) => {
+      const customEvent = event as CustomEvent<LocalStorageChangeDetail>;
+      if (customEvent.detail?.key === key) {
+        setStoredValue(customEvent.detail.value as T);
+      }
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener(LOCAL_STORAGE_CHANGE_EVENT, handleLocalStorageChange);
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener(LOCAL_STORAGE_CHANGE_EVENT, handleLocalStorageChange);
+    };
+  }, [key, readValue]);
 
   return [storedValue, setValue];
 }

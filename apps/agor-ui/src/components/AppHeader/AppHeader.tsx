@@ -1,40 +1,39 @@
-import type { ActiveUser, Board, BoardID, User, Worktree } from '@agor-live/client';
+import type {
+  AgorClient,
+  Artifact,
+  Board,
+  BoardID,
+  Branch,
+  MCPServer,
+  Session,
+  User,
+} from '@agor-live/client';
 import {
   ApiOutlined,
+  BookOutlined,
   CommentOutlined,
-  LogoutOutlined,
   QuestionCircleOutlined,
   SettingOutlined,
-  SoundOutlined,
   UnorderedListOutlined,
-  UserOutlined,
 } from '@ant-design/icons';
-import type { MenuProps } from 'antd';
-import {
-  Badge,
-  Button,
-  Divider,
-  Dropdown,
-  Layout,
-  Popover,
-  Space,
-  Tag,
-  Tooltip,
-  theme,
-} from 'antd';
-import { useState } from 'react';
+import { Badge, Button, Divider, Layout, Popover, Space, Tag, Tooltip, theme } from 'antd';
+import { useHref, useNavigate } from 'react-router-dom';
+import { useConnectionDisabled } from '../../contexts/ConnectionContext';
 import { BoardSwitcher } from '../BoardSwitcher';
 import { BrandLogo } from '../BrandLogo';
 import { ConnectionStatus } from '../ConnectionStatus';
-import { Facepile } from '../Facepile';
+import { GlobalSearch } from '../GlobalSearch';
+import { GlobalUserMenu } from '../GlobalUserMenu';
 import { MarkdownRenderer } from '../MarkdownRenderer';
 import { ThemeSwitcher } from '../ThemeSwitcher';
+import { GlobalPresenceFacepile } from './GlobalPresenceFacepile';
 
 const { Header } = Layout;
 
 export interface AppHeaderProps {
   user?: User | null;
-  activeUsers?: ActiveUser[];
+  presenceClient?: AgorClient | null;
+  presenceUsers?: User[];
   currentUserId?: string;
   connected?: boolean;
   connecting?: boolean;
@@ -54,8 +53,9 @@ export interface AppHeaderProps {
   boards?: Board[];
   currentBoardId?: string;
   onBoardChange?: (boardId: string) => void;
-  worktreeById?: Map<string, Worktree>;
-  boardById?: Map<string, Board>; // For looking up board names
+  onHomeClick?: () => void;
+  branchById: Map<string, Branch>;
+  boardById: Map<string, Board>; // For looking up board names; required because GlobalSearch hands it to useAppNavigation for slug-aware path building
   onUserClick?: (
     userId: string,
     boardId?: BoardID,
@@ -67,6 +67,12 @@ export interface AppHeaderProps {
   instanceLabel?: string;
   /** Instance description (markdown) shown in popover around the instance label */
   instanceDescription?: string;
+  /** Live entity maps for the global-search dropdown. Passed through from App.tsx.
+   * GlobalSearch calls useAppNavigation directly, so it needs boardById (for
+   * slug-aware path building) on top of the entity maps. */
+  sessionById: Map<string, Session>;
+  artifactById: Map<string, Artifact>;
+  mcpServerById: Map<string, MCPServer>;
 }
 
 const RecentBoardPills: React.FC<{
@@ -109,7 +115,8 @@ const RecentBoardPills: React.FC<{
 
 export const AppHeader: React.FC<AppHeaderProps> = ({
   user,
-  activeUsers = [],
+  presenceClient = null,
+  presenceUsers = [],
   currentUserId,
   connected = false,
   connecting = false,
@@ -129,65 +136,29 @@ export const AppHeader: React.FC<AppHeaderProps> = ({
   boards = [],
   currentBoardId,
   onBoardChange,
-  worktreeById = new Map(),
+  onHomeClick,
+  branchById,
   boardById,
   onUserClick,
   recentBoards = [],
   instanceLabel,
   instanceDescription,
+  sessionById,
+  artifactById,
+  mcpServerById,
 }) => {
   const { token } = theme.useToken();
-  const userEmoji = user?.emoji || '👤';
-  const [userDropdownOpen, setUserDropdownOpen] = useState(false);
-
-  // Check if audio notifications are enabled
-  const audioEnabled = user?.preferences?.audio?.enabled ?? false;
-
-  const userMenuItems: MenuProps['items'] = [
-    {
-      key: 'user-info',
-      label: (
-        <div style={{ padding: '4px 0', display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span style={{ fontSize: 20 }}>{userEmoji}</span>
-          <div>
-            <div style={{ fontWeight: 500 }}>{user?.name || 'User'}</div>
-            <div style={{ fontSize: 12, color: token.colorTextDescription }}>{user?.email}</div>
-          </div>
-        </div>
-      ),
-      disabled: true,
-    },
-    {
-      type: 'divider',
-    },
-    {
-      key: 'user-settings',
-      label: (
-        <Space>
-          <span>User Settings</span>
-          {audioEnabled && (
-            <Tooltip title="Audio notifications enabled">
-              <SoundOutlined style={{ color: token.colorSuccess, fontSize: 12 }} />
-            </Tooltip>
-          )}
-        </Space>
-      ),
-      icon: <UserOutlined />,
-      onClick: () => {
-        setUserDropdownOpen(false);
-        onUserSettingsClick?.();
-      },
-    },
-    {
-      key: 'logout',
-      label: 'Logout',
-      icon: <LogoutOutlined />,
-      onClick: () => {
-        setUserDropdownOpen(false);
-        onLogout?.();
-      },
-    },
-  ];
+  const navigate = useNavigate();
+  const knowledgeHref = useHref('/knowledge');
+  // Single source of truth for "is the daemon usable right now?". Captures
+  // disconnected, the 1.5s reconnect grace window, and out-of-sync. Don't
+  // gate off raw `connected` — it stays true through the grace window.
+  const mutationDisabled = useConnectionDisabled();
+  const headerIconButtonStyle = {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+  } as const;
 
   return (
     <Header
@@ -201,17 +172,33 @@ export const AppHeader: React.FC<AppHeaderProps> = ({
       }}
     >
       <Space size={16} align="center">
-        <img
-          src={`${import.meta.env.BASE_URL}favicon.png`}
-          alt="Agor logo"
+        <button
+          type="button"
+          aria-label="Go to Home"
+          onClick={onHomeClick}
           style={{
-            height: 50,
-            borderRadius: '50%',
-            objectFit: 'cover',
-            display: 'block',
+            height: 54,
+            padding: 0,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+            background: 'transparent',
+            border: 0,
+            cursor: 'pointer',
           }}
-        />
-        <BrandLogo level={3} style={{ marginTop: -6 }} />
+        >
+          <img
+            src={`${import.meta.env.BASE_URL}favicon.png`}
+            alt="Agor logo"
+            style={{
+              height: 50,
+              borderRadius: '50%',
+              objectFit: 'cover',
+              display: 'block',
+            }}
+          />
+          <BrandLogo level={3} style={{ marginTop: -6 }} />
+        </button>
         {instanceLabel &&
           (instanceDescription ? (
             <Popover
@@ -234,31 +221,39 @@ export const AppHeader: React.FC<AppHeaderProps> = ({
             </Tag>
           ))}
         <Divider orientation="vertical" style={{ height: 32, margin: '0 8px' }} />
-        {currentBoardId && boards.length > 0 && (
-          <>
-            <div style={{ minWidth: 200 }}>
-              <BoardSwitcher
-                boards={boards}
-                currentBoardId={currentBoardId}
-                onBoardChange={onBoardChange || (() => {})}
-                worktreeById={worktreeById}
-              />
-            </div>
-            <RecentBoardPills
-              recentBoards={recentBoards}
-              onBoardChange={onBoardChange || (() => {})}
-              token={token}
-            />
-          </>
-        )}
+        {/* Disconnected pattern: navbar elements that lead to server-fetching
+            or mutating surfaces are *disabled* (not hidden) via
+            useConnectionDisabled (covers disconnect + reconnect grace window
+            + out-of-sync). Local-only navigation (BoardSwitcher,
+            RecentBoardPills, theme, external doc link, presence display)
+            stays fully alive — those never depend on the daemon.
+            See docs/disconnected-state-design.md. */}
         {currentBoardName && (
-          <Tooltip title="Toggle session drawer" placement="bottom">
+          <Tooltip title="Toggle board panel" placement="bottom">
             <Button
               type="text"
               icon={<UnorderedListOutlined style={{ fontSize: token.fontSizeLG }} />}
+              style={headerIconButtonStyle}
               onClick={onMenuClick}
+              disabled={mutationDisabled}
             />
           </Tooltip>
+        )}
+        <div style={{ minWidth: 200 }}>
+          <BoardSwitcher
+            boards={boards}
+            currentBoardId={currentBoardId}
+            onBoardChange={onBoardChange || (() => {})}
+            onHomeClick={onHomeClick}
+            branchById={branchById}
+          />
+        </div>
+        {boards.length > 0 && (
+          <RecentBoardPills
+            recentBoards={recentBoards}
+            onBoardChange={onBoardChange || (() => {})}
+            token={token}
+          />
         )}
         {currentBoardName && (
           <Badge
@@ -267,12 +262,15 @@ export const AppHeader: React.FC<AppHeaderProps> = ({
             style={{
               backgroundColor: hasUserMentions ? token.colorError : token.colorPrimaryBgHover,
             }}
+            className="app-header-icon-badge"
           >
-            <Tooltip title="Toggle comments panel" placement="bottom">
+            <Tooltip title="Show comments tab" placement="bottom">
               <Button
                 type="text"
                 icon={<CommentOutlined style={{ fontSize: token.fontSizeLG }} />}
+                style={headerIconButtonStyle}
                 onClick={onCommentsClick}
+                disabled={mutationDisabled}
               />
             </Tooltip>
           </Badge>
@@ -285,34 +283,63 @@ export const AppHeader: React.FC<AppHeaderProps> = ({
           connecting={connecting}
           onRetry={onRetryConnection}
         />
-        {activeUsers.length > 0 && (
-          <>
-            <Facepile
-              activeUsers={activeUsers}
-              currentUserId={currentUserId}
-              maxVisible={5}
-              boardById={boardById}
-              onUserClick={onUserClick}
-              style={{
-                marginRight: 8,
-              }}
-            />
-            <Divider orientation="vertical" style={{ height: 32, margin: '0 8px' }} />
-          </>
-        )}
+        <GlobalPresenceFacepile
+          client={presenceClient}
+          currentBoardId={currentBoardId ? (currentBoardId as BoardID) : null}
+          users={presenceUsers}
+          currentUser={user}
+          boardById={boardById}
+          onUserClick={onUserClick}
+        />
+        <GlobalSearch
+          currentUserId={currentUserId}
+          sessionById={sessionById}
+          branchById={branchById}
+          artifactById={artifactById}
+          boardById={boardById}
+          mcpServerById={mcpServerById}
+          onSettingsClick={onSettingsClick}
+        />
+        <Divider orientation="vertical" style={{ height: 32, margin: '0 8px' }} />
         {eventStreamEnabled && (
           <Tooltip title="Live Event Stream" placement="bottom">
             <Button
               type="text"
               icon={<ApiOutlined style={{ fontSize: token.fontSizeLG }} />}
+              style={headerIconButtonStyle}
               onClick={onEventStreamClick}
+              disabled={mutationDisabled}
             />
           </Tooltip>
         )}
+        <Tooltip title="Knowledge" placement="bottom">
+          <Button
+            type="text"
+            icon={<BookOutlined style={{ fontSize: token.fontSizeLG }} />}
+            style={headerIconButtonStyle}
+            href={knowledgeHref}
+            aria-label="Knowledge"
+            onClick={(event) => {
+              if (event.defaultPrevented) return;
+              if (
+                event.button !== 0 ||
+                event.metaKey ||
+                event.ctrlKey ||
+                event.shiftKey ||
+                event.altKey
+              ) {
+                return;
+              }
+              event.preventDefault();
+              navigate('/knowledge');
+            }}
+          />
+        </Tooltip>
         <Tooltip title="Documentation" placement="bottom">
           <Button
             type="text"
             icon={<QuestionCircleOutlined style={{ fontSize: token.fontSizeLG }} />}
+            style={headerIconButtonStyle}
             href="https://agor.live/guide/getting-started"
             target="_blank"
             rel="noopener noreferrer"
@@ -323,20 +350,17 @@ export const AppHeader: React.FC<AppHeaderProps> = ({
           <Button
             type="text"
             icon={<SettingOutlined style={{ fontSize: token.fontSizeLG }} />}
+            style={headerIconButtonStyle}
             onClick={onSettingsClick}
+            disabled={mutationDisabled}
           />
         </Tooltip>
-        <Dropdown
-          menu={{ items: userMenuItems }}
-          placement="bottomRight"
-          trigger={['click']}
-          open={userDropdownOpen}
-          onOpenChange={setUserDropdownOpen}
-        >
-          <Tooltip title={user?.name || 'User menu'} placement="bottom">
-            <Button type="text" icon={<UserOutlined style={{ fontSize: token.fontSizeLG }} />} />
-          </Tooltip>
-        </Dropdown>
+        <GlobalUserMenu
+          user={user}
+          disabled={mutationDisabled}
+          onUserSettingsClick={onUserSettingsClick}
+          onLogout={onLogout}
+        />
       </Space>
     </Header>
   );

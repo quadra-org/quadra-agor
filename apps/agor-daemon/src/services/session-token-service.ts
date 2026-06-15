@@ -13,8 +13,19 @@
 
 import jwt from 'jsonwebtoken';
 
+const DEBUG_SESSION_TOKENS =
+  process.env.AGOR_DEBUG_SESSION_TOKENS === '1' || process.env.DEBUG?.includes('session-token');
+
+function sessionTokenDebug(...args: unknown[]): void {
+  if (DEBUG_SESSION_TOKENS) {
+    console.debug(...args);
+  }
+}
+
 interface SessionTokenData {
   session_id: string;
+  task_id?: string;
+  branch_id?: string;
   user_id: string;
   created_at: Date;
   expires_at: Date;
@@ -22,8 +33,10 @@ interface SessionTokenData {
   use_count: number;
 }
 
-interface SessionInfo {
+export interface SessionInfo {
   session_id: string;
+  task_id?: string;
+  branch_id?: string;
   user_id: string;
 }
 
@@ -53,7 +66,11 @@ export class SessionTokenService {
    * Generate a new session token (JWT)
    * Returns a JWT that works with Feathers' standard JWT authentication
    */
-  async generateToken(sessionId: string, userId: string): Promise<string> {
+  async generateToken(
+    sessionId: string,
+    userId: string,
+    scope: { taskId?: string; branchId?: string; maxUses?: number } = {}
+  ): Promise<string> {
     if (!this.jwtSecret) {
       throw new Error('SessionTokenService: JWT secret not set. Call setJwtSecret() first.');
     }
@@ -65,7 +82,12 @@ export class SessionTokenService {
     // This JWT will work seamlessly with the standard JWT strategy
     const payload = {
       sub: userId, // Standard JWT subject claim (used by Feathers for user lookup)
+      type: 'executor-session',
+      purpose: 'executor-task',
       sessionId: sessionId, // Custom claim for session tracking
+      session_id: sessionId,
+      task_id: scope.taskId,
+      branch_id: scope.branchId,
       iat: Math.floor(now.getTime() / 1000), // Issued at
       exp: Math.floor(expiresAt.getTime() / 1000), // Expiration
       aud: 'https://agor.dev', // Must match Feathers jwtOptions.audience
@@ -82,14 +104,16 @@ export class SessionTokenService {
     // Track this token for revocation and use counting
     this.tokens.set(token, {
       session_id: sessionId,
+      task_id: scope.taskId,
+      branch_id: scope.branchId,
       user_id: userId,
       created_at: now,
       expires_at: expiresAt,
-      max_uses: this.config.max_uses,
+      max_uses: scope.maxUses ?? this.config.max_uses,
       use_count: 0,
     });
 
-    console.log(
+    console.debug(
       `[SessionTokenService] Generated JWT for session=${sessionId}, expires=${expiresAt.toISOString()}`
     );
 
@@ -103,7 +127,10 @@ export class SessionTokenService {
    * NOTE: JWT signature/expiration validation is handled by Feathers automatically.
    * This method only checks revocation and use counting.
    */
-  async validateToken(token: string): Promise<SessionInfo | null> {
+  async validateToken(
+    token: string,
+    expected?: { sessionId?: string; taskId?: string; branchId?: string }
+  ): Promise<SessionInfo | null> {
     // Get tracking data for this token
     const data = this.tokens.get(token);
 
@@ -120,22 +147,38 @@ export class SessionTokenService {
       return null;
     }
 
-    // Check max uses (if configured)
+    if (
+      (expected?.sessionId && data.session_id !== expected.sessionId) ||
+      (expected?.taskId && data.task_id !== expected.taskId) ||
+      (expected?.branchId && data.branch_id !== expected.branchId)
+    ) {
+      console.warn(`[SessionTokenService] Token scope mismatch`);
+      return null;
+    }
+
+    // Check max uses (if configured). Reusable executor tokens are validated
+    // on every protected daemon service call, so avoid mutating a diagnostic
+    // counter for the normal unlimited-use path.
     if (data.max_uses > 0 && data.use_count >= data.max_uses) {
       console.warn(`[SessionTokenService] Token max uses exceeded`);
       this.tokens.delete(token);
       return null;
     }
 
-    // Increment use count
-    data.use_count++;
+    if (data.max_uses > 0) {
+      data.use_count++;
+    }
 
-    console.log(
-      `[SessionTokenService] Token validated: session=${data.session_id}, uses=${data.use_count}/${data.max_uses === -1 ? '∞' : data.max_uses}`
+    sessionTokenDebug(
+      data.max_uses > 0
+        ? `[SessionTokenService] Token validated: session=${data.session_id}, uses=${data.use_count}/${data.max_uses}`
+        : `[SessionTokenService] Reusable token validated: session=${data.session_id}`
     );
 
     return {
       session_id: data.session_id,
+      task_id: data.task_id,
+      branch_id: data.branch_id,
       user_id: data.user_id,
     };
   }
@@ -145,7 +188,7 @@ export class SessionTokenService {
    */
   revokeToken(token: string): void {
     if (this.tokens.delete(token)) {
-      console.log(`[SessionTokenService] Token revoked: ${token.slice(0, 8)}...`);
+      console.debug(`[SessionTokenService] Token revoked`);
     }
   }
 
@@ -163,7 +206,7 @@ export class SessionTokenService {
     }
 
     if (count > 0) {
-      console.log(`[SessionTokenService] Revoked ${count} tokens for session=${sessionId}`);
+      console.debug(`[SessionTokenService] Revoked ${count} tokens for session=${sessionId}`);
     }
   }
 
@@ -189,7 +232,7 @@ export class SessionTokenService {
     }
 
     if (count > 0) {
-      console.log(`[SessionTokenService] Cleaned up ${count} expired tokens`);
+      console.debug(`[SessionTokenService] Cleaned up ${count} expired tokens`);
     }
   }
 
@@ -198,11 +241,12 @@ export class SessionTokenService {
    */
   private startCleanupTimer(): void {
     // Clean up every hour
-    setInterval(
+    const timer = setInterval(
       () => {
         this.cleanupExpiredTokens();
       },
       60 * 60 * 1000
     );
+    timer.unref?.();
   }
 }

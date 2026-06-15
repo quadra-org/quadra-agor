@@ -1,5 +1,6 @@
 // src/utils/audio.ts
-import type { AudioPreferences, ChimeSound, Task, TaskStatus } from '@agor-live/client';
+import type { AudioPreferences, ChimeSound, Task } from '@agor-live/client';
+import { isNaturalCompletion } from '@agor-live/client';
 
 /**
  * Map of chime sound names to their filenames in public/sounds/
@@ -131,8 +132,10 @@ export function checkAudioPermission(): Promise<boolean> {
 function meetsMinimumDuration(task: Task, minDurationSeconds: number): boolean {
   if (minDurationSeconds === 0) return true;
 
-  // Try to use duration_ms if available
-  if (task.duration_ms) {
+  // Null-check (not truthy-check) so an explicit `duration_ms: 0` is honored —
+  // a near-instant task should be gated against `minDurationSeconds`, not fall
+  // through to the timestamp fallback / optimistic allow.
+  if (task.duration_ms != null) {
     const durationSeconds = task.duration_ms / 1000;
     return durationSeconds >= minDurationSeconds;
   }
@@ -148,13 +151,6 @@ function meetsMinimumDuration(task: Task, minDurationSeconds: number): boolean {
   // If we can't determine duration, allow it to play (optimistic approach)
   // The user set up audio notifications, so they probably want to hear them
   return true;
-}
-
-/**
- * Check if task status indicates natural completion (not user-stopped)
- */
-function isNaturalCompletion(status: TaskStatus): boolean {
-  return status === 'completed' || status === 'failed';
 }
 
 /**

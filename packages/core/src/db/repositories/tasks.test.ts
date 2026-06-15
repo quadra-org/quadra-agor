@@ -7,14 +7,14 @@
 import type { Task, UUID } from '@agor/core/types';
 import { TaskStatus } from '@agor/core/types';
 import { describe, expect } from 'vitest';
-import { generateId } from '../../lib/ids';
+import { generateId, toShortId } from '../../lib/ids';
 import type { Database } from '../client';
 import { dbTest } from '../test-helpers';
 import { AmbiguousIdError, EntityNotFoundError, RepositoryError } from './base';
+import { BranchRepository } from './branches';
 import { RepoRepository } from './repos';
 import { SessionRepository } from './sessions';
 import { TaskRepository } from './tasks';
-import { WorktreeRepository } from './worktrees';
 
 /**
  * Create test task data
@@ -26,7 +26,6 @@ function createTaskData(overrides?: Partial<Task>): Partial<Task> {
     session_id: generateId(), // Will be overridden in tests
     created_by: 'test-user',
     full_prompt: 'Test prompt',
-    description: 'Test task',
     status: TaskStatus.CREATED,
     message_range: {
       start_index: 0,
@@ -43,11 +42,11 @@ function createTaskData(overrides?: Partial<Task>): Partial<Task> {
   };
 }
 
-// Counter for unique worktree IDs
-let worktreeCounter = 1;
+// Counter for unique branch IDs
+let branchCounter = 1;
 
 /**
- * Create a session with required dependencies (repo and worktree)
+ * Create a session with required dependencies (repo and branch)
  * Returns the session_id that can be used for tasks
  */
 async function createSessionWithDeps(db: Database): Promise<UUID> {
@@ -63,23 +62,25 @@ async function createSessionWithDeps(db: Database): Promise<UUID> {
     default_branch: 'main',
   });
 
-  // Create worktree
-  const worktreeRepo = new WorktreeRepository(db);
-  const worktree = await worktreeRepo.create({
-    worktree_id: generateId(),
+  // Create branch
+  const branchRepo = new BranchRepository(db);
+  const branch = await branchRepo.create({
+    branch_id: generateId(),
     repo_id: repo.repo_id,
-    name: 'test-worktree',
+    name: 'test-branch',
     ref: 'main',
-    worktree_unique_id: worktreeCounter++,
-    path: '/tmp/test/worktree',
+    branch_unique_id: branchCounter++,
+    path: '/tmp/test/branch',
+    created_by: 'test-user' as UUID,
   });
 
   // Create session
   const sessionRepo = new SessionRepository(db);
   const session = await sessionRepo.create({
     session_id: generateId(),
-    worktree_id: worktree.worktree_id,
+    branch_id: branch.branch_id,
     agentic_tool: 'claude-code',
+    created_by: 'test-user' as UUID,
   });
 
   return session.session_id;
@@ -101,10 +102,10 @@ describe('TaskRepository.create', () => {
     expect(created.session_id).toBe(data.session_id);
     expect(created.created_by).toBe(data.created_by);
     expect(created.full_prompt).toBe(data.full_prompt);
-    expect(created.description).toBe(data.description);
     expect(created.status).toBe(data.status);
     expect(created.created_at).toBeDefined();
     expect(created.completed_at).toBeUndefined();
+    expect(created.last_executor_heartbeat_at).toBeUndefined();
   });
 
   dbTest('should generate task_id if not provided', async ({ db }) => {
@@ -132,15 +133,13 @@ describe('TaskRepository.create', () => {
     expect(created.status).toBe(TaskStatus.CREATED);
   });
 
-  dbTest('should default created_by to anonymous', async ({ db }) => {
+  dbTest('should throw if created_by is missing', async ({ db }) => {
     const taskRepo = new TaskRepository(db);
     const sessionId = await createSessionWithDeps(db);
     const data = createTaskData({ session_id: sessionId });
     delete (data as any).created_by;
 
-    const created = await taskRepo.create(data);
-
-    expect(created.created_by).toBe('anonymous');
+    await expect(taskRepo.create(data)).rejects.toThrow(/created_by/);
   });
 
   dbTest('should throw error if session_id is missing', async ({ db }) => {
@@ -150,6 +149,27 @@ describe('TaskRepository.create', () => {
 
     await expect(taskRepo.create(data)).rejects.toThrow(RepositoryError);
     await expect(taskRepo.create(data)).rejects.toThrow('session_id is required');
+  });
+
+  dbTest('should leave Task.model undefined when not provided', async ({ db }) => {
+    const taskRepo = new TaskRepository(db);
+    const sessionId = await createSessionWithDeps(db);
+    const data = createTaskData({ session_id: sessionId });
+    delete (data as any).model;
+
+    const created = await taskRepo.create(data);
+
+    expect(created.model).toBeUndefined();
+  });
+
+  dbTest('should preserve explicit Task.model when provided', async ({ db }) => {
+    const taskRepo = new TaskRepository(db);
+    const sessionId = await createSessionWithDeps(db);
+    const data = createTaskData({ session_id: sessionId, model: 'gpt-5.5' });
+
+    const created = await taskRepo.create(data);
+
+    expect(created.model).toBe('gpt-5.5');
   });
 
   dbTest('should handle complex task data with all optional fields', async ({ db }) => {
@@ -250,17 +270,17 @@ describe('TaskRepository.createMany', () => {
     const taskRepo = new TaskRepository(db);
     const sessionId = await createSessionWithDeps(db);
     const tasks = [
-      createTaskData({ session_id: sessionId, description: 'Task 1' }),
-      createTaskData({ session_id: sessionId, description: 'Task 2' }),
-      createTaskData({ session_id: sessionId, description: 'Task 3' }),
+      createTaskData({ session_id: sessionId, full_prompt: 'Task 1' }),
+      createTaskData({ session_id: sessionId, full_prompt: 'Task 2' }),
+      createTaskData({ session_id: sessionId, full_prompt: 'Task 3' }),
     ];
 
     const created = await taskRepo.createMany(tasks);
 
     expect(created).toHaveLength(3);
-    expect(created[0].description).toBe('Task 1');
-    expect(created[1].description).toBe('Task 2');
-    expect(created[2].description).toBe('Task 3');
+    expect(created[0].full_prompt).toBe('Task 1');
+    expect(created[1].full_prompt).toBe('Task 2');
+    expect(created[2].full_prompt).toBe('Task 3');
   });
 
   dbTest('should handle empty array', async ({ db }) => {
@@ -333,12 +353,12 @@ describe('TaskRepository.findById', () => {
     expect(byFull?.task_id).toBe(data.task_id);
 
     // Short ID
-    const shortId = data.task_id!.replace(/-/g, '').slice(0, 8);
-    const byShort = await taskRepo.findById(shortId);
+    const idPrefix = toShortId(data.task_id!, 8);
+    const byShort = await taskRepo.findById(idPrefix);
     expect(byShort?.task_id).toBe(data.task_id);
 
     // Case insensitive
-    const byUpper = await taskRepo.findById(shortId.toUpperCase());
+    const byUpper = await taskRepo.findById(idPrefix.toUpperCase());
     expect(byUpper?.task_id).toBe(data.task_id);
   });
 
@@ -384,14 +404,14 @@ describe('TaskRepository.findAll', () => {
     const taskRepo = new TaskRepository(db);
     const sessionId = await createSessionWithDeps(db);
 
-    await taskRepo.create(createTaskData({ session_id: sessionId, description: 'Task 1' }));
-    await taskRepo.create(createTaskData({ session_id: sessionId, description: 'Task 2' }));
-    await taskRepo.create(createTaskData({ session_id: sessionId, description: 'Task 3' }));
+    await taskRepo.create(createTaskData({ session_id: sessionId, full_prompt: 'Task 1' }));
+    await taskRepo.create(createTaskData({ session_id: sessionId, full_prompt: 'Task 2' }));
+    await taskRepo.create(createTaskData({ session_id: sessionId, full_prompt: 'Task 3' }));
 
     const tasks = await taskRepo.findAll();
 
     expect(tasks).toHaveLength(3);
-    expect(tasks.map((t) => t.description).sort()).toEqual(['Task 1', 'Task 2', 'Task 3']);
+    expect(tasks.map((t) => t.full_prompt).sort()).toEqual(['Task 1', 'Task 2', 'Task 3']);
   });
 
   dbTest('should return fully populated task objects', async ({ db }) => {
@@ -400,7 +420,6 @@ describe('TaskRepository.findAll', () => {
     const data = createTaskData({
       session_id: sessionId,
       full_prompt: 'Test prompt',
-      description: 'Test description',
       status: TaskStatus.RUNNING,
       tool_use_count: 5,
     });
@@ -412,7 +431,6 @@ describe('TaskRepository.findAll', () => {
     const found = tasks[0];
     expect(found.task_id).toBe(data.task_id);
     expect(found.full_prompt).toBe(data.full_prompt);
-    expect(found.description).toBe(data.description);
     expect(found.status).toBe(data.status);
     expect(found.tool_use_count).toBe(data.tool_use_count);
   });
@@ -438,20 +456,20 @@ describe('TaskRepository.findBySession', () => {
     const session2 = await createSessionWithDeps(db);
 
     await taskRepo.create(
-      createTaskData({ session_id: session1, description: 'Session 1 Task 1' })
+      createTaskData({ session_id: session1, full_prompt: 'Session 1 Task 1' })
     );
     await taskRepo.create(
-      createTaskData({ session_id: session1, description: 'Session 1 Task 2' })
+      createTaskData({ session_id: session1, full_prompt: 'Session 1 Task 2' })
     );
     await taskRepo.create(
-      createTaskData({ session_id: session2, description: 'Session 2 Task 1' })
+      createTaskData({ session_id: session2, full_prompt: 'Session 2 Task 1' })
     );
 
     const tasks = await taskRepo.findBySession(session1);
 
     expect(tasks).toHaveLength(2);
     expect(tasks.every((t) => t.session_id === session1)).toBe(true);
-    expect(tasks.map((t) => t.description).sort()).toEqual([
+    expect(tasks.map((t) => t.full_prompt).sort()).toEqual([
       'Session 1 Task 1',
       'Session 1 Task 2',
     ]);
@@ -462,18 +480,18 @@ describe('TaskRepository.findBySession', () => {
     const sessionId = await createSessionWithDeps(db);
 
     // Create tasks with small delays to ensure different timestamps
-    await taskRepo.create(createTaskData({ session_id: sessionId, description: 'First' }));
+    await taskRepo.create(createTaskData({ session_id: sessionId, full_prompt: 'First' }));
     await new Promise((resolve) => setTimeout(resolve, 10));
-    await taskRepo.create(createTaskData({ session_id: sessionId, description: 'Second' }));
+    await taskRepo.create(createTaskData({ session_id: sessionId, full_prompt: 'Second' }));
     await new Promise((resolve) => setTimeout(resolve, 10));
-    await taskRepo.create(createTaskData({ session_id: sessionId, description: 'Third' }));
+    await taskRepo.create(createTaskData({ session_id: sessionId, full_prompt: 'Third' }));
 
     const tasks = await taskRepo.findBySession(sessionId);
 
     expect(tasks).toHaveLength(3);
-    expect(tasks[0].description).toBe('First');
-    expect(tasks[1].description).toBe('Second');
-    expect(tasks[2].description).toBe('Third');
+    expect(tasks[0].full_prompt).toBe('First');
+    expect(tasks[1].full_prompt).toBe('Second');
+    expect(tasks[2].full_prompt).toBe('Third');
   });
 
   dbTest('should not return tasks from other sessions', async ({ db }) => {
@@ -516,24 +534,24 @@ describe('TaskRepository.findRunning', () => {
       createTaskData({
         session_id: sessionId,
         status: TaskStatus.RUNNING,
-        description: 'Running 1',
+        full_prompt: 'Running 1',
       })
     );
     await taskRepo.create(
-      createTaskData({ session_id: sessionId, status: TaskStatus.CREATED, description: 'Created' })
+      createTaskData({ session_id: sessionId, status: TaskStatus.CREATED, full_prompt: 'Created' })
     );
     await taskRepo.create(
       createTaskData({
         session_id: sessionId,
         status: TaskStatus.RUNNING,
-        description: 'Running 2',
+        full_prompt: 'Running 2',
       })
     );
     await taskRepo.create(
       createTaskData({
         session_id: sessionId,
         status: TaskStatus.COMPLETED,
-        description: 'Completed',
+        full_prompt: 'Completed',
       })
     );
 
@@ -541,7 +559,7 @@ describe('TaskRepository.findRunning', () => {
 
     expect(running).toHaveLength(2);
     expect(running.every((t) => t.status === TaskStatus.RUNNING)).toBe(true);
-    expect(running.map((t) => t.description).sort()).toEqual(['Running 1', 'Running 2']);
+    expect(running.map((t) => t.full_prompt).sort()).toEqual(['Running 1', 'Running 2']);
   });
 
   dbTest('should return running tasks from all sessions', async ({ db }) => {
@@ -630,8 +648,8 @@ describe('TaskRepository.update', () => {
     expect(updated.status).toBe(TaskStatus.RUNNING);
 
     // Update by short ID
-    const shortId = data.task_id!.replace(/-/g, '').slice(0, 8);
-    const updated2 = await taskRepo.update(shortId, { status: TaskStatus.COMPLETED });
+    const idPrefix = toShortId(data.task_id!, 8);
+    const updated2 = await taskRepo.update(idPrefix, { status: TaskStatus.COMPLETED });
     expect(updated2.status).toBe(TaskStatus.COMPLETED);
   });
 
@@ -676,6 +694,23 @@ describe('TaskRepository.update', () => {
     // Unchanged fields
     expect(updated.full_prompt).toBe(created.full_prompt);
     expect(updated.session_id).toBe(created.session_id);
+  });
+
+  dbTest('should round-trip last_executor_heartbeat_at on update', async ({ db }) => {
+    const taskRepo = new TaskRepository(db);
+    const sessionId = await createSessionWithDeps(db);
+    const created = await taskRepo.create(
+      createTaskData({ session_id: sessionId, status: TaskStatus.RUNNING })
+    );
+    const heartbeatAt = '2026-01-01T00:00:00.000Z';
+
+    const updated = await taskRepo.update(created.task_id, {
+      last_executor_heartbeat_at: heartbeatAt,
+    });
+    const found = await taskRepo.findById(created.task_id);
+
+    expect(updated.last_executor_heartbeat_at).toBe(heartbeatAt);
+    expect(found?.last_executor_heartbeat_at).toBe(heartbeatAt);
   });
 
   dbTest('should throw EntityNotFoundError for non-existent ID', async ({ db }) => {
@@ -730,8 +765,8 @@ describe('TaskRepository.delete', () => {
     expect(await taskRepo.findById(data1.task_id!)).toBeNull();
 
     // Delete by short ID
-    const shortId = data2.task_id!.replace(/-/g, '').slice(0, 8);
-    await taskRepo.delete(shortId);
+    const idPrefix = toShortId(data2.task_id!, 8);
+    await taskRepo.delete(idPrefix);
     expect(await taskRepo.findById(data2.task_id!)).toBeNull();
   });
 
@@ -805,5 +840,391 @@ describe('TaskRepository edge cases', () => {
 
     expect(created.duration_ms).toBeUndefined();
     expect(created.report).toBeUndefined();
+  });
+});
+
+// ============================================================================
+// CreatePending (never-lose-prompt §C: queue lives on tasks)
+// ============================================================================
+
+/**
+ * Helper: build the minimum-viable input for `createPending` so tests stay
+ * focused on the behavior under test instead of restating boilerplate.
+ */
+function createPendingInput(overrides: {
+  session_id: string;
+  status: typeof TaskStatus.CREATED | typeof TaskStatus.QUEUED;
+  full_prompt?: string;
+  metadata?: Parameters<TaskRepository['createPending']>[0]['metadata'];
+}): Parameters<TaskRepository['createPending']>[0] {
+  return {
+    session_id: overrides.session_id as Parameters<
+      TaskRepository['createPending']
+    >[0]['session_id'],
+    full_prompt: overrides.full_prompt ?? 'test prompt',
+    created_by: 'test-user',
+    status: overrides.status,
+    metadata: overrides.metadata,
+  };
+}
+
+describe('TaskRepository.createPending', () => {
+  dbTest(
+    'should create QUEUED task with queue_position=1 when no other queued tasks',
+    async ({ db }) => {
+      const taskRepo = new TaskRepository(db);
+      const sessionId = await createSessionWithDeps(db);
+
+      const queued = await taskRepo.createPending(
+        createPendingInput({ session_id: sessionId, status: TaskStatus.QUEUED })
+      );
+
+      expect(queued.status).toBe(TaskStatus.QUEUED);
+      expect(queued.queue_position).toBe(1);
+      expect(queued.session_id).toBe(sessionId);
+    }
+  );
+
+  dbTest('should auto-assign incrementing queue_position within a session', async ({ db }) => {
+    const taskRepo = new TaskRepository(db);
+    const sessionId = await createSessionWithDeps(db);
+
+    const first = await taskRepo.createPending(
+      createPendingInput({ session_id: sessionId, status: TaskStatus.QUEUED })
+    );
+    const second = await taskRepo.createPending(
+      createPendingInput({ session_id: sessionId, status: TaskStatus.QUEUED })
+    );
+    const third = await taskRepo.createPending(
+      createPendingInput({ session_id: sessionId, status: TaskStatus.QUEUED })
+    );
+
+    expect(first.queue_position).toBe(1);
+    expect(second.queue_position).toBe(2);
+    expect(third.queue_position).toBe(3);
+  });
+
+  dbTest('should scope queue_position per session', async ({ db }) => {
+    const taskRepo = new TaskRepository(db);
+    const sessionA = await createSessionWithDeps(db);
+    const sessionB = await createSessionWithDeps(db);
+
+    await taskRepo.createPending(
+      createPendingInput({ session_id: sessionA, status: TaskStatus.QUEUED })
+    );
+    await taskRepo.createPending(
+      createPendingInput({ session_id: sessionA, status: TaskStatus.QUEUED })
+    );
+    const onB = await taskRepo.createPending(
+      createPendingInput({ session_id: sessionB, status: TaskStatus.QUEUED })
+    );
+
+    // Session B's first queued task should be at position 1, not 3.
+    expect(onB.queue_position).toBe(1);
+  });
+
+  dbTest('should preserve metadata round-trip through findById', async ({ db }) => {
+    const taskRepo = new TaskRepository(db);
+    const sessionId = await createSessionWithDeps(db);
+    const metadata = {
+      is_agor_callback: true,
+      source: 'agor' as const,
+      queued_by_user_id: 'user-123',
+    };
+
+    const queued = await taskRepo.createPending(
+      createPendingInput({ session_id: sessionId, status: TaskStatus.QUEUED, metadata })
+    );
+
+    expect(queued.metadata).toEqual(metadata);
+
+    const refetched = await taskRepo.findById(queued.task_id);
+    expect(refetched?.metadata).toEqual(metadata);
+  });
+
+  dbTest('should leave queue_position unset for CREATED tasks (idle path)', async ({ db }) => {
+    const taskRepo = new TaskRepository(db);
+    const sessionId = await createSessionWithDeps(db);
+
+    const created = await taskRepo.createPending(
+      createPendingInput({ session_id: sessionId, status: TaskStatus.CREATED })
+    );
+
+    expect(created.status).toBe(TaskStatus.CREATED);
+    expect(created.queue_position).toBeUndefined();
+  });
+
+  dbTest(
+    'should stamp sentinels on the row so spawnTaskExecutor knows what to recompute',
+    async ({ db }) => {
+      const taskRepo = new TaskRepository(db);
+      const sessionId = await createSessionWithDeps(db);
+
+      const queued = await taskRepo.createPending(
+        createPendingInput({ session_id: sessionId, status: TaskStatus.QUEUED })
+      );
+
+      // The sentinel contract: while a task is QUEUED/CREATED, message_range
+      // and git_state hold "not yet pinned" markers. spawnTaskExecutor is the
+      // sole place that overwrites these on the way to RUNNING.
+      expect(queued.message_range.start_index).toBe(-1);
+      expect(queued.git_state.sha_at_start).toBe('');
+      expect(queued.git_state.ref_at_start).toBe('');
+    }
+  );
+
+  dbTest(
+    'should serialize parallel QUEUED inserts via transaction (race regression)',
+    async ({ db }) => {
+      const taskRepo = new TaskRepository(db);
+      const sessionId = await createSessionWithDeps(db);
+
+      // Three callers fire in parallel — they must produce three distinct
+      // queue_positions rather than colliding on the same `max+1`. This is the
+      // createQueued TOCTOU race that existed before the read-then-insert was
+      // wrapped in a transaction.
+      //
+      // libsql serializes concurrent write transactions, so under contention
+      // some inserts may surface SQLITE_BUSY. Either outcome (success with
+      // unique position OR transient BUSY) is correct — what we forbid is
+      // *committed* duplicates. Successful rows must therefore have distinct,
+      // monotonically-increasing positions starting at 1.
+      const settled = await Promise.allSettled([
+        taskRepo.createPending(
+          createPendingInput({ session_id: sessionId, status: TaskStatus.QUEUED })
+        ),
+        taskRepo.createPending(
+          createPendingInput({ session_id: sessionId, status: TaskStatus.QUEUED })
+        ),
+        taskRepo.createPending(
+          createPendingInput({ session_id: sessionId, status: TaskStatus.QUEUED })
+        ),
+      ]);
+
+      const successes = settled
+        .filter((r): r is PromiseFulfilledResult<Task> => r.status === 'fulfilled')
+        .map((r) => r.value);
+
+      expect(successes.length).toBeGreaterThan(0);
+
+      const positions = successes.map((t) => t.queue_position).sort();
+      const unique = new Set(positions);
+      expect(unique.size).toBe(positions.length); // no duplicates
+      expect(positions[0]).toBe(1); // numbering starts at 1
+    }
+  );
+});
+
+// ============================================================================
+// FindQueued
+// ============================================================================
+
+describe('TaskRepository.findQueued', () => {
+  dbTest('should return queued tasks ordered by queue_position', async ({ db }) => {
+    const taskRepo = new TaskRepository(db);
+    const sessionId = await createSessionWithDeps(db);
+
+    await taskRepo.createPending(
+      createPendingInput({
+        session_id: sessionId,
+        status: TaskStatus.QUEUED,
+        full_prompt: 'first queued',
+      })
+    );
+    await taskRepo.createPending(
+      createPendingInput({
+        session_id: sessionId,
+        status: TaskStatus.QUEUED,
+        full_prompt: 'second queued',
+      })
+    );
+    await taskRepo.createPending(
+      createPendingInput({
+        session_id: sessionId,
+        status: TaskStatus.QUEUED,
+        full_prompt: 'third queued',
+      })
+    );
+
+    const found = await taskRepo.findQueued(sessionId);
+
+    expect(found).toHaveLength(3);
+    expect(found.map((t) => t.queue_position)).toEqual([1, 2, 3]);
+    expect(found.map((t) => t.full_prompt)).toEqual([
+      'first queued',
+      'second queued',
+      'third queued',
+    ]);
+  });
+});
+
+// ============================================================================
+// GetNextQueued
+// ============================================================================
+
+describe('TaskRepository.getNextQueued', () => {
+  dbTest('should return null when no queued tasks for session', async ({ db }) => {
+    const taskRepo = new TaskRepository(db);
+    const sessionId = await createSessionWithDeps(db);
+
+    const next = await taskRepo.getNextQueued(sessionId);
+
+    expect(next).toBeNull();
+  });
+
+  dbTest('should return lowest queue_position first', async ({ db }) => {
+    const taskRepo = new TaskRepository(db);
+    const sessionId = await createSessionWithDeps(db);
+
+    // Insert out of order with manually-set queue_position so we know findRunning
+    // isn't accidentally returning insert-order.
+    await taskRepo.create(
+      createTaskData({
+        session_id: sessionId,
+        status: TaskStatus.QUEUED,
+        queue_position: 3,
+        full_prompt: 'pos 3',
+      })
+    );
+    await taskRepo.create(
+      createTaskData({
+        session_id: sessionId,
+        status: TaskStatus.QUEUED,
+        queue_position: 1,
+        full_prompt: 'pos 1',
+      })
+    );
+    await taskRepo.create(
+      createTaskData({
+        session_id: sessionId,
+        status: TaskStatus.QUEUED,
+        queue_position: 2,
+        full_prompt: 'pos 2',
+      })
+    );
+
+    const next = await taskRepo.getNextQueued(sessionId);
+
+    expect(next).not.toBeNull();
+    expect(next?.queue_position).toBe(1);
+    expect(next?.full_prompt).toBe('pos 1');
+  });
+
+  dbTest('should not return tasks from other sessions', async ({ db }) => {
+    const taskRepo = new TaskRepository(db);
+    const sessionA = await createSessionWithDeps(db);
+    const sessionB = await createSessionWithDeps(db);
+
+    await taskRepo.createPending(
+      createPendingInput({ session_id: sessionA, status: TaskStatus.QUEUED })
+    );
+
+    const next = await taskRepo.getNextQueued(sessionB);
+
+    expect(next).toBeNull();
+  });
+
+  dbTest('should not return non-QUEUED tasks even if queue_position set', async ({ db }) => {
+    const taskRepo = new TaskRepository(db);
+    const sessionId = await createSessionWithDeps(db);
+
+    // A task that has a queue_position but a non-QUEUED status — e.g. one that
+    // already drained to RUNNING — must not be picked up by getNextQueued.
+    await taskRepo.create(
+      createTaskData({
+        session_id: sessionId,
+        status: TaskStatus.RUNNING,
+        queue_position: 1,
+      })
+    );
+
+    const next = await taskRepo.getNextQueued(sessionId);
+
+    expect(next).toBeNull();
+  });
+});
+
+// ============================================================================
+// Sentinel invariants (never-lose-prompt §C)
+//
+// QUEUED tasks are born with sentinel `message_range.start_index = -1` and
+// sentinel `git_state.sha_at_start = ''` — values that the drainer recomputes
+// before flipping the task to RUNNING. These tests are tripwires: they assert
+// the post-recompute shape on real data we control. End-to-end coverage of the
+// recompute path itself lives in a follow-up PR; this is the cheapest possible
+// guard so a future regression in spawnTaskExecutor isn't silent.
+// ============================================================================
+
+describe('TaskRepository sentinel invariants', () => {
+  dbTest(
+    'should never persist RUNNING task with sentinel message_range.start_index',
+    async ({ db }) => {
+      const taskRepo = new TaskRepository(db);
+      const sessionId = await createSessionWithDeps(db);
+
+      // Born QUEUED with the sentinel start_index = -1 (mirrors what the
+      // /sessions/:id/tasks/queue endpoint writes).
+      const queued = await taskRepo.create(
+        createTaskData({
+          session_id: sessionId,
+          status: TaskStatus.QUEUED,
+          queue_position: 1,
+          message_range: {
+            start_index: -1,
+            end_index: -1,
+            start_timestamp: new Date().toISOString(),
+          },
+        })
+      );
+
+      // Drainer recomputes message_range before flipping to RUNNING.
+      const now = new Date().toISOString();
+      await taskRepo.update(queued.task_id, {
+        status: TaskStatus.RUNNING,
+        message_range: {
+          start_index: 0,
+          end_index: 0,
+          start_timestamp: now,
+        },
+      });
+
+      // Scan: no RUNNING/COMPLETED row should have the sentinel.
+      const all = await taskRepo.findAll();
+      for (const task of all) {
+        if (task.status === TaskStatus.RUNNING || task.status === TaskStatus.COMPLETED) {
+          expect(task.message_range.start_index).not.toBe(-1);
+        }
+      }
+    }
+  );
+
+  dbTest('should never persist RUNNING task with empty git_state.sha_at_start', async ({ db }) => {
+    const taskRepo = new TaskRepository(db);
+    const sessionId = await createSessionWithDeps(db);
+
+    // Born QUEUED with the sentinel empty sha_at_start.
+    const queued = await taskRepo.create(
+      createTaskData({
+        session_id: sessionId,
+        status: TaskStatus.QUEUED,
+        queue_position: 1,
+        git_state: { ref_at_start: '', sha_at_start: '' },
+      })
+    );
+
+    // Drainer recomputes git_state before flipping to RUNNING.
+    await taskRepo.update(queued.task_id, {
+      status: TaskStatus.RUNNING,
+      git_state: { ref_at_start: 'main', sha_at_start: 'abc123' },
+    });
+
+    const all = await taskRepo.findAll();
+    for (const task of all) {
+      if (task.status === TaskStatus.RUNNING || task.status === TaskStatus.COMPLETED) {
+        // Empty string is the sentinel. 'unknown' is the documented default
+        // when git state can't be read at task start — that's allowed.
+        expect(task.git_state.sha_at_start).not.toBe('');
+      }
+    }
   });
 });

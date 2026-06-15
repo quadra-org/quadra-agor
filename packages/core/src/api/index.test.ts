@@ -359,6 +359,54 @@ describe('createClient', () => {
 
       expect(() => createClient()).not.toThrow();
     });
+
+    // Regression coverage for Node 25 compat: it exposes `globalThis.localStorage`
+    // but the object lacks `setItem`, so the Feathers auth client throws
+    // `_a.setItem is not a function` on first authenticate(). createClient()
+    // must treat that as "no storage" rather than passing it straight through.
+    it('should reject a localStorage stub without setItem (Node 25)', () => {
+      const brokenLocalStorage = {
+        getItem: vi.fn(),
+        // setItem intentionally absent — this is what Node 25 ships
+        removeItem: vi.fn(),
+        clear: vi.fn(),
+        length: 0,
+        key: vi.fn(),
+      };
+
+      (globalThis as any).localStorage = brokenLocalStorage;
+
+      const authMock = authClient as unknown as MockedFunction<any>;
+
+      createClient();
+
+      expect(authMock).toHaveBeenCalledWith({ storage: undefined });
+
+      delete (globalThis as any).localStorage;
+    });
+
+    it('should reject a localStorage stub whose setItem is not a function', () => {
+      // Defensive sibling case: anything truthy at .setItem that isn't
+      // callable would otherwise pass `'setItem' in storage` style checks.
+      const oddLocalStorage = {
+        getItem: vi.fn(),
+        setItem: 'not-a-function' as unknown as Storage['setItem'],
+        removeItem: vi.fn(),
+        clear: vi.fn(),
+        length: 0,
+        key: vi.fn(),
+      };
+
+      (globalThis as any).localStorage = oddLocalStorage;
+
+      const authMock = authClient as unknown as MockedFunction<any>;
+
+      createClient();
+
+      expect(authMock).toHaveBeenCalledWith({ storage: undefined });
+
+      delete (globalThis as any).localStorage;
+    });
   });
 
   describe('return value type', () => {
@@ -503,6 +551,48 @@ describe('createClient', () => {
       });
     });
 
+    // Regression: PR #1088 added users.getGitEnvironment + repos/branches.initializeUnixGroup
+    // server-side via `app.use(path, service, { methods })`, but the Feathers Socket.io
+    // client only wires standard CRUD at construction time. Without an explicit
+    // service.methods(...) call on the client, calling these threw
+    // "client.service(...).<method> is not a function" — observed during prod branch
+    // creation. These assertions guard the client-side mirror of the daemon's methods list.
+    it('registers users.getGitEnvironment custom method on client', () => {
+      const client = createClient();
+      const usersService = client.service('users') as unknown as {
+        methods: MockedFunction<(...names: string[]) => unknown>;
+      };
+      expect(usersService.methods).toHaveBeenCalledWith('getGitEnvironment');
+    });
+
+    it('registers repos.initializeUnixGroup custom method on client', () => {
+      const client = createClient();
+      const reposService = client.service('repos') as unknown as {
+        methods: MockedFunction<(...names: string[]) => unknown>;
+      };
+      expect(reposService.methods).toHaveBeenCalledWith('initializeUnixGroup');
+    });
+
+    it('registers branches.initializeUnixGroup custom method on client', () => {
+      const client = createClient();
+      const branchesService = client.service('branches') as unknown as {
+        methods: MockedFunction<(...names: string[]) => unknown>;
+      };
+      expect(branchesService.methods).toHaveBeenCalledWith(
+        'initializeUnixGroup',
+        'ensureAssistantKnowledgeNamespace'
+      );
+    });
+
+    it('does not register custom methods on services without any', () => {
+      const client = createClient();
+      const sessionsService = client.service('sessions') as unknown as {
+        methods: MockedFunction<(...names: string[]) => unknown>;
+      };
+      // sessions has no extend*Service helper, so .methods() should not be called
+      expect(sessionsService.methods).not.toHaveBeenCalled();
+    });
+
     it('should expose sessions.prompt helper that calls /sessions/:id/prompt route', async () => {
       const client = createClient();
       const routeService = client.service('sessions/session-123/prompt');
@@ -535,6 +625,51 @@ describe('createClient', () => {
         streaming: true,
       });
     });
+
+    // The pure-REST counterpart to client.sessions.prompt() — a thin wrapper
+    // around POST /tasks/:id/run, the explicit executor-trigger route added
+    // for harnesses that don't speak MCP. See issue #1118.
+    it('should expose tasks.run helper that calls /tasks/:id/run route', async () => {
+      const client = createClient();
+      const routeService = client.service('tasks/task-456/run');
+      const createMock = routeService.create as unknown as MockedFunction<any>;
+
+      createMock.mockResolvedValue({
+        task_id: 'task-456',
+        session_id: 'session-123',
+        status: 'running',
+      });
+
+      const result = await client.tasks.run('task-456', {
+        permissionMode: 'auto',
+        stream: true,
+      });
+
+      expect(createMock).toHaveBeenCalledWith(
+        {
+          permissionMode: 'auto',
+          stream: true,
+        },
+        undefined
+      );
+      expect(result).toEqual({
+        task_id: 'task-456',
+        session_id: 'session-123',
+        status: 'running',
+      });
+    });
+
+    it('should call tasks.run with empty body when no options provided', async () => {
+      const client = createClient();
+      const routeService = client.service('tasks/task-789/run');
+      const createMock = routeService.create as unknown as MockedFunction<any>;
+
+      createMock.mockResolvedValue({ task_id: 'task-789', status: 'running' });
+
+      await client.tasks.run('task-789');
+
+      expect(createMock).toHaveBeenCalledWith({}, undefined);
+    });
   });
 });
 
@@ -563,13 +698,13 @@ describe('type-level API ergonomics', () => {
     type SessionIdUpdateInput = UpdatePayload<Session>['session_id'];
 
     const createPayload: SessionCreateInput = {
-      worktree_id: '01933e4a-7b89-7c35-a8f3-9d2e1c4b5a6f',
+      branch_id: '01933e4a-7b89-7c35-a8f3-9d2e1c4b5a6f',
     };
-    const patchPayload: SessionPatchInput = { worktree_id: '01933e4a-7b89-7c35-a8f3-9d2e1c4b5a6f' };
+    const patchPayload: SessionPatchInput = { branch_id: '01933e4a-7b89-7c35-a8f3-9d2e1c4b5a6f' };
     const updateId: SessionIdUpdateInput = '01933e4a-7b89-7c35-a8f3-9d2e1c4b5a6f';
 
-    expect(createPayload.worktree_id).toBeDefined();
-    expect(patchPayload.worktree_id).toBeDefined();
+    expect(createPayload.branch_id).toBeDefined();
+    expect(patchPayload.branch_id).toBeDefined();
     expect(typeof updateId).toBe('string');
   });
 

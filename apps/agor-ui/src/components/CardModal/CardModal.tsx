@@ -14,13 +14,14 @@ import type { AgorClient, Board, CardWithType } from '@agor-live/client';
 import {
   DeleteOutlined,
   EditOutlined,
-  InboxOutlined,
   LinkOutlined,
   PushpinFilled,
   SaveOutlined,
 } from '@ant-design/icons';
-import { Button, Collapse, Input, Modal, message, Space, Tag, Typography, theme } from 'antd';
+import { Button, Collapse, Input, Modal, Space, Tag, Typography, theme } from 'antd';
 import React, { useCallback, useEffect, useState } from 'react';
+import { useThemedMessage } from '../../utils/message';
+import { ArchiveActionButton } from '../ArchiveButton';
 import { MarkdownRenderer } from '../MarkdownRenderer';
 
 function isSafeUrl(url: string): boolean {
@@ -58,6 +59,7 @@ const CardModalComponent = ({
   onCardDeleted,
 }: CardModalProps) => {
   const { token } = theme.useToken();
+  const { showSuccess, showError } = useThemedMessage();
 
   // Edit state
   const [editingNote, setEditingNote] = useState(false);
@@ -89,30 +91,37 @@ const CardModalComponent = ({
       onCardUpdated?.(updated as CardWithType);
       setEditingNote(false);
       setEditingDesc(false);
-      message.success('Card saved');
+      showSuccess('Card saved');
     } catch (err) {
       console.error('Failed to save card:', err);
-      message.error('Failed to save card');
+      showError('Failed to save card');
     } finally {
       setSaving(false);
     }
-  }, [card, client, noteValue, descValue, hasChanges, onCardUpdated]);
+  }, [card, client, noteValue, descValue, hasChanges, onCardUpdated, showSuccess, showError]);
 
   const handleArchive = useCallback(async () => {
     if (!card || !client) return;
-    try {
-      const updated = await client.service('cards').patch(card.card_id, {
-        archived: true,
-        archived_at: new Date().toISOString(),
-      });
-      onCardUpdated?.(updated as CardWithType);
-      onClose();
-      message.success('Card archived');
-    } catch (err) {
-      console.error('Failed to archive card:', err);
-      message.error('Failed to archive card');
-    }
-  }, [card, client, onCardUpdated, onClose]);
+    Modal.confirm({
+      title: 'Archive card?',
+      content: `This will hide "${card.title}" from the board while preserving its data.`,
+      okText: 'Archive',
+      onOk: async () => {
+        try {
+          const updated = await client.service('cards').patch(card.card_id, {
+            archived: true,
+            archived_at: new Date().toISOString(),
+          });
+          onCardUpdated?.(updated as CardWithType);
+          onClose();
+          showSuccess('Card archived');
+        } catch (err) {
+          console.error('Failed to archive card:', err);
+          showError('Failed to archive card');
+        }
+      },
+    });
+  }, [card, client, onCardUpdated, onClose, showSuccess, showError]);
 
   const handleDelete = useCallback(async () => {
     if (!card || !client) return;
@@ -126,14 +135,14 @@ const CardModalComponent = ({
           await client.service('cards').remove(card.card_id);
           onCardDeleted?.(card.card_id);
           onClose();
-          message.success('Card deleted');
+          showSuccess('Card deleted');
         } catch (err) {
           console.error('Failed to delete card:', err);
-          message.error('Failed to delete card');
+          showError('Failed to delete card');
         }
       },
     });
-  }, [card, client, onCardDeleted, onClose]);
+  }, [card, client, onCardDeleted, onClose, showSuccess, showError]);
 
   if (!card) return null;
 
@@ -148,9 +157,9 @@ const CardModalComponent = ({
       footer={
         <div style={{ display: 'flex', justifyContent: 'space-between' }}>
           <Space>
-            <Button icon={<InboxOutlined />} onClick={handleArchive}>
+            <ArchiveActionButton tooltip="" size="middle" onClick={handleArchive}>
               Archive
-            </Button>
+            </ArchiveActionButton>
             <Button danger icon={<DeleteOutlined />} onClick={handleDelete}>
               Delete
             </Button>

@@ -16,12 +16,20 @@
 import 'dotenv/config';
 
 // Patch console methods to respect LOG_LEVEL env var
+import { configureAnalyticsLogger } from '@agor/core/analytics';
 import { patchConsole } from '@agor/core/utils/logger';
+import { UI_MOUNT_PATH } from '@agor/core/utils/url';
 
 patchConsole();
 
 import type { AgorConfig, ResolvedSecurity } from '@agor/core/config';
-import { loadConfig, loadConfigFromFile, resolveSecurity } from '@agor/core/config';
+import {
+  loadConfig,
+  loadConfigFromFile,
+  renderGitConfigParametersForLog,
+  resolveGitConfigParameters,
+  resolveSecurity,
+} from '@agor/core/config';
 import { getDatabaseUrl } from '@agor/core/db';
 import {
   authenticate,
@@ -31,16 +39,19 @@ import {
   rest,
   socketio,
 } from '@agor/core/feathers';
+import { buildGitConfigParameters } from '@agor/core/git';
 import { registerHandlebarsHelpers } from '@agor/core/templates/handlebars-helpers';
 import type { HookContext, ServiceGroupName, ServiceTier, User } from '@agor/core/types';
 import { getServiceTier, isServiceEnabled } from '@agor/core/types';
-import compression from 'compression';
 import cors from 'cors';
 import express from 'express';
 import expressStaticGzip from 'express-static-gzip';
+import { scopeExecutorRuntimeAuth } from './auth/executor-runtime-scope.js';
 import { registerHooks } from './register-hooks.js';
 import { registerRoutes } from './register-routes.js';
 import { registerServices } from './register-services.js';
+import { loadBuildInfo } from './setup/build-info.js';
+import { createDynamicCompressionMiddleware } from './setup/compression.js';
 import { buildCorsConfig, isSandpackOrigin } from './setup/cors.js';
 import {
   initializeAnthropicApiKey,
@@ -48,16 +59,28 @@ import {
   initializeAnthropicBaseUrl,
 } from './setup/credentials.js';
 import { initializeDatabase } from './setup/database.js';
+import { warnDeprecatedAnonymousConfig } from './setup/first-run-admin.js';
 import { securityHeaders } from './setup/security-headers.js';
 import { logServicesConfig, resolveServicesConfig } from './setup/service-tiers.js';
 import { configureChannels, createSocketIOConfig } from './setup/socketio.js';
+import { setBundledUiFallbackHeaders, setBundledUiStaticHeaders } from './setup/static-assets.js';
 import { configureSwagger } from './setup/swagger.js';
 import { loadDaemonVersion } from './setup/version.js';
-import { startup } from './startup.js';
-import { configureDaemonUrl } from './utils/spawn-executor.js';
+import { runPostStartJob, startup } from './startup.js';
+import { configureDaemonUrl, configureExecutor } from './utils/spawn-executor.js';
+import { registerAllWidgets } from './widgets/index.js';
 
 // Load daemon version at startup
 const DAEMON_VERSION = await loadDaemonVersion(import.meta.url);
+
+// Resolve build SHA (env > .build-info file > git > 'dev'). UI tabs capture
+// this on first connect and prompt a refresh if a later handshake disagrees.
+const DAEMON_BUILD_INFO = loadBuildInfo(import.meta.url);
+console.log(
+  `🔖 Build: sha=${DAEMON_BUILD_INFO.sha} ` +
+    `builtAt=${DAEMON_BUILD_INFO.builtAt ?? 'unknown'} ` +
+    `(source=${DAEMON_BUILD_INFO.source})`
+);
 
 // Database URL (env vars > config.yaml > defaults)
 const DB_PATH = getDatabaseUrl();
@@ -109,6 +132,14 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
   registerHandlebarsHelpers();
   console.log('✅ Handlebars helpers registered');
 
+  // Populate the widget registry. Each concrete widget type (`env_vars`,
+  // future `confirmation`, `oauth`, ...) lives in its own subdir under
+  // `./widgets/` and side-effect-registers via this central call. The
+  // registry is consulted by `POST /widgets/:id/{submit,dismiss}` and by
+  // the `agor_widgets_request_*` MCP tools.
+  registerAllWidgets();
+  console.log('✅ Widget registry populated');
+
   // Configure Git to fail fast instead of prompting for credentials
   process.env.GIT_TERMINAL_PROMPT = '0';
   process.env.GIT_ASKPASS = 'echo';
@@ -119,6 +150,33 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     : options?.configPath
       ? await loadConfigFromFile(options.configPath)
       : await loadConfig();
+
+  // Set GIT_CONFIG_PARAMETERS before any child-process spawn so every git
+  // invocation under Agor's control inherits it. See @agor/core/config
+  // (security-resolver) for the defaults + resolver semantics.
+  const resolvedGitParams = resolveGitConfigParameters(config.security?.git_config_parameters);
+  const gitConfigParams = buildGitConfigParameters(resolvedGitParams);
+  if (gitConfigParams.length > 0) {
+    process.env.GIT_CONFIG_PARAMETERS = gitConfigParams;
+    console.log(
+      `🔒 GIT_CONFIG_PARAMETERS hardened: ${renderGitConfigParametersForLog(resolvedGitParams)}`
+    );
+  } else {
+    // override: [] in config — Agor defaults disabled; any inherited env var preserved.
+    console.log(
+      '🔒 Agor git hardening disabled (override: []); inherited GIT_CONFIG_PARAMETERS preserved'
+    );
+  }
+
+  // Configure analytics after process-wide git hardening is installed. Module
+  // plugins are optional dynamic imports and must never prevent daemon startup.
+  await configureAnalyticsLogger(config);
+
+  // Surface a clear migration note if the config still carries leftover
+  // anonymous-mode keys. Operators upgrading from a release that had
+  // `daemon.allowAnonymous` / `daemon.requireAuth` see what to do; the keys
+  // are otherwise silently ignored.
+  warnDeprecatedAnonymousConfig(config);
 
   // Resolve service tier configuration (validate deps, auto-promote)
   const servicesConfig = resolveServicesConfig(config.services);
@@ -132,9 +190,7 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
   // --------------------------------------------------------------------------
   // Auth configuration
   // --------------------------------------------------------------------------
-  const allowAnonymous = config.daemon?.allowAnonymous === true;
-  const authStrategies = allowAnonymous ? ['api-key', 'jwt', 'anonymous'] : ['api-key', 'jwt'];
-  const requireAuth = authenticate({ strategies: authStrategies });
+  const requireAuth = scopeExecutorRuntimeAuth(authenticate({ strategies: ['api-key', 'jwt'] }));
 
   const enforcePasswordChange = async (context: HookContext) => {
     const user = context.params?.user as User | undefined;
@@ -169,26 +225,6 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     });
   };
 
-  const getReadAuthHooks = () => (allowAnonymous ? [] : [requireAuth]);
-
-  // --------------------------------------------------------------------------
-  // Security: block anonymous in public deployments
-  // --------------------------------------------------------------------------
-  const isPublicDeployment =
-    process.env.CODESPACES === 'true' ||
-    process.env.NODE_ENV === 'production' ||
-    process.env.RAILWAY_ENVIRONMENT !== undefined ||
-    process.env.RENDER !== undefined;
-
-  if (isPublicDeployment && allowAnonymous) {
-    console.error('');
-    console.error('❌ SECURITY ERROR: Anonymous authentication is enabled in a public deployment');
-    console.error('   This would allow unauthorized access to your Agor instance.');
-    console.error('   Set daemon.allowAnonymous=false in config or unset it (defaults to false)');
-    console.error('');
-    process.exit(1);
-  }
-
   // --------------------------------------------------------------------------
   // Ports, daemon URL, credentials
   // --------------------------------------------------------------------------
@@ -207,7 +243,13 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
 
   const daemonUrl = config.daemon?.public_url || `http://localhost:${DAEMON_PORT}`;
   configureDaemonUrl(daemonUrl);
-  console.log(`[Executor] Daemon URL configured: ${daemonUrl}`);
+
+  // Wire the configured executor command template + impersonation user so the
+  // ~10 spawnExecutorFireAndForget() call sites pick them up without needing
+  // their own config-threading code. Local-subprocess remains the default
+  // when execution.executor_command_template is unset (no behavior change
+  // for existing deployments).
+  configureExecutor(config.execution);
 
   initializeAnthropicApiKey(config, process.env.ANTHROPIC_API_KEY);
   initializeAnthropicAuthToken(config, process.env.ANTHROPIC_AUTH_TOKEN);
@@ -271,7 +313,7 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     extraOptions: corsExtraOptions,
   } = buildCorsConfig({
     uiPort: UI_PORT,
-    isCodespaces: process.env.CODESPACES === 'true',
+    daemonPort: DAEMON_PORT,
     resolved: resolvedSecurity.cors,
   });
 
@@ -368,6 +410,16 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     );
   }
 
+  // HTTP proxies need raw bytes (no JSON/urlencoded reserialization) so the
+  // configured upstream sees exactly what the artifact wrote. Mount raw-body
+  // capture for `/proxies` BEFORE the global parsers below — once `req._body`
+  // is set, downstream parsers skip the request. Only mounted when at least
+  // one proxy is configured (matches the rest of the feature's "off by
+  // default" posture).
+  if (config.proxies && Object.keys(config.proxies).length > 0) {
+    app.use('/proxies', express.raw({ type: '*/*', limit: '10mb' }));
+  }
+
   // Default to a 10MB JSON body. The previous 10MB pre-hardening default was
   // unbounded enough to allow trivial memory-pressure DoS, and a 1MB ceiling
   // turned out to break legitimate flows (large prompts, /messages/bulk
@@ -379,11 +431,17 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
   app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
   // --------------------------------------------------------------------------
-  // Static file serving (production only)
+  // Static file serving — serve the bundled UI when it exists alongside
+  // the daemon (i.e., installed-package layout: dist/daemon + dist/ui).
+  // Previously gated on NODE_ENV=production, which made the UI 404 in
+  // foreground mode (where NODE_ENV is unset) — see issue #1150. The actual
+  // signal is "do we have a built UI bundle to serve?", which existsSync
+  // already answers correctly for both dev (no, vite serves on its own port)
+  // and installed (yes, it sits at ../ui).
   // --------------------------------------------------------------------------
-  const isProduction = process.env.NODE_ENV === 'production';
   const serveStaticFiles = servicesConfig.static_files !== 'off';
-  if (isProduction && serveStaticFiles) {
+  let bundledUiAvailable = false;
+  if (serveStaticFiles) {
     const path = await import('node:path');
     const { fileURLToPath } = await import('node:url');
     const { existsSync } = await import('node:fs');
@@ -393,28 +451,33 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     const uiPath = path.resolve(dirname, '../ui');
 
     if (existsSync(uiPath)) {
+      bundledUiAvailable = true;
       console.log(`📂 Serving UI from: ${uiPath}`);
 
       app.use(
-        '/ui',
+        UI_MOUNT_PATH,
         expressStaticGzip(uiPath, {
           enableBrotli: false,
           orderPreference: ['gz'],
-          serveStatic: { maxAge: '1y' },
+          serveStatic: {
+            etag: true,
+            setHeaders: setBundledUiStaticHeaders,
+          },
         }) as never
       );
-      app.use('/ui/*', ((_req: unknown, res: express.Response) => {
+      app.use(`${UI_MOUNT_PATH}/*`, ((_req: unknown, res: express.Response) => {
+        setBundledUiFallbackHeaders(res);
         res.sendFile(path.join(uiPath, 'index.html'));
       }) as never);
       app.use('/', ((req: express.Request, res: express.Response, next: express.NextFunction) => {
         if (req.path === '/' && req.method === 'GET') {
-          res.redirect('/ui/');
+          res.redirect(`${UI_MOUNT_PATH}/`);
         } else {
           next();
         }
       }) as never);
     } else {
-      console.warn(`⚠️  UI directory not found at ${uiPath} - UI will not be served`);
+      console.warn(`⚠️  UI bundle not found at ${uiPath} - UI will not be served`);
       console.warn(`   This is expected in development mode (UI runs on port ${UI_PORT})`);
     }
   }
@@ -450,39 +513,59 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     }
   }) as never);
 
-  // Compress dynamic API responses (after static file serving)
-  app.use(compression() as never);
+  // Compress dynamic REST/API responses after static file serving. The filter
+  // deliberately skips pass-through proxy and streaming/event-stream routes.
+  app.use(createDynamicCompressionMiddleware() as never);
 
   // --------------------------------------------------------------------------
   // REST, Socket.io, Swagger, Database
   // --------------------------------------------------------------------------
   app.configure(rest());
 
-  // Generate or load JWT secret
-  let jwtSecret = config.daemon?.jwtSecret;
-  if (!jwtSecret) {
-    const crypto = await import('node:crypto');
-    jwtSecret = crypto.randomBytes(32).toString('hex');
-    const { setConfigValue } = await import('@agor/core/config');
-    await setConfigValue('daemon.jwtSecret', jwtSecret);
-    console.log(
-      `🔑 Generated and saved persistent JWT secret to config (length=${jwtSecret.length})`
-    );
-  } else {
-    // SECURITY: never log any prefix/substring of the secret. Length only.
-    console.log(`🔑 Loaded existing JWT secret from config (length=${jwtSecret.length})`);
+  // JWT secret: env > existing config value > generate-and-persist >
+  // fail-fast with operator-actionable remediation. See setup/persisted-secret.ts
+  // and context/explorations/daemon-fs-decoupling.md §1.5 (H3).
+  //
+  // Failing-fast is critical: a fresh JWT secret on every restart invalidates
+  // every issued token, which silently breaks every active session.
+  const crypto = await import('node:crypto');
+  const { resolvePersistedSecret } = await import('./setup/persisted-secret.js');
+  const jwtResolution = await resolvePersistedSecret({
+    name: 'JWT secret',
+    envVar: 'AGOR_JWT_SECRET',
+    existing: config.daemon?.jwtSecret,
+    configKey: 'daemon.jwtSecret',
+    generate: () => crypto.randomBytes(32).toString('hex'),
+  });
+  const jwtSecret = jwtResolution.value;
+  // SECURITY: never log any prefix/substring of the secret. Length only.
+  switch (jwtResolution.source) {
+    case 'env':
+      console.log(`🔑 Loaded JWT secret from AGOR_JWT_SECRET env var (length=${jwtSecret.length})`);
+      break;
+    case 'config':
+      console.log(`🔑 Loaded JWT secret from config (length=${jwtSecret.length})`);
+      break;
+    case 'generated':
+      console.log(
+        `🔑 Generated and saved persistent JWT secret to config (length=${jwtSecret.length})`
+      );
+      break;
   }
 
   const socketIOConfig = createSocketIOConfig(app, {
     corsOrigin,
     jwtSecret,
-    allowAnonymous,
     credentialsAllowed,
     // Mirror the HTTP terminals service gate (register-hooks.ts) so the
     // `allow_web_terminal: false` kill-switch is enforced on the WebSocket
     // transport too. Without this the terminal:* relay events would still
     // accept traffic when the HTTP modal is disabled.
     webTerminalEnabled: config.execution?.allow_web_terminal !== false,
+    // Build info for the version-sync banner. Emitted as the `server-info`
+    // welcome event on every connect (and reconnect), so UI tabs can detect
+    // FE/BE drift after a deploy without waiting for the next /health poll.
+    buildInfo: DAEMON_BUILD_INFO,
   });
   app.configure(socketio(socketIOConfig.serverOptions, socketIOConfig.callback));
   configureChannels(app);
@@ -493,9 +576,17 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
   // --------------------------------------------------------------------------
   // RBAC flags
   // --------------------------------------------------------------------------
-  const worktreeRbacEnabled = config.execution?.worktree_rbac === true;
+  const branchRbacEnabled = config.execution?.branch_rbac === true;
   const allowSuperadmin = config.execution?.allow_superadmin === true;
   const superadminOpts = { allowSuperadmin };
+
+  // Stash the shared Drizzle handle on the Feathers app so utilities
+  // that don't get db passed as a constructor arg (Claude Code CLI
+  // watcher sink/persister, lifecycle hooks fired from after.create
+  // contexts) can resolve it via `getDb(app)`. Existing services that
+  // already receive `db` via constructor injection are unaffected.
+  app.set('database', db);
+  app.set('config', config);
 
   // --------------------------------------------------------------------------
   // Phase 1: Register services
@@ -507,10 +598,10 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     svcEnabled,
     jwtSecret,
     daemonUrl,
-    isProduction,
+    bundledUiAvailable,
     DAEMON_PORT,
     UI_PORT,
-    worktreeRbacEnabled,
+    branchRbacEnabled,
     allowSuperadmin,
     requireAuth,
   });
@@ -524,15 +615,13 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     config,
     svcEnabled,
     jwtSecret,
-    worktreeRbacEnabled,
-    allowAnonymous,
+    branchRbacEnabled,
     requireAuth,
-    getReadAuthHooks,
     superadminOpts,
     sessionsService: services.sessionsService,
     messagesService: services.messagesService,
     boardsService: services.boardsService,
-    worktreeRepository: services.worktreeRepository,
+    branchRepository: services.branchRepository,
     usersRepository: services.usersRepository,
     sessionsRepository: services.sessionsRepository,
   });
@@ -547,20 +636,20 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     svcEnabled,
     svcTier,
     jwtSecret,
-    worktreeRbacEnabled,
-    allowAnonymous,
+    branchRbacEnabled,
     requireAuth,
     enforcePasswordChange,
     superadminOpts,
     DB_PATH,
     DAEMON_PORT,
     DAEMON_VERSION,
+    DAEMON_BUILD_INFO,
     servicesConfig,
     resolvedSecurity,
     sessionsService: services.sessionsService,
     messagesService: services.messagesService,
     boardsService: services.boardsService,
-    worktreeRepository: services.worktreeRepository,
+    branchRepository: services.branchRepository,
     usersRepository: services.usersRepository,
     sessionsRepository: services.sessionsRepository,
     sessionMCPServersService: services.sessionMCPServersService,
@@ -582,5 +671,28 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     getSocketServer: socketIOConfig.getSocketServer,
     sessionsService: services.sessionsService,
     terminalsService: services.terminalsService,
+  });
+
+  // --------------------------------------------------------------------------
+  // Phase 5: Re-instantiate Claude Code CLI watchers for in-flight sessions.
+  //
+  // Has to run AFTER services are up (we use `app.service('branches')` to
+  // resolve cwds + `app.service('messages')` indirectly via the sink) and
+  // AFTER `app.set('database', db)` (the watcher persister uses
+  // `getDb(app)`). Sessions that were mid-turn at the previous daemon
+  // shutdown get their `cli_state.active_turn` rehydrated AND their
+  // stale-task watchdog re-started, so a Ctrl-D'd REPL that straddled
+  // the restart is detected and the task is closed.
+  // --------------------------------------------------------------------------
+  runPostStartJob('cli-watcher-rehydrate', async () => {
+    const { rehydrateCliWatchers } = await import('./services/claude-cli-integration.js');
+    await rehydrateCliWatchers(app, async (branchId) => {
+      try {
+        const branch = (await app.service('branches').get(branchId)) as { path?: string };
+        return branch?.path ?? null;
+      } catch {
+        return null;
+      }
+    });
   });
 }

@@ -3,8 +3,8 @@
  *
  * Focus: the tool bypasses the Feathers hook pipeline by running a raw Drizzle
  * query against the messages table. These tests verify that when
- * `worktree_rbac` is enabled, the raw query is restricted to sessions the
- * caller can access (preventing cross-worktree leakage via the `search`
+ * `branch_rbac` is enabled, the raw query is restricted to sessions the
+ * caller can access (preventing cross-branch leakage via the `search`
  * parameter).
  */
 
@@ -12,14 +12,14 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Hoist-safe mocks must be declared before the module under test is imported.
-const mockIsWorktreeRbacEnabled = vi.fn(() => false);
+const mockIsBranchRbacEnabled = vi.fn(() => false);
 const mockFindAccessibleSessions = vi.fn(async () => [] as Array<{ session_id: string }>);
 
 vi.mock('@agor/core/config', async () => {
   const actual = await vi.importActual<Record<string, unknown>>('@agor/core/config');
   return {
     ...actual,
-    isWorktreeRbacEnabled: () => mockIsWorktreeRbacEnabled(),
+    isBranchRbacEnabled: () => mockIsBranchRbacEnabled(),
   };
 });
 
@@ -62,12 +62,17 @@ type ToolHandler = (args: Record<string, unknown>) => Promise<{
   content: Array<{ type: string; text: string }>;
 }>;
 
-async function registerAndGetHandler(ctx: { userId: string; role?: string }): Promise<ToolHandler> {
+type CapturedTool = {
+  cfg: { inputSchema?: { parse: (v: unknown) => unknown; safeParse: (v: unknown) => any } };
+  cb: ToolHandler;
+};
+
+async function registerAndGetTool(ctx: { userId: string; role?: string }): Promise<CapturedTool> {
   const { registerMessageTools } = await import('./messages.js');
-  let captured: ToolHandler | undefined;
+  let captured: CapturedTool | undefined;
   const fakeServer = {
-    registerTool: (_name: string, _cfg: unknown, cb: ToolHandler) => {
-      captured = cb;
+    registerTool: (_name: string, cfg: unknown, cb: ToolHandler) => {
+      captured = { cfg: cfg as CapturedTool['cfg'], cb };
     },
   } as unknown as McpServer;
 
@@ -84,14 +89,18 @@ async function registerAndGetHandler(ctx: { userId: string; role?: string }): Pr
   return captured;
 }
 
+async function registerAndGetHandler(ctx: { userId: string; role?: string }): Promise<ToolHandler> {
+  return (await registerAndGetTool(ctx)).cb;
+}
+
 describe('agor_messages_list MCP tool', () => {
   beforeEach(() => {
-    mockIsWorktreeRbacEnabled.mockReset();
+    mockIsBranchRbacEnabled.mockReset();
     mockFindAccessibleSessions.mockReset();
     mockWhereSpy.mockReset();
     mockAllSpy.mockReset();
     mockAllSpy.mockResolvedValue([]);
-    mockIsWorktreeRbacEnabled.mockReturnValue(false);
+    mockIsBranchRbacEnabled.mockReturnValue(false);
     mockFindAccessibleSessions.mockResolvedValue([]);
   });
 
@@ -99,8 +108,33 @@ describe('agor_messages_list MCP tool', () => {
     vi.resetModules();
   });
 
-  it('does not enforce RBAC when worktree_rbac is disabled', async () => {
-    mockIsWorktreeRbacEnabled.mockReturnValue(false);
+  it('surfaces clearer validation for malformed ids and pagination', async () => {
+    const tool = await registerAndGetTool({ userId: 'user-1' });
+    const schema = tool.cfg.inputSchema!;
+
+    const badSessionId = schema.safeParse({ sessionId: 123 });
+    expect(badSessionId.success).toBe(false);
+    expect(String(badSessionId.error.message)).toMatch(/sessionId must be a string/);
+
+    const badLimit = schema.safeParse({ search: 'secret', limit: -1 });
+    expect(badLimit.success).toBe(false);
+    expect(String(badLimit.error.message)).toMatch(/limit must be greater than 0/);
+
+    const badOffset = schema.safeParse({ search: 'secret', offset: -1 });
+    expect(badOffset.success).toBe(false);
+    expect(String(badOffset.error.message)).toMatch(/offset must be greater than or equal to 0/);
+  });
+
+  it('keeps the handler-level search scope check actionable', async () => {
+    const handler = await registerAndGetHandler({ userId: 'user-1' });
+
+    await expect(handler({})).rejects.toThrow(
+      /At least one of sessionId, taskId, or search must be provided as a non-empty string/
+    );
+  });
+
+  it('does not enforce RBAC when branch_rbac is disabled', async () => {
+    mockIsBranchRbacEnabled.mockReturnValue(false);
     const handler = await registerAndGetHandler({ userId: 'user-1' });
     await handler({ search: 'secret' });
     expect(mockFindAccessibleSessions).not.toHaveBeenCalled();
@@ -108,7 +142,7 @@ describe('agor_messages_list MCP tool', () => {
   });
 
   it('short-circuits to empty when user has no accessible sessions', async () => {
-    mockIsWorktreeRbacEnabled.mockReturnValue(true);
+    mockIsBranchRbacEnabled.mockReturnValue(true);
     mockFindAccessibleSessions.mockResolvedValue([]);
 
     const handler = await registerAndGetHandler({ userId: 'user-1' });
@@ -124,7 +158,7 @@ describe('agor_messages_list MCP tool', () => {
   });
 
   it('restricts raw query to accessible session ids for regular users', async () => {
-    mockIsWorktreeRbacEnabled.mockReturnValue(true);
+    mockIsBranchRbacEnabled.mockReturnValue(true);
     mockFindAccessibleSessions.mockResolvedValue([
       { session_id: 'sess-allowed-1' },
       { session_id: 'sess-allowed-2' },
@@ -155,7 +189,7 @@ describe('agor_messages_list MCP tool', () => {
   });
 
   it('bypasses RBAC filter for superadmin role', async () => {
-    mockIsWorktreeRbacEnabled.mockReturnValue(true);
+    mockIsBranchRbacEnabled.mockReturnValue(true);
     const handler = await registerAndGetHandler({ userId: 'user-1', role: 'superadmin' });
     await handler({ search: 'secret' });
     expect(mockFindAccessibleSessions).not.toHaveBeenCalled();

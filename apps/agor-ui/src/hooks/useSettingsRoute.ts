@@ -8,13 +8,14 @@ import { useLocation, useNavigate } from 'react-router-dom';
 export const SETTINGS_SECTIONS = [
   'boards',
   'repos',
-  'worktrees',
+  'branches',
   'assistants',
   'cards',
   'artifacts',
   'mcp',
   'agentic-tools',
   'gateway',
+  'groups',
   'users',
   'about',
 ] as const;
@@ -48,6 +49,8 @@ export interface SettingsRouteState {
 export function useSettingsRoute() {
   const location = useLocation();
   const navigate = useNavigate();
+  const settingsBackgroundPath =
+    (location.state as { settingsBackgroundPath?: string } | null)?.settingsBackgroundPath ?? null;
 
   // Parse the current location to extract settings state
   const routeState = useMemo<SettingsRouteState>(() => {
@@ -87,28 +90,31 @@ export function useSettingsRoute() {
   const openSettings = useCallback(
     (section: SettingsSection = 'boards', itemId?: string) => {
       const path = itemId ? `/settings/${section}/${itemId}/` : `/settings/${section}/`;
-      navigate(path);
+      const backgroundPath = location.pathname.startsWith('/settings')
+        ? settingsBackgroundPath || '/'
+        : `${location.pathname}${location.search}${location.hash}`;
+      navigate(path, { state: { settingsBackgroundPath: backgroundPath } });
     },
-    [navigate]
+    [location.hash, location.pathname, location.search, navigate, settingsBackgroundPath]
   );
 
   /**
    * Close the settings modal (navigate back or to root)
    */
   const closeSettings = useCallback(() => {
-    // Navigate to root or previous non-settings route
-    // For now, just go to root. Could be improved to remember previous location.
-    navigate('/');
-  }, [navigate]);
+    navigate(settingsBackgroundPath || '/');
+  }, [navigate, settingsBackgroundPath]);
 
   /**
    * Change the current settings section
    */
   const setSection = useCallback(
     (section: SettingsSection) => {
-      navigate(`/settings/${section}/`);
+      navigate(`/settings/${section}/`, {
+        state: settingsBackgroundPath ? { settingsBackgroundPath } : undefined,
+      });
     },
-    [navigate]
+    [navigate, settingsBackgroundPath]
   );
 
   /**
@@ -116,17 +122,21 @@ export function useSettingsRoute() {
    */
   const openItem = useCallback(
     (itemId: string) => {
-      navigate(`/settings/${routeState.section}/${itemId}/`);
+      navigate(`/settings/${routeState.section}/${itemId}/`, {
+        state: settingsBackgroundPath ? { settingsBackgroundPath } : undefined,
+      });
     },
-    [navigate, routeState.section]
+    [navigate, routeState.section, settingsBackgroundPath]
   );
 
   /**
    * Close the item modal but stay in the section
    */
   const closeItem = useCallback(() => {
-    navigate(`/settings/${routeState.section}/`);
-  }, [navigate, routeState.section]);
+    navigate(`/settings/${routeState.section}/`, {
+      state: settingsBackgroundPath ? { settingsBackgroundPath } : undefined,
+    });
+  }, [navigate, routeState.section, settingsBackgroundPath]);
 
   return {
     ...routeState,

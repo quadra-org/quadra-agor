@@ -2,9 +2,15 @@
 
 # Agor
 
-**Think Figma, but for AI coding assistants.** Orchestrate Claude Code, Codex, and Gemini sessions on a multiplayer canvas. Manage git worktrees, track AI conversations, and visualize your team's agentic work in real-time.
+**Team command center for all things agentic.**
 
-> **TL;DR:** Agor is a multiplayer spatial canvas where you coordinate multiple AI coding assistants on parallel tasks, with GitHub-linked worktrees, automated workflow zones, and isolated test environments—all running simultaneously.
+Agor is a shared canvas where coding agents (Claude Code, Codex, Gemini) and long-lived assistants run side-by-side on isolated git branches — the anchor entity where sessions, dev environments, prompts, and PRs converge. Your whole team rallies around the same live work in real time, and the agents themselves drive Agor over MCP.
+
+- **Team workspace for AI agents** — multiplayer is the core differentiator. Live cursors, facepile, scoped comments, shared sessions and dev envs.
+- **Branches as the anchor** — one entity per piece of work, where conversations + dev env + PR + prompts all converge.
+- **Multi-agent, multi-runtime** — Claude Code, Codex, Gemini, OpenCode, Copilot, interchangeable per session.
+- **Shared, long-lived assistants** — persistent agents with identity, memory, and skills that you publish for the whole team.
+- **Self-hosted** — your repos, your DB, your isolation posture.
 
 **📖 [Read the full documentation at agor.live →](https://agor.live/)**
 
@@ -17,7 +23,7 @@
     <tr>
       <td width="50%">
         <img src="https://github.com/preset-io/agor/releases/download/v0.3.15/Area.gif" alt="Spatial 2D Canvas"/>
-        <p align="center"><em style="opacity: 0.5;">Spatial canvas with worktrees and zones</em></p>
+        <p align="center"><em style="opacity: 0.5;">Spatial canvas with branches and zones</em></p>
       </td>
       <td width="50%">
         <img src="https://github.com/preset-io/agor/releases/download/v0.3.15/Convo.gif" alt="AI Conversation in Action"/>
@@ -27,7 +33,7 @@
     <tr>
       <td width="50%">
         <img src="https://github.com/preset-io/agor/releases/download/v0.3.15/Settings.gif" alt="Settings and Configuration"/>
-        <p align="center"><em style="opacity: 0.5;">MCP servers and worktree management</em></p>
+        <p align="center"><em style="opacity: 0.5;">MCP servers and branch management</em></p>
       </td>
       <td width="50%">
         <img src="https://github.com/preset-io/agor/releases/download/v0.3.15/Social.gif" alt="Real-time Multiplayer"/>
@@ -48,122 +54,51 @@
 
 ---
 
-## Installation
+## Quick Start
 
-### Requirements
-
-- **Node.js** 20.x
-- **Zellij** ≥ 0.40 (required - daemon will not start without it)
-
-Install Zellij:
-
-```bash
-# Ubuntu/Debian
-curl -L https://github.com/zellij-org/zellij/releases/latest/download/zellij-x86_64-unknown-linux-musl.tar.gz | sudo tar -xz -C /usr/local/bin
-
-# macOS
-brew install zellij
-
-# RHEL/CentOS
-curl -L https://github.com/zellij-org/zellij/releases/latest/download/zellij-x86_64-unknown-linux-musl.tar.gz | sudo tar -xz -C /usr/local/bin
-```
-
-### Install Agor
+Requires **Node.js ≥ 22.12** ([install](https://nodejs.org)).
 
 ```bash
 npm install -g agor-live
 ```
 
-**Note:** Agor requires Zellij for persistent terminal sessions. The daemon will fail to start with a helpful error message if Zellij is not installed.
-
-## Quick Start
+Prefer Homebrew on macOS or Linux? See the [Getting Started guide](https://agor.live/guide/getting-started) for the brew install path.
 
 ```bash
-# 1. Initialize (creates ~/.agor/ and database)
-agor init
-
-# 2. Start the daemon
-agor daemon start
-
-# 3. Open the UI
-agor open
+agor init           # creates ~/.agor/ and database
+agor daemon start   # runs in the background
+agor open           # opens the UI
 ```
 
-**Try in Codespaces:**
+That's it. Visit [agor.live/guide/getting-started](https://agor.live/guide/getting-started) to add a repo and create your first session — the onboarding wizard takes it from there.
 
-[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://github.com/codespaces/new?skip_quickstart=true&machine=basicLinux32gb&repo=1069864589&ref=main&devcontainer_path=.devcontainer%2Fdevcontainer.json&geo=UsWest)
-
----
-
-## Key Features
-
-### 🧩 Agent Swarm Control
-
-- Run as many **Claude Code**, **Codex**, and **Gemini** sessions as you can handle—simultaneously.
-- Agents in Agor can coordinate and supervise through the internal Agor MCP service.
-- Built-in **scheduler** triggers templated prompts on your cadence.
-
-### 🌐 Multiplayer Spatial Canvas
-
-- Figma-esque board layout organizes your AI coding sessions across boards (full 2D canvases).
-- **Scoped/spatial comments** + reactions pinned to boards, zones, or worktrees (Figma-style).
-- WebSocket-powered cursor broadcasting and facepiles show teammates in real time.
-
-### 🌲 Session Trees — Fork, Spawn, Coordinate
-
-- **Fork sessions** to explore alternatives without losing the original path.
-- **Spawn subsessions** for focused subtasks that report back to the parent.
-- Visualize the session genealogy in "session trees"
-
-### ⚙️ Zone Triggers — Workflows Made Spatial
-
-- Define **zones** on your board that trigger templated prompts when worktrees are dropped.
-- Build **kanban-style flows** or custom pipelines: analyze → develop → review → deploy.
-- **GitHub-native workflow**: Link worktrees to issues/PRs, auto-inject context into prompts
-  - Template syntax: `"deeply analyze this github issue: {{ worktree.issue_url }}"`
-  - Each worktree = isolated branch for a specific issue/PR
-  - AI agents automatically read the linked issue/PR context
-
-### 🌳 Isolated Development Environments
-
-**The Problem:** Working on 3 PRs simultaneously? Each needs different ports, dependencies, database states.
-
-**Agor's Solution:**
-
-- Each worktree gets its own **isolated environment** with auto-managed unique ports
-- Configure start/stop commands once with templates: `PORT={{ add 9000 worktree.unique_id }} docker compose up -d`
-- Everyone on your team can **one-click start/stop** any worktree's environment
-- Multiple AI agents work in parallel without stepping on each other
-- Health monitoring tracks if services are running properly
-
-**No more:** "Kill your local server, I need to test my branch"
-
-### 🕹️ Real-Time Strategy for AI Teams
-
-- Coordinate agentic work like a multiplayer RTS.
-- Watch teammates or agents move across tasks live.
-- Cluster sessions, delegate, pivot, and iterate together.
-
-### 📱 Mobile-Friendly Prompting
-
-- **Keep sessions cooking on the go** — mobile-optimized UI for sending prompts and monitoring progress.
-- Access conversations, send follow-ups, and check agent status from your phone.
-- Full conversation view with hamburger navigation to switch between sessions.
+For Docker, source builds, Postgres, and team setups, see [Extended Installation](https://agor.live/guide/extended-install).
 
 ---
 
-## Use Case: Parallel PR Workflow
+## What is Agor?
 
-Your team has 3 bug fixes and 2 features in flight. With Agor:
+Agor is built on three foundational concepts:
 
-1. **Create 5 worktrees**, each linked to its GitHub issue/PR
-2. **Spawn AI sessions** for each worktree (Claude, Codex, Gemini)
-3. **Drop into zones** → "Analyze" zone triggers: `"Review this issue: {{ worktree.issue_url }}"`
-4. **Watch in real-time** as all 5 agents work simultaneously on the spatial canvas
-5. **Isolated environments** with unique ports prevent conflicts
-6. **Push directly** from worktrees to GitHub when ready
+- **[Branches](https://agor.live/guide/branches)** — the unit of work. A git branch pinned to a board, with its own branch, isolated environment, and conversations.
+- **[Sessions & Trees](https://agor.live/guide/sessions)** — agent conversations with genealogy. Fork to explore alternatives, spawn subsessions for focused subtasks.
+- **[Boards & Zones](https://agor.live/guide/boards)** — a Figma-style 2D canvas of branches. Drop a branch into a zone to trigger a templated prompt.
 
-**No context switching. No port collisions. No waiting.**
+Everything else builds on these. **[Read the Features Overview →](https://agor.live/guide/features-overview)**
+
+---
+
+## Features
+
+- **[Assistants](https://agor.live/guide/assistants)** — long-lived AI companions with file-based memory and skills, OpenClaw-style.
+- **[Agor MCP Server](https://agor.live/guide/internal-mcp)** — anything a user can do in Agor, an agent can do too. Sessions are auto-issued an MCP token.
+- **[Rich Chat UX](https://agor.live/guide/rich-chat-ux)** — per-prompt token + dollar accounting, model/effort selectors, structured tool blocks, completion chimes.
+- **[Multiplayer & Social](https://agor.live/guide/multiplayer-social)** — live cursors, facepiles, spatial comments, shared multiplayer terminal.
+- **[Environments](https://agor.live/guide/environment-configuration)** — one-click dev servers per branch with auto-managed unique ports.
+- **[Scheduler](https://agor.live/guide/scheduler)** — cron-style triggers for templated prompts. Powers assistant heartbeats and automated audits.
+- **[Cards](https://agor.live/guide/cards)** (Beta) — generic workflow entities for non-code workflows.
+- **[Artifacts](https://agor.live/guide/artifacts)** — live, interactive applications rendered on the board via Sandpack.
+- **[Message Gateway](https://agor.live/guide/message-gateway)** — Slack and GitHub as portals to Agor sessions.
 
 ---
 
@@ -171,7 +106,7 @@ Your team has 3 bug fixes and 2 features in flight. With Agor:
 
 <div align="center">
   <img src="https://github.com/preset-io/agor/releases/download/v0.7.9/hero.png" alt="Agor Board" style="width: 100%; border-radius: 8px; margin-bottom: 24px;" />
-  <p style="opacity: 0.5;"><em>Multiplayer spatial canvas with zones, worktrees, and real-time collaboration</em></p>
+  <p style="opacity: 0.5;"><em>Multiplayer spatial canvas with zones, branches, and real-time collaboration</em></p>
 </div>
 
 <div align="center">
@@ -183,7 +118,7 @@ Your team has 3 bug fixes and 2 features in flight. With Agor:
       </td>
       <td width="50%">
         <img src="https://github.com/preset-io/agor/releases/download/v0.3.15/settings_modal.png" alt="Settings Modal"/>
-        <p align="center"><em style="opacity: 0.5;">MCP server and worktree management</em></p>
+        <p align="center"><em style="opacity: 0.5;">MCP server and branch management</em></p>
       </td>
     </tr>
     <tr>
@@ -199,7 +134,7 @@ Your team has 3 bug fixes and 2 features in flight. With Agor:
     <tr>
       <td width="50%">
         <img src="https://github.com/preset-io/agor/releases/download/v0.3.15/env_configuration.png" alt="Environment Configuration"/>
-        <p align="center"><em style="opacity: 0.5;">Worktree environment setup</em></p>
+        <p align="center"><em style="opacity: 0.5;">Branch environment setup</em></p>
       </td>
       <td width="50%">
         <img src="https://github.com/preset-io/agor/releases/download/v0.3.15/create_session_modal.png" alt="Create Session Modal"/>
@@ -209,7 +144,7 @@ Your team has 3 bug fixes and 2 features in flight. With Agor:
     <tr>
       <td width="50%">
         <img src="https://github.com/preset-io/agor/releases/download/v0.3.15/baked_in_terminal.png" alt="Built-in Terminal"/>
-        <p align="center"><em style="opacity: 0.5;">Built-in terminal with worktree context</em></p>
+        <p align="center"><em style="opacity: 0.5;">Built-in terminal with branch context</em></p>
       </td>
       <td width="50%">
         <img src="https://github.com/preset-io/agor/releases/download/v0.3.15/onboarding.png" alt="Onboarding Experience"/>
@@ -235,14 +170,14 @@ graph TB
     subgraph "Agor Daemon"
         Feathers["FeathersJS Server"]
         MCP["MCP HTTP Endpoint<br/>/mcp?sessionToken=..."]
-        Services["Services<br/>Sessions, Tasks, Messages<br/>Boards, Worktrees, Repos"]
+        Services["Services<br/>Sessions, Tasks, Messages<br/>Boards, Branches, Repos"]
         AgentSDKs["Agent SDKs<br/>Claude, Codex, Gemini"]
         ORM["Drizzle ORM"]
     end
 
     subgraph Storage
         DB[("LibSQL Database<br/>~/.agor/agor.db")]
-        Git["Git Worktrees<br/>~/.agor/worktrees/"]
+        Git["Git Branches<br/>~/.agor/worktrees/"]
         Config["Config<br/>~/.agor/config.yaml"]
     end
 
@@ -271,21 +206,15 @@ graph TB
 
 **[Development Guide →](https://agor.live/guide/development)**
 
-Quick start (localhost):
+Quickest path — run Agor from source via Docker:
 
 ```bash
-# Terminal 1: Daemon
-cd apps/agor-daemon && pnpm dev  # :3030
-
-# Terminal 2: UI
-cd apps/agor-ui && pnpm dev      # :5173
-```
-
-Or use Docker:
-
-```bash
+git clone https://github.com/preset-io/agor.git
+cd agor
 docker compose up
 ```
+
+The repo's `.agor.yml` defines variants (sqlite / postgres / full / docs) so you can spin up the exact dev setup you need. The dev guide also covers running Agor _inside_ Agor for dogfooding, plus custom builds via `packages/agor-live/build.sh`.
 
 ---
 
@@ -296,8 +225,8 @@ docker compose up
 Highlights:
 
 - **Match CLI-Native Features** — SDKs are evolving rapidly and exposing more functionality. Push integrations deeper to match all key features available in the underlying CLIs
-- **Bring Your Own IDE** — Connect VSCode, Cursor, or any IDE directly to Agor-managed worktrees via SSH/Remote
-- **Unix User Integration** — Enable true multi-tenancy with per-user Unix isolation for secure collaboration. [Read the exploration →](https://github.com/preset-io/agor/blob/main/context/explorations/unix-user-integration.md)
+- **Bring Your Own IDE** — Connect VSCode, Cursor, or any IDE directly to Agor-managed branches via SSH/Remote
+- **Unix User Integration** — Enable true multi-tenancy with per-user Unix isolation for secure collaboration. [Read the guide →](https://github.com/preset-io/agor/blob/main/apps/agor-docs/pages/guide/multiplayer-unix-isolation.mdx)
 
 ---
 

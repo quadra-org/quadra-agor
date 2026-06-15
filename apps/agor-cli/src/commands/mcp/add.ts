@@ -2,6 +2,8 @@
  * `agor mcp add` - Add a new MCP server
  */
 
+import { normalizeMCPCustomHeaders } from '@agor/core/tools/mcp/http-headers';
+import { shortId } from '@agor-live/client';
 import { Args, Flags } from '@oclif/core';
 import chalk from 'chalk';
 import { BaseCommand } from '../../base-command';
@@ -65,6 +67,10 @@ export default class McpAdd extends BaseCommand {
       char: 'e',
       description: 'Environment variables (key=value pairs, comma-separated)',
     }),
+    headers: Flags.string({
+      description:
+        'Custom HTTP headers for remote transports (key=value pairs, comma-separated). Authorization is configured via auth, not here.',
+    }),
   };
 
   async run(): Promise<void> {
@@ -121,6 +127,35 @@ export default class McpAdd extends BaseCommand {
         }
       }
 
+      // Add custom HTTP headers
+      if (flags.headers) {
+        if (flags.transport === 'stdio') {
+          this.warn('--headers only applies to http/sse transports; ignoring for stdio');
+        }
+        const headerPairs = flags.headers.split(',').map((pair) => pair.trim());
+        const headersObject: Record<string, string> = {};
+        for (const pair of headerPairs) {
+          const [key, ...valueParts] = pair.split('=');
+          const value = valueParts.join('=');
+          if (key && value) {
+            headersObject[key.trim()] = value.trim();
+          }
+        }
+        const normalizedHeaders =
+          flags.transport === 'stdio' ? undefined : normalizeMCPCustomHeaders(headersObject);
+        const droppedHeaderNames = Object.keys(headersObject).filter(
+          (key) => !normalizedHeaders || !(key.trim() in normalizedHeaders)
+        );
+        if (droppedHeaderNames.length > 0) {
+          this.warn(
+            `Ignoring reserved or invalid custom headers: ${droppedHeaderNames.join(', ')}`
+          );
+        }
+        if (normalizedHeaders && Object.keys(normalizedHeaders).length > 0) {
+          data.headers = normalizedHeaders;
+        }
+      }
+
       // Add scope-specific IDs
       if (flags['session-id']) data.session_id = flags['session-id'];
 
@@ -130,7 +165,7 @@ export default class McpAdd extends BaseCommand {
       this.log(`${chalk.green('✓')} MCP server added`);
       this.log('');
       this.log(chalk.bold('Server Details:'));
-      this.log(`  ${chalk.cyan('ID')}: ${String(server.mcp_server_id).substring(0, 8)}`);
+      this.log(`  ${chalk.cyan('ID')}: ${shortId(String(server.mcp_server_id))}`);
       this.log(`  ${chalk.cyan('Name')}: ${server.name}`);
       this.log(`  ${chalk.cyan('Transport')}: ${server.transport}`);
       this.log(`  ${chalk.cyan('Scope')}: ${server.scope}`);
@@ -150,6 +185,10 @@ export default class McpAdd extends BaseCommand {
       if (server.env) {
         const envKeys = Object.keys(server.env);
         this.log(`  ${chalk.cyan('Environment')}: ${envKeys.join(', ')}`);
+      }
+      if (server.headers) {
+        const headerKeys = Object.keys(server.headers);
+        this.log(`  ${chalk.cyan('Custom Headers')}: ${headerKeys.join(', ')}`);
       }
 
       this.log('');

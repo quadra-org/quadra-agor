@@ -6,17 +6,22 @@
  */
 
 import type {
+  AgorGrants,
+  AgorRuntimeConfig,
   CodexApprovalPolicy,
   CodexSandboxMode,
   EffortLevel,
   Message,
   PermissionMode,
+  SandpackConfig,
   Session,
   Task,
+  UserExternalIdentity,
 } from '@agor/core/types';
-import { WORKTREE_PERMISSION_LEVELS } from '@agor/core/types';
+import { BRANCH_PERMISSION_LEVELS } from '@agor/core/types';
 import { relations, sql } from 'drizzle-orm';
 import {
+  type AnyPgColumn,
   bigint,
   boolean,
   customType,
@@ -61,7 +66,7 @@ export const sessions = pgTable(
     updated_at: t.timestamp('updated_at'),
 
     // User attribution
-    created_by: varchar('created_by', { length: 36 }).notNull().default('anonymous'),
+    created_by: varchar('created_by', { length: 36 }).notNull(),
 
     // Unix username for SDK impersonation (immutable once set)
     // Set from creator's unix_username at session creation time
@@ -83,7 +88,7 @@ export const sessions = pgTable(
       ],
     }).notNull(),
     agentic_tool: text('agentic_tool', {
-      enum: ['claude-code', 'codex', 'gemini', 'opencode', 'copilot'],
+      enum: ['claude-code', 'claude-code-cli', 'codex', 'gemini', 'opencode', 'copilot', 'cursor'],
     }).notNull(),
     board_id: varchar('board_id', { length: 36 }), // NULL = no board
 
@@ -91,24 +96,31 @@ export const sessions = pgTable(
     parent_session_id: varchar('parent_session_id', { length: 36 }),
     forked_from_session_id: varchar('forked_from_session_id', { length: 36 }),
 
-    // Worktree reference (REQUIRED: all sessions must have a worktree)
-    worktree_id: varchar('worktree_id', { length: 36 })
+    // Branch reference (REQUIRED: all sessions must have a branch)
+    branch_id: varchar('branch_id', { length: 36 })
       .notNull()
-      .references(() => worktrees.worktree_id, {
-        onDelete: 'cascade', // Cascade delete sessions when worktree is deleted
+      .references(() => branches.branch_id, {
+        onDelete: 'cascade', // Cascade delete sessions when branch is deleted
       }),
 
     // Scheduler tracking (materialized for deduplication and retention cleanup)
     scheduled_run_at: bigint('scheduled_run_at', { mode: 'number' }), // Unix timestamp (ms) - authoritative run ID - bigint to support dates beyond 2038
-    scheduled_from_worktree: t.bool('scheduled_from_worktree').notNull().default(false),
+    scheduled_from_branch: t.bool('scheduled_from_branch').notNull().default(false),
+    // FK to schedules.schedule_id, ON DELETE SET NULL. Defined here (not
+    // just in the migration) so drizzle-kit / db introspection sees the
+    // constraint and so future schema diffs don't lose it.
+    schedule_id: varchar('schedule_id', { length: 36 }).references(
+      (): import('drizzle-orm/pg-core').AnyPgColumn => schedules.schedule_id,
+      { onDelete: 'set null' }
+    ),
 
     // UI state (materialized for efficient highlighting queries)
     ready_for_prompt: t.bool('ready_for_prompt').notNull().default(false),
 
-    // Archive state (cascaded from worktree archive)
+    // Archive state (cascaded from branch archive)
     archived: t.bool('archived').notNull().default(false),
     archived_reason: text('archived_reason', {
-      enum: ['worktree_archived', 'manual', 'btw_completed'],
+      enum: ['branch_archived', 'manual', 'btw_completed'],
     }),
 
     // JSON blob for everything else (cross-DB via json() type)
@@ -175,6 +187,33 @@ export const sessions = pgTable(
             };
           };
         };
+
+        // Claude Code CLI adapter state (only set when agentic_tool === 'claude-code-cli').
+        // Persisted so the daemon can re-instantiate the JSONL watcher across
+        // daemon restarts without losing offset. See
+        // apps/agor-daemon/src/services/claude-cli-watcher.ts and
+        // docs/internal/claude-code-cli-integration-analysis-2026-05-14.md.
+        cli_state?: {
+          watcher_offset?: number;
+          last_event_ts?: string;
+          last_event_uuid?: string;
+          slug?: string;
+          jsonl_path?: string;
+          zellij_pane_id?: string;
+          zellij_tab_name?: string;
+          active_turn?: {
+            task_id: string;
+            user_message_index: number;
+            started_at_ms: number;
+          } | null;
+        };
+
+        // Billing model for this session.
+        // - 'subscription': running against the user's Claude Pro/Max
+        //   subscription's interactive limits (CLI adapter, default).
+        // - 'api-key': ANTHROPIC_API_KEY was set at spawn → per-token billing.
+        // - 'unknown': legacy rows or pre-flag detection.
+        billing_mode?: 'subscription' | 'api-key' | 'unknown';
       }>()
       .notNull(),
   },
@@ -182,14 +221,19 @@ export const sessions = pgTable(
     statusIdx: index('sessions_status_idx').on(table.status),
     agenticToolIdx: index('sessions_agentic_tool_idx').on(table.agentic_tool),
     boardIdx: index('sessions_board_idx').on(table.board_id),
-    worktreeIdx: index('sessions_worktree_idx').on(table.worktree_id),
+    branchIdx: index('sessions_branch_idx').on(table.branch_id),
     createdIdx: index('sessions_created_idx').on(table.created_at),
     parentIdx: index('sessions_parent_idx').on(table.parent_session_id),
     forkedIdx: index('sessions_forked_idx').on(table.forked_from_session_id),
-    // Scheduler indexes (note: partial indexes defined in migration, not here)
-    scheduledFromWorktreeIdx: index('sessions_scheduled_flag_idx').on(
-      table.scheduled_from_worktree
-    ),
+    // Scheduler indexes — including the partial unique index below.
+    scheduledFromBranchIdx: index('sessions_scheduled_flag_idx').on(table.scheduled_from_branch),
+    // Partial unique index — covering for the scheduler's dedup lookup
+    // AND serves as the DB-level guard against check-then-create races
+    // in spawnScheduledSession.
+    scheduleRunUnique: uniqueIndex('sessions_schedule_run_unique')
+      .on(table.schedule_id, table.scheduled_run_at)
+      // Both columns must be non-null — see SQLite mirror.
+      .where(sql`${table.schedule_id} IS NOT NULL AND ${table.scheduled_run_at} IS NOT NULL`),
   })
 );
 
@@ -206,8 +250,10 @@ export const tasks = pgTable(
     created_at: t.timestamp('created_at').notNull(),
     started_at: t.timestamp('started_at'),
     completed_at: t.timestamp('completed_at'),
+    last_executor_heartbeat_at: t.timestamp('last_executor_heartbeat_at'),
     status: text('status', {
       enum: [
+        'queued',
         'created',
         'running',
         'stopping',
@@ -220,8 +266,11 @@ export const tasks = pgTable(
       ],
     }).notNull(),
 
+    // Queue position (lower drains first); only populated for status='queued'
+    queue_position: integer('queue_position'),
+
     // User attribution
-    created_by: varchar('created_by', { length: 36 }).notNull().default('anonymous'),
+    created_by: varchar('created_by', { length: 36 }).notNull(),
 
     // MD5 of SDK session file at task completion (only populated when stateless_fs_mode is enabled)
     session_md5: text('session_md5'),
@@ -229,13 +278,13 @@ export const tasks = pgTable(
     data: t
       .json<unknown>('data')
       .$type<{
-        description: string;
         full_prompt: string;
 
         message_range: Task['message_range'];
         git_state: Task['git_state'];
 
-        model: string;
+        /** Filled by the executor after the turn. */
+        model?: string;
         tool_use_count: number;
 
         duration_ms?: number;
@@ -257,6 +306,9 @@ export const tasks = pgTable(
 
         report?: Task['report'];
         permission_request?: Task['permission_request'];
+
+        // Generic metadata (e.g., is_agor_callback, source, child_session_id)
+        metadata?: Task['metadata'];
       }>()
       .notNull(),
   },
@@ -264,6 +316,13 @@ export const tasks = pgTable(
     sessionIdx: index('tasks_session_idx').on(table.session_id),
     statusIdx: index('tasks_status_idx').on(table.status),
     createdIdx: index('tasks_created_idx').on(table.created_at),
+    queueIdx: index('tasks_queue_idx').on(table.session_id, table.status, table.queue_position),
+    // Partial unique index — defense-in-depth for `tasks.createPending` race
+    // serialization. Only QUEUED rows are constrained; CREATED/RUNNING/done
+    // rows have NULL queue_position and are unaffected.
+    queuedPositionUnique: uniqueIndex('tasks_queued_position_unique')
+      .on(table.session_id, table.queue_position)
+      .where(sql`${table.status} = 'queued'`),
   })
 );
 
@@ -277,9 +336,9 @@ export const serializedSessions = pgTable(
     session_id: varchar('session_id', { length: 36 })
       .notNull()
       .references(() => sessions.session_id, { onDelete: 'cascade' }),
-    worktree_id: varchar('worktree_id', { length: 36 })
+    branch_id: varchar('branch_id', { length: 36 })
       .notNull()
-      .references(() => worktrees.worktree_id, { onDelete: 'cascade' }),
+      .references(() => branches.branch_id, { onDelete: 'cascade' }),
     task_id: varchar('task_id', { length: 36 }).references(() => tasks.task_id, {
       onDelete: 'set null',
     }),
@@ -294,7 +353,7 @@ export const serializedSessions = pgTable(
       table.session_id,
       table.turn_index
     ),
-    worktreeIdx: index('serialized_sessions_worktree_idx').on(table.worktree_id),
+    branchIdx: index('serialized_sessions_branch_idx').on(table.branch_id),
   })
 );
 
@@ -328,6 +387,9 @@ export const messages = pgTable(
         'file-history-snapshot',
         'permission_request',
         'input_request',
+        'daemon_restart',
+        'daemon_crash',
+        'widget_request',
       ],
     }).notNull(),
     role: text('role', {
@@ -340,9 +402,9 @@ export const messages = pgTable(
     // Parent tool use ID (for nested tool calls - e.g., Task tool spawning Read/Grep)
     parent_tool_use_id: text('parent_tool_use_id'),
 
-    // Message queueing fields
-    status: text('status', { enum: ['queued'] }), // 'queued' or null (normal message)
-    queue_position: integer('queue_position'), // Position in queue (1, 2, 3, ...)
+    // NOTE: queueing moved off `messages` and onto `tasks.status='queued'` as
+    // of migration sqlite/0040 (postgres/0030). The legacy `status` and
+    // `queue_position` columns are gone — see `tasks.queue_position` instead.
 
     // Full data (JSON blob)
     data: t
@@ -359,7 +421,6 @@ export const messages = pgTable(
     sessionIdx: index('messages_session_id_idx').on(table.session_id),
     taskIdx: index('messages_task_id_idx').on(table.task_id),
     sessionIndexIdx: index('messages_session_index_idx').on(table.session_id, table.index),
-    queueIdx: index('messages_queue_idx').on(table.session_id, table.status, table.queue_position),
   })
 );
 
@@ -374,17 +435,27 @@ export const boards = pgTable(
     updated_at: t.timestamp('updated_at'),
 
     // User attribution
-    created_by: varchar('created_by', { length: 36 }).notNull().default('anonymous'),
+    created_by: varchar('created_by', { length: 36 }).notNull(),
 
     // Materialized for lookups
     name: text('name').notNull(),
     slug: text('slug').unique(),
+    primary_assistant_id: varchar('primary_assistant_id', { length: 36 }).references(
+      (): AnyPgColumn => branches.branch_id,
+      {
+        onDelete: 'set null',
+      }
+    ),
 
     // JSON blob for the rest
     data: t
       .json<unknown>('data')
       .$type<{
         description?: string;
+        access_mode?: 'private' | 'shared';
+        default_others_can?: import('@agor/core/types').BranchPermissionLevel;
+        default_others_fs_access?: 'none' | 'read' | 'write';
+        default_dangerously_allow_session_sharing?: boolean;
         color?: string;
         icon?: string;
         background_color?: string; // Background color for the board canvas
@@ -424,7 +495,7 @@ export const repos = pgTable(
       .default('remote'),
 
     // Unix group for repo-level git access (agor_rp_<short-id>)
-    // Users who have access to ANY worktree in this repo get added to this group.
+    // Users who have access to ANY branch in this repo get added to this group.
     // Applied to repo Unix-group-managed paths:
     // - repo root (non-recursive) for traversal into .git/worktrees/<name>
     // - .git (recursive) for shared git objects/refs and git operations
@@ -437,9 +508,17 @@ export const repos = pgTable(
         remote_url?: string;
         local_path: string; // Absolute path to base repository
         default_branch?: string;
+        // Async clone lifecycle: 'cloning' → 'ready' | 'failed'. Undefined for
+        // legacy rows and for local-type repos. See packages/core/src/types/repo.ts.
+        clone_status?: 'cloning' | 'ready' | 'failed';
+        clone_error?: {
+          exit_code: number;
+          category: 'auth_failed' | 'not_found' | 'network' | 'unknown';
+          message: string;
+        };
         // v2 environment config — source of truth. Named variants + optional
         // deployment-local template_overrides. See RepoEnvironment in
-        // packages/core/src/types/worktree.ts.
+        // packages/core/src/types/branch.ts.
         environment?: {
           version: 2;
           default: string;
@@ -483,17 +562,17 @@ export const repos = pgTable(
 );
 
 /**
- * Worktrees table - Git worktrees for isolated development contexts
+ * Branches table - Git branches for isolated development contexts
  *
  * First-class entities for managing work contexts across sessions.
- * Each worktree is an isolated git working directory with its own branch,
+ * Each branch is an isolated git working directory with its own branch,
  * environment configuration, and persistent work state.
  */
-export const worktrees = pgTable(
-  'worktrees',
+export const branches = pgTable(
+  'branches',
   {
     // Primary identity
-    worktree_id: varchar('worktree_id', { length: 36 }).primaryKey(),
+    branch_id: varchar('branch_id', { length: 36 }).primaryKey(),
     repo_id: varchar('repo_id', { length: 36 })
       .notNull()
       .references(() => repos.repo_id, { onDelete: 'cascade' }),
@@ -501,13 +580,13 @@ export const worktrees = pgTable(
     updated_at: t.timestamp('updated_at'),
 
     // User attribution
-    created_by: varchar('created_by', { length: 36 }).notNull().default('anonymous'),
+    created_by: varchar('created_by', { length: 36 }).notNull(),
 
     // Materialized for queries
     name: text('name').notNull(), // "feat-auth", "main"
     ref: text('ref').notNull(), // Current branch/tag/commit
     ref_type: text('ref_type', { enum: ['branch', 'tag'] }), // Type of ref (branch or tag)
-    worktree_unique_id: integer('worktree_unique_id').notNull(), // Auto-assigned sequential ID for templates
+    branch_unique_id: integer('branch_unique_id').notNull(), // Auto-assigned sequential ID for templates
 
     // Environment configuration (static, initialized from templates, then user-editable)
     start_command: text('start_command'), // Start command (initialized from repo's up_command template)
@@ -517,22 +596,16 @@ export const worktrees = pgTable(
     app_url: text('app_url'), // Application URL (initialized from repo's app_url_template)
     logs_command: text('logs_command'), // Logs command (initialized from repo's logs_command template)
     // Name of the environment variant currently rendered into the command fields above.
-    // References a key under repo.environment.variants. Null for pre-v2 worktrees.
+    // References a key under repo.environment.variants. Null for pre-v2 branches.
     environment_variant: text('environment_variant'),
 
-    // Board relationship (nullable - worktrees can exist without boards)
-    board_id: varchar('board_id', { length: 36 }).references(() => boards.board_id, {
-      onDelete: 'set null', // If board is deleted, worktree remains but loses board association
+    // Board relationship (nullable - branches can exist without boards)
+    board_id: varchar('board_id', { length: 36 }).references((): AnyPgColumn => boards.board_id, {
+      onDelete: 'set null', // If board is deleted, branch remains but loses board association
     }),
 
-    // Scheduler config (materialized for efficient queries)
-    schedule_enabled: t.bool('schedule_enabled').notNull().default(false),
-    schedule_cron: text('schedule_cron'), // Cron expression (e.g., "0 9 * * 1-5")
-    schedule_last_triggered_at: bigint('schedule_last_triggered_at', { mode: 'number' }), // Unix timestamp (ms) - bigint to support dates beyond 2038
-    schedule_next_run_at: bigint('schedule_next_run_at', { mode: 'number' }), // Unix timestamp (ms) - bigint to support dates beyond 2038
-
     // UI state (materialized for efficient highlighting queries)
-    needs_attention: t.bool('needs_attention').notNull().default(true), // Default true for new worktrees
+    needs_attention: t.bool('needs_attention').notNull().default(true), // Default true for new branches
 
     // Archive state (for soft deletes)
     archived: t.bool('archived').notNull().default(false),
@@ -543,8 +616,12 @@ export const worktrees = pgTable(
     }),
 
     // RBAC: App-layer permissions (rbac.md)
+    permission_source: text('permission_source', { enum: ['board', 'override'] })
+      .$type<'board' | 'override'>()
+      .notNull()
+      .default('override'),
     others_can: text('others_can', {
-      enum: [...WORKTREE_PERMISSION_LEVELS],
+      enum: [...BRANCH_PERMISSION_LEVELS],
     }).default('view'),
 
     // RBAC: OS-layer permissions (unix-user-modes.md)
@@ -555,16 +632,31 @@ export const worktrees = pgTable(
       .$type<'none' | 'read' | 'write'>()
       .default('read'),
 
+    // Branch storage model — see context/explorations/clone-redesign.md.
+    // 'worktree' = native `git worktree add` (shared base .git/config — legacy default).
+    // 'clone'    = self-standing `git clone` (own .git/ — closes cross-branch leak vectors).
+    //
+    // No DB-side CHECK: enum is validated at the Drizzle/TS/Zod/service
+    // layer to stay symmetric with the SQLite mirror (which can't easily
+    // alter CHECK constraints in place).
+    storage_mode: text('storage_mode', { enum: ['worktree', 'clone'] })
+      .notNull()
+      .default('worktree'),
+    // Only meaningful when storage_mode='clone'. NULL = full clone, positive
+    // integer = `git clone --depth N` (shallow). The service layer rejects
+    // a non-null clone_depth on worktree-mode rows.
+    clone_depth: integer('clone_depth'),
+
     // JSON blob for everything else
     data: t
       .json<unknown>('data')
       .$type<{
         // File system
-        path: string; // Absolute path to worktree directory
+        path: string; // Absolute path to branch directory
 
         // Git state (current)
         base_ref?: string; // Branch this diverged from (e.g., "main")
-        base_sha?: string; // SHA at worktree creation
+        base_sha?: string; // SHA at branch creation
         last_commit_sha?: string; // Latest commit
         tracking_branch?: string; // Remote tracking branch
         new_branch: boolean; // Created by Agor?
@@ -600,79 +692,134 @@ export const worktrees = pgTable(
         // Custom context for templates (accessible as {{custom.*}})
         custom_context?: Record<string, unknown>;
 
-        // Default MCP servers for new sessions in this worktree
+        // Default MCP servers for new sessions in this branch
         mcp_server_ids?: string[];
 
         // DANGEROUS: opt-in to legacy session-spawn identity borrowing.
         // When true, agor_sessions_spawn / agor_sessions_prompt(mode:"fork"|"subsession")
         // attribute the new child session to the parent owner instead of the
-        // MCP-authenticated caller. See packages/core/src/types/worktree.ts.
+        // MCP-authenticated caller. See packages/core/src/types/branch.ts.
         dangerously_allow_session_sharing?: boolean;
-
-        // Schedule configuration (full config in JSON blob)
-        schedule?: {
-          timezone: string; // IANA timezone (default: 'UTC')
-          prompt_template: string; // Handlebars template
-          agentic_tool: 'claude-code' | 'codex' | 'gemini' | 'opencode' | 'copilot';
-          retention: number; // How many sessions to keep (0 = keep forever)
-          permission_mode?: string; // Permission mode for spawned sessions
-          model_config?: {
-            mode: 'default' | 'custom';
-            model?: string;
-          };
-          mcp_server_ids?: string[]; // MCP servers to attach (default: ['agor'])
-          context_files?: string[]; // Additional context files
-          created_at: number; // When schedule was created
-          created_by: string; // User ID who created
-        };
       }>()
       .notNull(),
   },
   (table) => ({
-    repoIdx: index('worktrees_repo_idx').on(table.repo_id),
-    nameIdx: index('worktrees_name_idx').on(table.name),
-    refIdx: index('worktrees_ref_idx').on(table.ref),
-    boardIdx: index('worktrees_board_idx').on(table.board_id),
-    createdIdx: index('worktrees_created_idx').on(table.created_at),
-    updatedIdx: index('worktrees_updated_idx').on(table.updated_at),
+    repoIdx: index('branches_repo_idx').on(table.repo_id),
+    nameIdx: index('branches_name_idx').on(table.name),
+    refIdx: index('branches_ref_idx').on(table.ref),
+    boardIdx: index('branches_board_idx').on(table.board_id),
+    createdIdx: index('branches_created_idx').on(table.created_at),
+    updatedIdx: index('branches_updated_idx').on(table.updated_at),
     // Composite unique constraint (repo + name)
-    uniqueRepoName: index('worktrees_repo_name_unique').on(table.repo_id, table.name),
-    // Scheduler indexes (note: partial indexes with WHERE clauses defined in migration)
-    scheduleEnabledIdx: index('worktrees_schedule_enabled_idx').on(table.schedule_enabled),
-    boardScheduleIdx: index('worktrees_board_schedule_idx').on(
-      table.board_id,
-      table.schedule_enabled
-    ),
+    uniqueRepoName: index('branches_repo_name_unique').on(table.repo_id, table.name),
   })
 );
 
 /**
- * Worktree Owners - RBAC junction table
+ * Branch Owners - RBAC junction table
  *
- * Many-to-many relationship between users and worktrees.
+ * Many-to-many relationship between users and branches.
  * Owners have implicit 'all' permission regardless of others_can setting.
  */
-export const worktreeOwners = pgTable(
-  'worktree_owners',
+export const branchOwners = pgTable(
+  'branch_owners',
   {
-    worktree_id: varchar('worktree_id', { length: 36 })
+    branch_id: varchar('branch_id', { length: 36 })
       .notNull()
-      .references(() => worktrees.worktree_id, { onDelete: 'cascade' }),
+      .references(() => branches.branch_id, { onDelete: 'cascade' }),
     user_id: varchar('user_id', { length: 36 })
       .notNull()
       .references(() => users.user_id, { onDelete: 'cascade' }),
     created_at: t.timestamp('created_at').defaultNow(),
   },
   (table) => ({
-    pk: primaryKey({ columns: [table.worktree_id, table.user_id] }),
+    pk: primaryKey({ columns: [table.branch_id, table.user_id] }),
+  })
+);
+
+/**
+ * Board Owners - RBAC junction table.
+ *
+ * Board owners can manage board-level defaults and are treated as inherited
+ * branch owners for board-aligned branches.
+ */
+export const boardOwners = pgTable(
+  'board_owners',
+  {
+    board_id: varchar('board_id', { length: 36 })
+      .notNull()
+      .references(() => boards.board_id, { onDelete: 'cascade' }),
+    user_id: varchar('user_id', { length: 36 })
+      .notNull()
+      .references(() => users.user_id, { onDelete: 'cascade' }),
+    created_at: t.timestamp('created_at'),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.board_id, table.user_id] }),
+    userIdx: index('board_owners_user_idx').on(table.user_id),
+  })
+);
+
+/**
+ * Schedules table - First-class scheduled prompts per branch.
+ *
+ * Multiple schedules per branch (e.g. hourly heartbeat + daily summary).
+ * Replaces the four `branches.schedule_*` columns and `branches.data.schedule`
+ * blob; sessions backlink via `sessions.schedule_id`.
+ *
+ * Enums (`timezone_mode`) are validated at the app layer (no DB CHECK
+ * constraint) to stay symmetric with the SQLite mirror.
+ */
+export const schedules = pgTable(
+  'schedules',
+  {
+    schedule_id: varchar('schedule_id', { length: 36 }).primaryKey(),
+    branch_id: varchar('branch_id', { length: 36 })
+      .notNull()
+      .references(() => branches.branch_id, { onDelete: 'cascade' }),
+
+    name: text('name').notNull(),
+    description: text('description'),
+
+    cron_expression: text('cron_expression').notNull(),
+    timezone_mode: text('timezone_mode', { enum: ['local', 'utc'] })
+      .notNull()
+      .default('local'),
+    timezone: text('timezone'),
+
+    prompt: text('prompt').notNull(),
+
+    agentic_tool_config: t.json<unknown>('agentic_tool_config').notNull(),
+
+    enabled: t.bool('enabled').notNull().default(true),
+    allow_concurrent_runs: t.bool('allow_concurrent_runs').notNull().default(false),
+    retention: integer('retention').notNull().default(5),
+
+    last_run_at: bigint('last_run_at', { mode: 'number' }),
+    last_run_session_id: varchar('last_run_session_id', { length: 36 }).references(
+      () => sessions.session_id,
+      { onDelete: 'set null' }
+    ),
+    next_run_at: bigint('next_run_at', { mode: 'number' }),
+
+    created_at: t.timestamp('created_at').notNull(),
+    updated_at: t.timestamp('updated_at').notNull(),
+    created_by: varchar('created_by', { length: 36 })
+      .notNull()
+      .references(() => users.user_id),
+  },
+  (table) => ({
+    enabledNextRunIdx: index('schedules_enabled_next_run_idx').on(table.enabled, table.next_run_at),
+    branchIdx: index('schedules_branch_idx').on(table.branch_id),
+    createdByIdx: index('schedules_created_by_idx').on(table.created_by),
   })
 );
 
 /**
  * Users table - Authentication and authorization
  *
- * Optional table - only created when authentication is enabled via `agor auth init`.
- * In anonymous mode (default), this table doesn't exist and all operations are permitted.
+ * Authentication is required for every endpoint; on first daemon start with an
+ * empty users table, a default admin is auto-created (see `bootstrapFirstRunAdmin`).
  */
 export const users = pgTable(
   'users',
@@ -710,12 +857,48 @@ export const users = pgTable(
       .$type<{
         avatar?: string;
         preferences?: Record<string, unknown>;
-        // Encrypted API keys (stored as hex-encoded encrypted strings)
-        api_keys?: {
-          ANTHROPIC_API_KEY?: string; // Encrypted with AES-256-GCM
-          OPENAI_API_KEY?: string; // Encrypted with AES-256-GCM
-          GEMINI_API_KEY?: string; // Encrypted with AES-256-GCM
-          COPILOT_GITHUB_TOKEN?: string; // Encrypted with AES-256-GCM
+        // Stable external-auth identity mappings used by generic launch-code auth.
+        external_identities?: UserExternalIdentity[];
+        // Per-tool credentials and auth-adjacent config.
+        //
+        // Each entry is keyed by AgenticToolName and holds env-var-named fields
+        // (e.g. `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`). All values are
+        // encrypted at rest (AES-256-GCM, hex-encoded) for shape uniformity —
+        // the runtime decrypts on read; the UI controls plain-vs-password
+        // rendering based on per-field config.
+        //
+        // Field name = env var name. The session executor exports these as
+        // env vars to the SDK CLI, scoped to the session's agentic_tool
+        // (i.e. claude-code's keys never reach codex sessions).
+        //
+        // See `context/concepts/agentic-tool-config.md` (TODO).
+        agentic_tools?: {
+          'claude-code'?: {
+            ANTHROPIC_API_KEY?: string;
+            CLAUDE_CODE_OAUTH_TOKEN?: string;
+            ANTHROPIC_AUTH_TOKEN?: string;
+            ANTHROPIC_BASE_URL?: string;
+          };
+          'claude-code-cli'?: {
+            // Mirrors 'claude-code' — the CLI accepts the same Anthropic env
+            // vars on the api-key path. Subscription auth reads
+            // ~/.claude/.credentials.json, not these env vars.
+            ANTHROPIC_API_KEY?: string;
+            CLAUDE_CODE_OAUTH_TOKEN?: string;
+            ANTHROPIC_AUTH_TOKEN?: string;
+            ANTHROPIC_BASE_URL?: string;
+          };
+          codex?: {
+            OPENAI_API_KEY?: string;
+            OPENAI_BASE_URL?: string;
+          };
+          gemini?: {
+            GEMINI_API_KEY?: string;
+          };
+          copilot?: {
+            COPILOT_GITHUB_TOKEN?: string;
+          };
+          opencode?: Record<string, never>;
         };
         // Encrypted environment variables with scope metadata.
         //
@@ -743,6 +926,17 @@ export const users = pgTable(
               mode?: 'alias' | 'exact';
               model?: string;
               effort?: EffortLevel;
+              advisorModel?: string;
+            };
+            permissionMode?: string;
+            mcpServerIds?: string[];
+          };
+          'claude-code-cli'?: {
+            modelConfig?: {
+              mode?: 'alias' | 'exact';
+              model?: string;
+              effort?: EffortLevel;
+              advisorModel?: string;
             };
             permissionMode?: string;
             mcpServerIds?: string[];
@@ -791,6 +985,145 @@ export const users = pgTable(
   },
   (table) => ({
     emailIdx: index('users_email_idx').on(table.email),
+  })
+);
+
+/**
+ * Groups - admin-managed user collections for sharing and branch RBAC.
+ */
+export const groups = pgTable(
+  'groups',
+  {
+    group_id: varchar('group_id', { length: 36 }).primaryKey(),
+    name: text('name').notNull(),
+    slug: text('slug').notNull(),
+    description: text('description'),
+    archived: t.bool('archived').notNull().default(false),
+    created_by: varchar('created_by', { length: 36 }).references(() => users.user_id, {
+      onDelete: 'set null',
+    }),
+    created_at: t.timestamp('created_at').notNull(),
+    updated_at: t.timestamp('updated_at'),
+  },
+  (table) => ({
+    slugIdx: uniqueIndex('groups_slug_idx').on(table.slug),
+    archivedIdx: index('groups_archived_idx').on(table.archived),
+  })
+);
+
+/**
+ * Group Memberships - many-to-many users ↔ groups.
+ */
+export const groupMemberships = pgTable(
+  'group_memberships',
+  {
+    group_id: varchar('group_id', { length: 36 })
+      .notNull()
+      .references(() => groups.group_id, { onDelete: 'cascade' }),
+    user_id: varchar('user_id', { length: 36 })
+      .notNull()
+      .references(() => users.user_id, { onDelete: 'cascade' }),
+    added_by: varchar('added_by', { length: 36 }).references(() => users.user_id, {
+      onDelete: 'set null',
+    }),
+    created_at: t.timestamp('created_at').notNull(),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.group_id, table.user_id] }),
+    userIdx: index('group_memberships_user_idx').on(table.user_id),
+  })
+);
+
+/**
+ * Branch Group Grants - group-aware Branch RBAC grants.
+ *
+ * Owners remain direct users in branch_owners. Groups receive explicit grants
+ * that participate in the same permission lattice as others_can.
+ */
+export const branchGroupGrants = pgTable(
+  'branch_group_grants',
+  {
+    branch_id: varchar('branch_id', { length: 36 })
+      .notNull()
+      .references(() => branches.branch_id, { onDelete: 'cascade' }),
+    group_id: varchar('group_id', { length: 36 })
+      .notNull()
+      .references(() => groups.group_id, { onDelete: 'cascade' }),
+    can: text('can', { enum: [...BRANCH_PERMISSION_LEVELS] })
+      .notNull()
+      .default('view'),
+    fs_access: text('fs_access', { enum: ['none', 'read', 'write'] }).$type<
+      'none' | 'read' | 'write'
+    >(),
+    created_by: varchar('created_by', { length: 36 }).references(() => users.user_id, {
+      onDelete: 'set null',
+    }),
+    created_at: t.timestamp('created_at').notNull(),
+    updated_at: t.timestamp('updated_at'),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.branch_id, table.group_id] }),
+    groupIdx: index('branch_group_grants_group_idx').on(table.group_id),
+  })
+);
+
+/**
+ * Board Group Grants - group-aware board visibility/default grants.
+ */
+export const boardGroupGrants = pgTable(
+  'board_group_grants',
+  {
+    board_id: varchar('board_id', { length: 36 })
+      .notNull()
+      .references(() => boards.board_id, { onDelete: 'cascade' }),
+    group_id: varchar('group_id', { length: 36 })
+      .notNull()
+      .references(() => groups.group_id, { onDelete: 'cascade' }),
+    can: text('can', { enum: [...BRANCH_PERMISSION_LEVELS] })
+      .notNull()
+      .default('view'),
+    fs_access: text('fs_access', { enum: ['none', 'read', 'write'] }).$type<
+      'none' | 'read' | 'write'
+    >(),
+    created_by: varchar('created_by', { length: 36 }).references(() => users.user_id, {
+      onDelete: 'set null',
+    }),
+    created_at: t.timestamp('created_at').notNull(),
+    updated_at: t.timestamp('updated_at'),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.board_id, table.group_id] }),
+    groupIdx: index('board_group_grants_group_idx').on(table.group_id),
+  })
+);
+
+/**
+ * App Variables - daemon-owned application settings and secrets.
+ *
+ * Values can be plaintext (`value_text`) for non-secret JSON/string settings or
+ * encrypted (`value_encrypted`) with AGOR_MASTER_SECRET for daemon service
+ * credentials such as Knowledge embedding provider API keys.
+ */
+export const appVariables = pgTable(
+  'app_variables',
+  {
+    variable_id: varchar('variable_id', { length: 36 }).primaryKey(),
+    namespace: text('namespace').notNull(),
+    key: text('key').notNull(),
+    value_text: text('value_text'),
+    value_encrypted: text('value_encrypted'),
+    is_encrypted: t.bool('is_encrypted').notNull().default(false),
+    content_type: text('content_type').notNull().default('text/plain'),
+    metadata: t.json<Record<string, unknown>>('metadata'),
+    updated_by: varchar('updated_by', { length: 36 }).references(() => users.user_id, {
+      onDelete: 'set null',
+    }),
+    created_at: t.timestamp('created_at').notNull(),
+    updated_at: t.timestamp('updated_at').notNull(),
+  },
+  (table) => ({
+    namespaceKeyIdx: uniqueIndex('app_variables_namespace_key_idx').on(table.namespace, table.key),
+    namespaceIdx: index('app_variables_namespace_idx').on(table.namespace),
   })
 );
 
@@ -865,6 +1198,7 @@ export const mcpServers = pgTable(
         command?: string;
         args?: string[];
         url?: string;
+        headers?: Record<string, string>;
         env?: Record<string, string>;
 
         // Authentication config (for HTTP/SSE transports)
@@ -950,7 +1284,7 @@ export const cardTypes = pgTable(
  * Cards table - Generic entities on boards
  *
  * Cards are visual work items managed by agents via MCP tools.
- * They live on boards alongside worktrees and can be placed in zones.
+ * They live on boards alongside branches and can be placed in zones.
  */
 export const cards = pgTable(
   'cards',
@@ -995,7 +1329,7 @@ export const artifacts = pgTable(
   'artifacts',
   {
     artifact_id: varchar('artifact_id', { length: 36 }).primaryKey(),
-    worktree_id: varchar('worktree_id', { length: 36 }).references(() => worktrees.worktree_id, {
+    branch_id: varchar('branch_id', { length: 36 }).references(() => branches.branch_id, {
       onDelete: 'set null',
     }),
     board_id: varchar('board_id', { length: 36 })
@@ -1006,12 +1340,15 @@ export const artifacts = pgTable(
     path: text('path'), // provenance only — where files were read from
     template: text('template').notNull().default('react'),
     build_status: text('build_status').notNull().default('unknown'),
-    build_errors: text('build_errors'), // JSON array of error strings
+    build_errors: t.json<string[]>('build_errors'),
     content_hash: text('content_hash'),
-    files: text('files'), // JSON: Record<string, string> — serialized file contents
-    dependencies: text('dependencies'), // JSON: Record<string, string> — npm deps
-    entry: text('entry'), // entry file from manifest
-    use_local_bundler: t.bool('use_local_bundler').notNull().default(false),
+    files: t.json<Record<string, string>>('files'),
+    dependencies: t.json<Record<string, string>>('dependencies'),
+    entry: text('entry'), // denormalized cache of the Sandpack entry file
+    sandpack_config: t.json<SandpackConfig>('sandpack_config'),
+    required_env_vars: t.json<string[]>('required_env_vars'),
+    agor_grants: t.json<AgorGrants>('agor_grants'),
+    agor_runtime: t.json<AgorRuntimeConfig>('agor_runtime'),
     public: t.bool('public').notNull().default(true),
     created_by: varchar('created_by', { length: 36 }),
     created_at: t.timestamp('created_at').notNull(),
@@ -1020,7 +1357,7 @@ export const artifacts = pgTable(
     archived_at: t.timestamp('archived_at'),
   },
   (table) => ({
-    worktreeIdx: index('artifacts_worktree_idx').on(table.worktree_id),
+    branchIdx: index('artifacts_branch_idx').on(table.branch_id),
     boardIdx: index('artifacts_board_idx').on(table.board_id),
     archivedIdx: index('artifacts_archived_idx').on(table.archived),
     publicIdx: index('artifacts_public_idx').on(table.public),
@@ -1031,9 +1368,34 @@ export type ArtifactRow = typeof artifacts.$inferSelect;
 export type ArtifactInsert = typeof artifacts.$inferInsert;
 
 /**
- * Board Objects table - Positioned entities (worktrees and cards) on boards
+ * Per-viewer trust grants for artifact secret/grant injection.
+ * See the matching SQLite definition for full docs.
+ */
+export const artifactTrustGrants = pgTable(
+  'artifact_trust_grants',
+  {
+    grant_id: varchar('grant_id', { length: 36 }).primaryKey(),
+    user_id: varchar('user_id', { length: 36 }).notNull(),
+    scope_type: text('scope_type').notNull(),
+    scope_value: text('scope_value'),
+    env_vars_set: t.json<string[]>('env_vars_set').notNull(),
+    agor_grants_set: t.json<AgorGrants>('agor_grants_set').notNull(),
+    granted_at: t.timestamp('granted_at').notNull(),
+    revoked_at: t.timestamp('revoked_at'),
+  },
+  (table) => ({
+    userIdx: index('artifact_trust_grants_user_idx').on(table.user_id),
+    scopeIdx: index('artifact_trust_grants_scope_idx').on(table.scope_type, table.scope_value),
+  })
+);
+
+export type ArtifactTrustGrantRow = typeof artifactTrustGrants.$inferSelect;
+export type ArtifactTrustGrantInsert = typeof artifactTrustGrants.$inferInsert;
+
+/**
+ * Board Objects table - Positioned entities (branches and cards) on boards
  *
- * Polymorphic placement: exactly one of worktree_id or card_id must be set.
+ * Polymorphic placement: exactly one of branch_id or card_id must be set.
  * Enforced in application layer.
  */
 export const boardObjects = pgTable(
@@ -1047,7 +1409,7 @@ export const boardObjects = pgTable(
     created_at: t.timestamp('created_at').notNull(),
 
     // Polymorphic entity reference (exactly one must be set)
-    worktree_id: varchar('worktree_id', { length: 36 }).references(() => worktrees.worktree_id, {
+    branch_id: varchar('branch_id', { length: 36 }).references(() => branches.branch_id, {
       onDelete: 'cascade',
     }),
     card_id: varchar('card_id', { length: 36 }).references(() => cards.card_id, {
@@ -1065,7 +1427,7 @@ export const boardObjects = pgTable(
   },
   (table) => ({
     boardIdx: index('board_objects_board_idx').on(table.board_id),
-    worktreeIdx: index('board_objects_worktree_idx').on(table.worktree_id),
+    branchIdx: index('board_objects_branch_idx').on(table.branch_id),
     cardIdx: index('board_objects_card_idx').on(table.card_id),
   })
 );
@@ -1143,7 +1505,7 @@ export const userMcpOauthTokens = pgTable(
  *
  * Flexible attachment strategy:
  * - Board-level: General conversations (no attachment foreign keys)
- * - Object-level: Attached to sessions, tasks, messages, or worktrees
+ * - Object-level: Attached to sessions, tasks, messages, or branches
  * - Spatial: Positioned on canvas (absolute or relative to objects)
  *
  * Supports threading, mentions, and resolve/unresolve workflows.
@@ -1160,11 +1522,11 @@ export const boardComments = pgTable(
     board_id: varchar('board_id', { length: 36 })
       .notNull()
       .references(() => boards.board_id, { onDelete: 'cascade' }),
-    created_by: varchar('created_by', { length: 36 }).notNull().default('anonymous'),
+    created_by: varchar('created_by', { length: 36 }).notNull(),
 
     // FLEXIBLE ATTACHMENTS (all optional)
     // Phase 1: board-level only (all NULL)
-    // Phase 2: object attachments (session, task, message, worktree)
+    // Phase 2: object attachments (session, task, message, branch)
     // Phase 3: spatial positioning
     session_id: varchar('session_id', { length: 36 }).references(() => sessions.session_id, {
       onDelete: 'set null',
@@ -1175,7 +1537,7 @@ export const boardComments = pgTable(
     message_id: varchar('message_id', { length: 36 }).references(() => messages.message_id, {
       onDelete: 'set null',
     }),
-    worktree_id: varchar('worktree_id', { length: 36 }).references(() => worktrees.worktree_id, {
+    branch_id: varchar('branch_id', { length: 36 }).references(() => branches.branch_id, {
       onDelete: 'cascade',
     }),
 
@@ -1207,10 +1569,10 @@ export const boardComments = pgTable(
         position?: {
           // Absolute board coordinates (React Flow coordinates)
           absolute?: { x: number; y: number };
-          // OR relative to session/zone/worktree (follows parent when it moves)
+          // OR relative to session/zone/branch (follows parent when it moves)
           relative?: {
-            parent_id: string; // Can be session_id, zone object ID, or worktree_id
-            parent_type: 'session' | 'zone' | 'worktree';
+            parent_id: string; // Can be session_id, zone object ID, or branch_id
+            parent_type: 'session' | 'zone' | 'branch';
             offset_x: number;
             offset_y: number;
           };
@@ -1225,7 +1587,7 @@ export const boardComments = pgTable(
     sessionIdx: index('board_comments_session_idx').on(table.session_id),
     taskIdx: index('board_comments_task_idx').on(table.task_id),
     messageIdx: index('board_comments_message_idx').on(table.message_id),
-    worktreeIdx: index('board_comments_worktree_idx').on(table.worktree_id),
+    branchIdx: index('board_comments_branch_idx').on(table.branch_id),
     createdByIdx: index('board_comments_created_by_idx').on(table.created_by),
     parentIdx: index('board_comments_parent_idx').on(table.parent_comment_id),
     createdIdx: index('board_comments_created_idx').on(table.created_at),
@@ -1237,8 +1599,8 @@ export const boardComments = pgTable(
  * Gateway Channels table - Registered messaging platform integrations
  *
  * Users create channels to connect messaging platforms (Slack, Discord, etc.)
- * to Agor. Each channel targets a specific worktree and routes messages
- * to/from sessions within that worktree.
+ * to Agor. Each channel targets a specific branch and routes messages
+ * to/from sessions within that branch.
  */
 export const gatewayChannels = pgTable(
   'gateway_channels',
@@ -1249,16 +1611,16 @@ export const gatewayChannels = pgTable(
     updated_at: t.timestamp('updated_at').notNull(),
 
     // User attribution
-    created_by: varchar('created_by', { length: 36 }).notNull().default('anonymous'),
+    created_by: varchar('created_by', { length: 36 }).notNull(),
 
     // Materialized for queries
     name: text('name').notNull(),
     channel_type: text('channel_type', {
       enum: ['slack', 'discord', 'whatsapp', 'telegram', 'github', 'teams'],
     }).notNull(),
-    target_worktree_id: varchar('target_worktree_id', { length: 36 })
+    target_branch_id: varchar('target_branch_id', { length: 36 })
       .notNull()
-      .references(() => worktrees.worktree_id, { onDelete: 'cascade' }),
+      .references(() => branches.branch_id, { onDelete: 'cascade' }),
     agor_user_id: varchar('agor_user_id', { length: 36 }).notNull(),
     channel_key: text('channel_key').notNull().unique(),
     enabled: t.bool('enabled').notNull().default(true),
@@ -1298,9 +1660,9 @@ export const threadSessionMap = pgTable(
     session_id: varchar('session_id', { length: 36 })
       .notNull()
       .references(() => sessions.session_id, { onDelete: 'cascade' }),
-    worktree_id: varchar('worktree_id', { length: 36 })
+    branch_id: varchar('branch_id', { length: 36 })
       .notNull()
-      .references(() => worktrees.worktree_id),
+      .references(() => branches.branch_id),
 
     // Materialized for queries
     status: text('status', {
@@ -1344,6 +1706,410 @@ export const sessionEnvSelections = pgTable(
 );
 
 /**
+ * Knowledge namespaces - first-class scopes for DB-backed knowledge documents.
+ * URI shape: agor://kb/<namespace.slug>/<document.path>
+ */
+export const kbNamespaces = pgTable(
+  'kb_namespaces',
+  {
+    namespace_id: varchar('namespace_id', { length: 36 }).primaryKey(),
+    slug: text('slug').notNull(),
+    display_name: text('display_name').notNull(),
+    description: text('description'),
+    kind: text('kind', { enum: ['system', 'global', 'user', 'repo', 'branch', 'team'] })
+      .notNull()
+      .default('global'),
+    owner_user_id: varchar('owner_user_id', { length: 36 }).references(() => users.user_id, {
+      onDelete: 'set null',
+    }),
+    repo_id: varchar('repo_id', { length: 36 }).references(() => repos.repo_id, {
+      onDelete: 'set null',
+    }),
+    branch_id: varchar('branch_id', { length: 36 }).references(() => branches.branch_id, {
+      onDelete: 'set null',
+    }),
+    visibility_default: text('visibility_default', { enum: ['public', 'private'] })
+      .notNull()
+      .default('public'),
+    others_can: text('others_can', { enum: ['none', 'read', 'write'] })
+      .notNull()
+      .default('write'),
+    metadata: t.json<Record<string, unknown>>('metadata'),
+    created_by: varchar('created_by', { length: 36 }).references(() => users.user_id, {
+      onDelete: 'set null',
+    }),
+    created_at: t.timestamp('created_at').notNull(),
+    updated_at: t.timestamp('updated_at'),
+    archived: t.bool('archived').notNull().default(false),
+    archived_at: t.timestamp('archived_at'),
+  },
+  (table) => ({
+    slugIdx: uniqueIndex('kb_namespaces_slug_idx')
+      .on(table.slug)
+      .where(sql`${table.archived} = false`),
+    kindIdx: index('kb_namespaces_kind_idx').on(table.kind),
+    ownerIdx: index('kb_namespaces_owner_idx').on(table.owner_user_id),
+    repoIdx: index('kb_namespaces_repo_idx').on(table.repo_id),
+    branchIdx: index('kb_namespaces_branch_idx').on(table.branch_id),
+    archivedIdx: index('kb_namespaces_archived_idx').on(table.archived),
+  })
+);
+
+/**
+ * Knowledge namespace ACL entries - explicit user/group grants for namespace RBAC.
+ */
+export const kbNamespaceAcl = pgTable(
+  'kb_namespace_acl',
+  {
+    namespace_acl_id: varchar('namespace_acl_id', { length: 36 }).primaryKey(),
+    namespace_id: varchar('namespace_id', { length: 36 })
+      .notNull()
+      .references(() => kbNamespaces.namespace_id, { onDelete: 'cascade' }),
+    subject_type: text('subject_type', { enum: ['user', 'group'] }).notNull(),
+    subject_id: varchar('subject_id', { length: 36 }).notNull(),
+    permission: text('permission', { enum: ['read', 'write', 'own'] }).notNull(),
+    created_by: varchar('created_by', { length: 36 }).references(() => users.user_id, {
+      onDelete: 'set null',
+    }),
+    created_at: t.timestamp('created_at').notNull(),
+    updated_at: t.timestamp('updated_at'),
+  },
+  (table) => ({
+    namespaceIdx: index('kb_namespace_acl_namespace_idx').on(table.namespace_id),
+    subjectIdx: index('kb_namespace_acl_subject_idx').on(table.subject_type, table.subject_id),
+    namespaceSubjectIdx: uniqueIndex('kb_namespace_acl_namespace_subject_idx').on(
+      table.namespace_id,
+      table.subject_type,
+      table.subject_id
+    ),
+  })
+);
+
+/**
+ * Knowledge documents - stable namespace/path identity and current-version state.
+ */
+export const kbDocuments = pgTable(
+  'kb_documents',
+  {
+    document_id: varchar('document_id', { length: 36 }).primaryKey(),
+    namespace_id: varchar('namespace_id', { length: 36 })
+      .notNull()
+      .references(() => kbNamespaces.namespace_id, { onDelete: 'cascade' }),
+    path: text('path').notNull(),
+    uri: text('uri').notNull(),
+    title: text('title').notNull(),
+    icon_emoji: text('icon_emoji'),
+    kind: text('kind', {
+      enum: ['doc', 'memory', 'skill', 'prompt', 'guide', 'decision', 'bundle', 'external'],
+    })
+      .notNull()
+      .default('doc'),
+    visibility: text('visibility', { enum: ['public', 'private'] })
+      .notNull()
+      .default('public'),
+    status: text('status', { enum: ['draft', 'published'] })
+      .notNull()
+      .default('published'),
+    edit_policy: text('edit_policy', { enum: ['owner', 'public', 'admins'] })
+      .notNull()
+      .default('owner'),
+    // Application-maintained pointer. Avoids a circular FK with versions.
+    current_version_id: varchar('current_version_id', { length: 36 }),
+    metadata: t.json<Record<string, unknown>>('metadata'),
+    created_by: varchar('created_by', { length: 36 }).references(() => users.user_id, {
+      onDelete: 'set null',
+    }),
+    created_at: t.timestamp('created_at').notNull(),
+    updated_by: varchar('updated_by', { length: 36 }).references(() => users.user_id, {
+      onDelete: 'set null',
+    }),
+    updated_at: t.timestamp('updated_at'),
+    archived: t.bool('archived').notNull().default(false),
+    archived_at: t.timestamp('archived_at'),
+  },
+  (table) => ({
+    namespacePathIdx: uniqueIndex('kb_documents_namespace_path_idx')
+      .on(table.namespace_id, table.path)
+      .where(sql`${table.archived} = false`),
+    uriIdx: uniqueIndex('kb_documents_uri_idx').on(table.uri).where(sql`${table.archived} = false`),
+    namespaceIdx: index('kb_documents_namespace_idx').on(table.namespace_id),
+    kindIdx: index('kb_documents_kind_idx').on(table.kind),
+    visibilityIdx: index('kb_documents_visibility_idx').on(table.visibility),
+    statusIdx: index('kb_documents_status_idx').on(table.status),
+    createdByIdx: index('kb_documents_created_by_idx').on(table.created_by),
+    updatedAtIdx: index('kb_documents_updated_at_idx').on(table.updated_at),
+    archivedIdx: index('kb_documents_archived_idx').on(table.archived),
+  })
+);
+
+/**
+ * Immutable document content snapshots.
+ */
+export const kbDocumentVersions = pgTable(
+  'kb_document_versions',
+  {
+    version_id: varchar('version_id', { length: 36 }).primaryKey(),
+    document_id: varchar('document_id', { length: 36 })
+      .notNull()
+      .references(() => kbDocuments.document_id, { onDelete: 'cascade' }),
+    version_number: integer('version_number').notNull(),
+    content_text: text('content_text'),
+    content_blob: bytea('content_blob'),
+    mime_type: text('mime_type').notNull().default('text/markdown'),
+    content_md5: text('content_md5'),
+    content_sha256: text('content_sha256'),
+    byte_length: integer('byte_length'),
+    char_length: integer('char_length'),
+    frontmatter: t.json<Record<string, unknown>>('frontmatter'),
+    metadata: t.json<Record<string, unknown>>('metadata'),
+    change_summary: text('change_summary'),
+    created_by: varchar('created_by', { length: 36 }).references(() => users.user_id, {
+      onDelete: 'set null',
+    }),
+    created_at: t.timestamp('created_at').notNull(),
+  },
+  (table) => ({
+    documentVersionIdx: uniqueIndex('kb_document_versions_document_version_idx').on(
+      table.document_id,
+      table.version_number
+    ),
+    documentIdx: index('kb_document_versions_document_idx').on(table.document_id),
+    createdIdx: index('kb_document_versions_created_idx').on(table.created_at),
+    md5Idx: index('kb_document_versions_md5_idx').on(table.content_md5),
+  })
+);
+
+/**
+ * Internal search units. V1 can create one unit per document version; later
+ * versions may create heading/file units without exposing arbitrary chunks.
+ */
+export const kbDocumentUnits = pgTable(
+  'kb_document_units',
+  {
+    unit_id: varchar('unit_id', { length: 36 }).primaryKey(),
+    document_id: varchar('document_id', { length: 36 })
+      .notNull()
+      .references(() => kbDocuments.document_id, { onDelete: 'cascade' }),
+    version_id: varchar('version_id', { length: 36 })
+      .notNull()
+      .references(() => kbDocumentVersions.version_id, { onDelete: 'cascade' }),
+    kind: text('kind', { enum: ['document', 'section', 'file', 'auto_split'] })
+      .notNull()
+      .default('document'),
+    ordinal: integer('ordinal').notNull().default(0),
+    path_anchor: text('path_anchor'),
+    heading_path: text('heading_path'),
+    source_path: text('source_path'),
+    content_text: text('content_text'),
+    content_md5: text('content_md5'),
+    start_offset: integer('start_offset'),
+    end_offset: integer('end_offset'),
+    embedding_status: text('embedding_status', {
+      enum: ['not_configured', 'pending', 'ready', 'stale', 'error'],
+    })
+      .notNull()
+      .default('not_configured'),
+    embedding_model: text('embedding_model'),
+    embedding_dimensions: integer('embedding_dimensions'),
+    embedding_hash: text('embedding_hash'),
+    embedding_error: text('embedding_error'),
+    metadata: t.json<Record<string, unknown>>('metadata'),
+    created_at: t.timestamp('created_at').notNull(),
+    updated_at: t.timestamp('updated_at'),
+  },
+  (table) => ({
+    documentIdx: index('kb_document_units_document_idx').on(table.document_id),
+    versionIdx: index('kb_document_units_version_idx').on(table.version_id),
+    versionOrdinalIdx: index('kb_document_units_version_ordinal_idx').on(
+      table.version_id,
+      table.ordinal
+    ),
+    contentHashIdx: index('kb_document_units_content_hash_idx').on(table.content_md5),
+    embeddingStatusIdx: index('kb_document_units_embedding_status_idx').on(table.embedding_status),
+  })
+);
+
+/** Embedding spaces configured for Knowledge semantic search. */
+export const kbEmbeddingSpaces = pgTable(
+  'kb_embedding_spaces',
+  {
+    embedding_space_id: varchar('embedding_space_id', { length: 36 }).primaryKey(),
+    provider: text('provider').notNull(),
+    model: text('model').notNull(),
+    dimensions: integer('dimensions').notNull(),
+    storage_type: text('storage_type').notNull().default('vector'),
+    distance: text('distance').notNull().default('cosine'),
+    active: t.bool('active').notNull().default(true),
+    metadata: t.json<Record<string, unknown>>('metadata'),
+    created_at: t.timestamp('created_at').notNull(),
+    updated_at: t.timestamp('updated_at'),
+  },
+  (table) => ({
+    providerModelIdx: uniqueIndex('kb_embedding_spaces_provider_model_idx').on(
+      table.provider,
+      table.model,
+      table.dimensions,
+      table.storage_type,
+      table.distance
+    ),
+    activeIdx: index('kb_embedding_spaces_active_idx').on(table.active),
+  })
+);
+
+/**
+ * Optional pgvector-backed Knowledge embeddings storage is created by the daemon
+ * at runtime when semantic search is enabled and pgvector is available. It is
+ * deliberately not part of the required Drizzle schema/migrations so Agor can
+ * install and upgrade on PostgreSQL instances without pgvector.
+ */
+
+/**
+ * Graph nodes for knowledge documents, document units, core Agor objects, tags,
+ * and external references.
+ */
+export const kbGraphNodes = pgTable(
+  'kb_graph_nodes',
+  {
+    node_id: varchar('node_id', { length: 36 }).primaryKey(),
+    node_type: text('node_type', {
+      enum: [
+        'namespace',
+        'document',
+        'document_unit',
+        'branch',
+        'session',
+        'task',
+        'message',
+        'artifact',
+        'repo',
+        'board',
+        'user',
+        'tag',
+        'external',
+      ],
+    }).notNull(),
+    uri: text('uri').notNull(),
+    label: text('label'),
+    namespace_id: varchar('namespace_id', { length: 36 }).references(
+      () => kbNamespaces.namespace_id,
+      { onDelete: 'cascade' }
+    ),
+    document_id: varchar('document_id', { length: 36 }).references(() => kbDocuments.document_id, {
+      onDelete: 'cascade',
+    }),
+    unit_id: varchar('unit_id', { length: 36 }).references(() => kbDocumentUnits.unit_id, {
+      onDelete: 'cascade',
+    }),
+    branch_id: varchar('branch_id', { length: 36 }).references(() => branches.branch_id, {
+      onDelete: 'cascade',
+    }),
+    session_id: varchar('session_id', { length: 36 }).references(() => sessions.session_id, {
+      onDelete: 'cascade',
+    }),
+    task_id: varchar('task_id', { length: 36 }).references(() => tasks.task_id, {
+      onDelete: 'cascade',
+    }),
+    message_id: varchar('message_id', { length: 36 }).references(() => messages.message_id, {
+      onDelete: 'cascade',
+    }),
+    artifact_id: varchar('artifact_id', { length: 36 }).references(() => artifacts.artifact_id, {
+      onDelete: 'cascade',
+    }),
+    repo_id: varchar('repo_id', { length: 36 }).references(() => repos.repo_id, {
+      onDelete: 'cascade',
+    }),
+    board_id: varchar('board_id', { length: 36 }).references(() => boards.board_id, {
+      onDelete: 'cascade',
+    }),
+    user_id: varchar('user_id', { length: 36 }).references(() => users.user_id, {
+      onDelete: 'cascade',
+    }),
+    external_uri: text('external_uri'),
+    metadata: t.json<Record<string, unknown>>('metadata'),
+    created_by: varchar('created_by', { length: 36 }).references(() => users.user_id, {
+      onDelete: 'set null',
+    }),
+    created_at: t.timestamp('created_at').notNull(),
+    updated_at: t.timestamp('updated_at'),
+    archived: t.bool('archived').notNull().default(false),
+    archived_at: t.timestamp('archived_at'),
+  },
+  (table) => ({
+    uriIdx: uniqueIndex('kb_graph_nodes_uri_idx')
+      .on(table.uri)
+      .where(sql`${table.archived} = false`),
+    typeIdx: index('kb_graph_nodes_type_idx').on(table.node_type),
+    namespaceIdx: index('kb_graph_nodes_namespace_idx').on(table.namespace_id),
+    documentIdx: index('kb_graph_nodes_document_idx').on(table.document_id),
+    unitIdx: index('kb_graph_nodes_unit_idx').on(table.unit_id),
+    branchIdx: index('kb_graph_nodes_branch_idx').on(table.branch_id),
+    sessionIdx: index('kb_graph_nodes_session_idx').on(table.session_id),
+    taskIdx: index('kb_graph_nodes_task_idx').on(table.task_id),
+    messageIdx: index('kb_graph_nodes_message_idx').on(table.message_id),
+    artifactIdx: index('kb_graph_nodes_artifact_idx').on(table.artifact_id),
+    repoIdx: index('kb_graph_nodes_repo_idx').on(table.repo_id),
+    boardIdx: index('kb_graph_nodes_board_idx').on(table.board_id),
+    userIdx: index('kb_graph_nodes_user_idx').on(table.user_id),
+    externalUriIdx: index('kb_graph_nodes_external_uri_idx').on(table.external_uri),
+    archivedIdx: index('kb_graph_nodes_archived_idx').on(table.archived),
+  })
+);
+
+/** Directed relationships between knowledge graph nodes. */
+export const kbGraphEdges = pgTable(
+  'kb_graph_edges',
+  {
+    edge_id: varchar('edge_id', { length: 36 }).primaryKey(),
+    source_node_id: varchar('source_node_id', { length: 36 })
+      .notNull()
+      .references(() => kbGraphNodes.node_id, { onDelete: 'cascade' }),
+    target_node_id: varchar('target_node_id', { length: 36 })
+      .notNull()
+      .references(() => kbGraphNodes.node_id, { onDelete: 'cascade' }),
+    edge_type: text('edge_type', {
+      enum: [
+        'contains',
+        'references',
+        'mentions',
+        'implements',
+        'depends_on',
+        'supersedes',
+        'derived_from',
+        'tagged_with',
+        'about',
+        'parent_of',
+        'related_to',
+      ],
+    }).notNull(),
+    confidence: integer('confidence'),
+    properties: t.json<Record<string, unknown>>('properties'),
+    created_by: varchar('created_by', { length: 36 }).references(() => users.user_id, {
+      onDelete: 'set null',
+    }),
+    created_at: t.timestamp('created_at').notNull(),
+    archived: t.bool('archived').notNull().default(false),
+    archived_at: t.timestamp('archived_at'),
+  },
+  (table) => ({
+    sourceIdx: index('kb_graph_edges_source_idx').on(table.source_node_id),
+    targetIdx: index('kb_graph_edges_target_idx').on(table.target_node_id),
+    typeIdx: index('kb_graph_edges_type_idx').on(table.edge_type),
+    sourceTypeIdx: index('kb_graph_edges_source_type_idx').on(
+      table.source_node_id,
+      table.edge_type
+    ),
+    targetTypeIdx: index('kb_graph_edges_target_type_idx').on(
+      table.target_node_id,
+      table.edge_type
+    ),
+    sourceTargetTypeIdx: uniqueIndex('kb_graph_edges_source_target_type_idx')
+      .on(table.source_node_id, table.target_node_id, table.edge_type)
+      .where(sql`${table.archived} = false`),
+    archivedIdx: index('kb_graph_edges_archived_idx').on(table.archived),
+  })
+);
+
+/**
  * Type exports for use with Drizzle ORM
  */
 export type SessionRow = typeof sessions.$inferSelect;
@@ -1356,10 +2122,22 @@ export type BoardRow = typeof boards.$inferSelect;
 export type BoardInsert = typeof boards.$inferInsert;
 export type RepoRow = typeof repos.$inferSelect;
 export type RepoInsert = typeof repos.$inferInsert;
-export type WorktreeRow = typeof worktrees.$inferSelect;
-export type WorktreeInsert = typeof worktrees.$inferInsert;
+export type BranchRow = typeof branches.$inferSelect;
+export type BranchInsert = typeof branches.$inferInsert;
+export type ScheduleRow = typeof schedules.$inferSelect;
+export type ScheduleInsert = typeof schedules.$inferInsert;
 export type UserRow = typeof users.$inferSelect;
 export type UserInsert = typeof users.$inferInsert;
+export type AppVariableRow = typeof appVariables.$inferSelect;
+export type AppVariableInsert = typeof appVariables.$inferInsert;
+export type GroupRow = typeof groups.$inferSelect;
+export type GroupInsert = typeof groups.$inferInsert;
+export type GroupMembershipRow = typeof groupMemberships.$inferSelect;
+export type GroupMembershipInsert = typeof groupMemberships.$inferInsert;
+export type BranchGroupGrantRow = typeof branchGroupGrants.$inferSelect;
+export type BoardGroupGrantRow = typeof boardGroupGrants.$inferSelect;
+export type BoardOwnerRow = typeof boardOwners.$inferSelect;
+export type BranchGroupGrantInsert = typeof branchGroupGrants.$inferInsert;
 export type MCPServerRow = typeof mcpServers.$inferSelect;
 export type MCPServerInsert = typeof mcpServers.$inferInsert;
 export type SessionMCPServerRow = typeof sessionMcpServers.$inferSelect;
@@ -1382,20 +2160,49 @@ export type ThreadSessionMapRow = typeof threadSessionMap.$inferSelect;
 export type ThreadSessionMapInsert = typeof threadSessionMap.$inferInsert;
 export type SerializedSessionRow = typeof serializedSessions.$inferSelect;
 export type SerializedSessionInsert = typeof serializedSessions.$inferInsert;
+export type KBNamespaceRow = typeof kbNamespaces.$inferSelect;
+export type KBNamespaceInsert = typeof kbNamespaces.$inferInsert;
+export type KBNamespaceAclRow = typeof kbNamespaceAcl.$inferSelect;
+export type KBNamespaceAclInsert = typeof kbNamespaceAcl.$inferInsert;
+export type KBDocumentRow = typeof kbDocuments.$inferSelect;
+export type KBDocumentInsert = typeof kbDocuments.$inferInsert;
+export type KBDocumentVersionRow = typeof kbDocumentVersions.$inferSelect;
+export type KBDocumentVersionInsert = typeof kbDocumentVersions.$inferInsert;
+export type KBDocumentUnitRow = typeof kbDocumentUnits.$inferSelect;
+export type KBDocumentUnitInsert = typeof kbDocumentUnits.$inferInsert;
+export type KBEmbeddingSpaceRow = typeof kbEmbeddingSpaces.$inferSelect;
+export type KBEmbeddingSpaceInsert = typeof kbEmbeddingSpaces.$inferInsert;
+export type KBGraphNodeRow = typeof kbGraphNodes.$inferSelect;
+export type KBGraphNodeInsert = typeof kbGraphNodes.$inferInsert;
+export type KBGraphEdgeRow = typeof kbGraphEdges.$inferSelect;
+export type KBGraphEdgeInsert = typeof kbGraphEdges.$inferInsert;
 
 /**
  * Drizzle Relations for Relational Queries
  *
- * These enable automatic JOINs using db.query.sessions.findFirst({ with: { worktree: true } })
+ * These enable automatic JOINs using db.query.sessions.findFirst({ with: { branch: true } })
  */
 
 export const sessionsRelations = relations(sessions, ({ one }) => ({
-  worktree: one(worktrees, {
-    fields: [sessions.worktree_id],
-    references: [worktrees.worktree_id],
+  branch: one(branches, {
+    fields: [sessions.branch_id],
+    references: [branches.branch_id],
+  }),
+  schedule: one(schedules, {
+    fields: [sessions.schedule_id],
+    references: [schedules.schedule_id],
   }),
 }));
 
-export const worktreesRelations = relations(worktrees, ({ many }) => ({
+export const branchesRelations = relations(branches, ({ many }) => ({
+  sessions: many(sessions),
+  schedules: many(schedules),
+}));
+
+export const schedulesRelations = relations(schedules, ({ one, many }) => ({
+  branch: one(branches, {
+    fields: [schedules.branch_id],
+    references: [branches.branch_id],
+  }),
   sessions: many(sessions),
 }));

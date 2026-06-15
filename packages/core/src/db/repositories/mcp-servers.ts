@@ -12,10 +12,14 @@ import type {
   MCPServerID,
   UpdateMCPServerInput,
   UserID,
-  UUID,
 } from '@agor/core/types';
 import { and, eq, like } from 'drizzle-orm';
-import { formatShortId, generateId } from '../../lib/ids';
+import { generateId } from '../../lib/ids';
+import { restoreRedactedMCPAuthSecrets } from '../../tools/mcp/auth-secrets';
+import {
+  normalizeMCPCustomHeaders,
+  restoreRedactedMCPCustomHeaders,
+} from '../../tools/mcp/http-headers';
 import type { Database } from '../client';
 import { deleteFrom, insert, select, update } from '../database-wrapper';
 import { type MCPServerInsert, type MCPServerRow, mcpServers } from '../schema';
@@ -23,7 +27,9 @@ import {
   AmbiguousIdError,
   type BaseRepository,
   EntityNotFoundError,
+  RESOLVE_SHORT_ID_FETCH_LIMIT,
   RepositoryError,
+  resolveByShortIdPrefix,
 } from './base';
 
 /**
@@ -57,6 +63,7 @@ export class MCPServerRepository
       command: row.data.command,
       args: row.data.args,
       url: row.data.url,
+      headers: row.data.headers,
       env: row.data.env,
       auth: row.data.auth,
 
@@ -80,6 +87,10 @@ export class MCPServerRepository
     const now = Date.now();
     const serverId =
       'mcp_server_id' in data && data.mcp_server_id ? data.mcp_server_id : generateId();
+    const headers =
+      data.transport === 'stdio'
+        ? undefined
+        : normalizeMCPCustomHeaders('headers' in data ? data.headers : undefined);
 
     return {
       mcp_server_id: serverId as string,
@@ -106,6 +117,7 @@ export class MCPServerRepository
         command: data.command,
         args: data.args,
         url: data.url,
+        headers,
         env: data.env,
         auth: 'auth' in data ? data.auth : undefined,
         tools: 'tools' in data ? data.tools : undefined,
@@ -117,36 +129,17 @@ export class MCPServerRepository
   }
 
   /**
-   * Resolve short ID to full ID
+   * Resolve short ID to full ID via the centralized helper.
    */
   private async resolveId(id: string): Promise<string> {
-    // If already a full UUID, return as-is
-    if (id.length === 36 && id.includes('-')) {
-      return id;
-    }
-
-    // Short ID - need to resolve
-    const normalized = id.replace(/-/g, '').toLowerCase();
-    const pattern = `${normalized}%`;
-
-    const results = await select(this.db)
-      .from(mcpServers)
-      .where(like(mcpServers.mcp_server_id, pattern))
-      .all();
-
-    if (results.length === 0) {
-      throw new EntityNotFoundError('MCPServer', id);
-    }
-
-    if (results.length > 1) {
-      throw new AmbiguousIdError(
-        'MCPServer',
-        id,
-        results.map((r: { mcp_server_id: string }) => formatShortId(r.mcp_server_id as UUID))
-      );
-    }
-
-    return results[0].mcp_server_id as UUID;
+    return resolveByShortIdPrefix(id, 'MCPServer', async (pattern) => {
+      const rows = await select(this.db)
+        .from(mcpServers)
+        .where(like(mcpServers.mcp_server_id, pattern))
+        .limit(RESOLVE_SHORT_ID_FETCH_LIMIT)
+        .all();
+      return rows.map((r: { mcp_server_id: string }) => r.mcp_server_id);
+    });
   }
 
   /**
@@ -267,6 +260,18 @@ export class MCPServerRepository
       }
 
       const merged = { ...current, ...updates };
+      if ('headers' in updates) {
+        merged.headers = restoreRedactedMCPCustomHeaders({
+          current: current.headers,
+          next: updates.headers,
+        });
+      }
+      if ('auth' in updates) {
+        merged.auth = restoreRedactedMCPAuthSecrets({
+          current: current.auth,
+          next: updates.auth,
+        });
+      }
       const insertData = this.mcpServerToInsert(merged);
 
       await update(this.db, mcpServers)

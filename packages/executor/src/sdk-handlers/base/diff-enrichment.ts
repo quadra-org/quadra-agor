@@ -18,9 +18,9 @@
  *    to enrich adjacent tool_result blocks in one pass.
  */
 
-import { execFileSync, execSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { createGit } from '@agor/core/git';
 import type { FileDiff, StructuredPatchHunk } from '@agor/core/types';
 import { structuredPatch } from 'diff';
 
@@ -31,6 +31,12 @@ const MAX_FILE_SIZE_BYTES = 1_048_576;
 
 /** Context lines around changes (same as Claude Code CLI) */
 const CONTEXT_LINES = 3;
+/** Maximum diff lines to persist per file in message JSON. */
+const MAX_STORED_DIFF_LINES_PER_FILE = 200;
+/** Maximum repo files to snapshot at the start of a Codex turn. */
+const MAX_TURN_BASELINE_FILES = 5_000;
+/** Maximum aggregate text bytes to keep in a Codex turn baseline. */
+const MAX_TURN_BASELINE_BYTES = 25 * 1_048_576;
 
 interface ToolUseInfo {
   name: string;
@@ -57,6 +63,18 @@ interface EditFilesSnapshot {
 
 interface PendingSnapshotEntry {
   snapshots: EditFilesSnapshot[];
+  createdAt: number;
+}
+
+interface TextFileSnapshot {
+  exists: boolean;
+  content?: string;
+  skipped?: boolean;
+}
+
+interface EditFilesBaselineEntry {
+  gitRoot: string;
+  files: Map<string, TextFileSnapshot>;
   createdAt: number;
 }
 
@@ -89,6 +107,82 @@ function tryRealpath(p: string): string | null {
     return fs.realpathSync(p);
   } catch {
     return null;
+  }
+}
+
+function readTextFileSnapshot(absolutePath: string): TextFileSnapshot {
+  try {
+    const linkStat = fs.lstatSync(absolutePath);
+    if (!linkStat.isFile()) {
+      return { exists: true, skipped: true };
+    }
+    const stat = fs.statSync(absolutePath);
+    if (stat.size > MAX_FILE_SIZE_BYTES) {
+      return { exists: true, skipped: true };
+    }
+    const buffer = fs.readFileSync(absolutePath);
+    // Avoid rendering binary data as a giant mojibake text diff.
+    if (buffer.includes(0)) {
+      return { exists: true, skipped: true };
+    }
+    return { exists: true, content: buffer.toString('utf-8') };
+  } catch {
+    return { exists: false };
+  }
+}
+
+function getGitRoot(workingDirectory?: string): string | null {
+  let current = path.resolve(workingDirectory ?? process.cwd());
+
+  try {
+    const stat = fs.statSync(current);
+    if (!stat.isDirectory()) {
+      current = path.dirname(current);
+    }
+  } catch {
+    current = path.dirname(current);
+  }
+
+  while (true) {
+    if (fs.existsSync(path.join(current, '.git'))) {
+      return current;
+    }
+
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return null;
+    }
+    current = parent;
+  }
+}
+
+async function getGitRootFromGit(workingDirectory: string): Promise<string | null> {
+  try {
+    const { git } = createGit(workingDirectory);
+    const gitRoot = (await git.raw(['rev-parse', '--show-toplevel'])).trim();
+    return gitRoot || null;
+  } catch {
+    return null;
+  }
+}
+
+async function listTurnBaselineFiles(gitRoot: string): Promise<string[]> {
+  try {
+    const { git } = createGit(gitRoot);
+    const output = await git.raw(['ls-files', '--cached', '--others', '--exclude-standard', '-z']);
+    const files: string[] = [];
+    const seen = new Set<string>();
+
+    for (const rawPath of output.split('\0')) {
+      if (files.length >= MAX_TURN_BASELINE_FILES) break;
+      if (!rawPath || seen.has(rawPath) || !isSafeRepoRelativePath(rawPath)) continue;
+      seen.add(rawPath);
+      files.push(rawPath);
+    }
+
+    return files;
+  } catch {
+    return [];
   }
 }
 
@@ -145,6 +239,7 @@ function resolveRepoRelativePath(gitRoot: string, absolutePath: string): string 
  */
 const pendingToolUses = new Map<string, ToolUseInfo>();
 const pendingEditFilesSnapshots = new Map<string, PendingSnapshotEntry>();
+const pendingEditFilesBaselines = new Map<string, EditFilesBaselineEntry>();
 const MAX_PENDING_EDIT_FILES_SNAPSHOTS = 400;
 
 /**
@@ -177,16 +272,8 @@ export function registerToolInvocationStart(
     if (!changes || changes.length === 0) return;
 
     const workingDirectory = context?.workingDirectory;
-    let gitRoot: string;
-    try {
-      gitRoot = execSync('git rev-parse --show-toplevel', {
-        encoding: 'utf-8',
-        timeout: 5000,
-        ...(workingDirectory ? { cwd: workingDirectory } : {}),
-      }).trim();
-    } catch {
-      return;
-    }
+    const gitRoot = getGitRoot(workingDirectory);
+    if (!gitRoot) return;
 
     const snapshots: EditFilesSnapshot[] = [];
     for (const change of changes) {
@@ -200,24 +287,14 @@ export function registerToolInvocationStart(
       // Only snapshot files inside the repo.
       if (!resolveRepoRelativePath(gitRoot, absolutePath)) continue;
 
-      let beforeExists = false;
-      let beforeContent: string | undefined;
-      try {
-        const stat = fs.statSync(absolutePath);
-        if (stat.size <= MAX_FILE_SIZE_BYTES) {
-          beforeContent = fs.readFileSync(absolutePath, 'utf-8');
-        }
-        beforeExists = true;
-      } catch {
-        beforeExists = false;
-      }
+      const before = readTextFileSnapshot(absolutePath);
 
       snapshots.push({
         path: change.path,
         kind,
         absolutePath,
-        beforeExists,
-        beforeContent,
+        beforeExists: before.exists,
+        beforeContent: before.content,
       });
     }
 
@@ -240,6 +317,66 @@ export function registerToolInvocationStart(
  */
 export function clearToolInvocationState(toolUseId: string, context?: DiffEnrichmentContext): void {
   pendingEditFilesSnapshots.delete(getSnapshotKey(toolUseId, context));
+}
+
+/**
+ * Capture a best-effort in-memory repo baseline at the start of a Codex turn.
+ *
+ * Codex SDK 0.135 emits `file_change` items only after the patch has been
+ * applied, so there is no per-file `tool_start` moment with target paths for
+ * edit_files. This turn baseline gives edit_files a true pre-image for dirty
+ * tracked and untracked files without falling back to git HEAD. The baseline is
+ * updated after each edit_files result so multiple edits to the same file in one
+ * turn render as per-operation diffs.
+ */
+export async function registerEditFilesTurnBaseline(
+  context?: DiffEnrichmentContext
+): Promise<void> {
+  try {
+    const workingDirectory = context?.workingDirectory;
+    if (!workingDirectory) return;
+
+    const gitRoot = await getGitRootFromGit(workingDirectory);
+    if (!gitRoot) return;
+
+    const files = new Map<string, TextFileSnapshot>();
+    let totalBytes = 0;
+    for (const relativePath of await listTurnBaselineFiles(gitRoot)) {
+      const absolutePath = path.join(gitRoot, relativePath);
+      const snapshot = readTextFileSnapshot(absolutePath);
+      if (snapshot.content !== undefined) {
+        const byteLength = Buffer.byteLength(snapshot.content, 'utf-8');
+        if (totalBytes + byteLength > MAX_TURN_BASELINE_BYTES) {
+          files.set(relativePath, { exists: true, skipped: true });
+          continue;
+        }
+        totalBytes += byteLength;
+      }
+      files.set(relativePath, snapshot);
+    }
+
+    pendingEditFilesBaselines.set(getBaselineKey(context), {
+      gitRoot,
+      files,
+      createdAt: Date.now(),
+    });
+  } catch {
+    // Best effort — swallow any errors.
+  }
+}
+
+/**
+ * Refresh an existing turn baseline after a non-edit_files tool that may have
+ * mutated the worktree. This keeps later edit_files diffs scoped to their own
+ * operation instead of diffing against the beginning of the whole Codex turn.
+ */
+export async function refreshEditFilesTurnBaseline(context?: DiffEnrichmentContext): Promise<void> {
+  if (!pendingEditFilesBaselines.has(getBaselineKey(context))) return;
+  await registerEditFilesTurnBaseline(context);
+}
+
+export function clearEditFilesTurnBaseline(context?: DiffEnrichmentContext): void {
+  pendingEditFilesBaselines.delete(getBaselineKey(context));
 }
 
 /**
@@ -340,6 +477,48 @@ function enrichBlock(
   }
 }
 
+function countOldLines(lines: string[]): number {
+  return lines.filter((line) => !line.startsWith('+')).length;
+}
+
+function countNewLines(lines: string[]): number {
+  return lines.filter((line) => !line.startsWith('-')).length;
+}
+
+function truncateStructuredPatchHunks(hunks: StructuredPatchHunk[]): StructuredPatchHunk[] {
+  const totalLines = hunks.reduce((sum, hunk) => sum + hunk.lines.length, 0);
+  if (totalLines <= MAX_STORED_DIFF_LINES_PER_FILE) return hunks;
+
+  const truncated: StructuredPatchHunk[] = [];
+  let remaining = MAX_STORED_DIFF_LINES_PER_FILE;
+  let shownLines = 0;
+
+  for (const hunk of hunks) {
+    if (remaining <= 0) break;
+
+    const lines = hunk.lines.slice(0, remaining);
+    remaining -= lines.length;
+    shownLines += lines.length;
+
+    truncated.push({
+      ...hunk,
+      oldLines: countOldLines(lines),
+      newLines: countNewLines(lines),
+      lines,
+    });
+  }
+
+  const notice = ` [diff output was truncated: showing first ${shownLines} of ${totalLines} lines]`;
+  const lastHunk = truncated.at(-1);
+  if (lastHunk) {
+    lastHunk.lines = [...lastHunk.lines, notice];
+    lastHunk.oldLines = countOldLines(lastHunk.lines);
+    lastHunk.newLines = countNewLines(lastHunk.lines);
+  }
+
+  return truncated;
+}
+
 /**
  * Compute structuredPatch for an Edit tool result.
  *
@@ -413,6 +592,7 @@ function enrichEditResult(block: ContentBlock, input: Record<string, unknown>): 
   // Release current content
   currentContent = null;
 
+  hunks = truncateStructuredPatchHunks(hunks);
   if (hunks.length > 0) {
     block.diff = { structuredPatch: hunks };
   }
@@ -437,8 +617,9 @@ function enrichWriteResult(block: ContentBlock, input: Record<string, unknown>):
     context: 0,
   });
 
-  if (patch.hunks.length > 0) {
-    block.diff = { structuredPatch: patch.hunks };
+  const hunks = truncateStructuredPatchHunks(patch.hunks);
+  if (hunks.length > 0) {
+    block.diff = { structuredPatch: hunks };
   }
 }
 
@@ -446,8 +627,10 @@ function enrichWriteResult(block: ContentBlock, input: Record<string, unknown>):
  * Compute structuredPatch for Codex edit_files tool results.
  *
  * Codex groups file changes as: { changes: [{ path, kind }] }.
- * No old/new content is provided — we reconstruct diffs by comparing
- * the current file (post-edit) against git HEAD.
+ * No old/new content is provided. Prefer pre-edit snapshots captured at
+ * tool-start. If no snapshot exists, only explicit add operations can be
+ * represented accurately; updates/deletes are left unenriched rather than
+ * guessed from git HEAD, which may be stale relative to a dirty worktree.
  */
 function enrichEditFilesResult(
   block: ContentBlock,
@@ -469,6 +652,7 @@ function enrichEditFilesResult(
 
   if (snapshots?.length) {
     const snapshotDiffs = enrichFromEditFilesSnapshots(snapshots);
+    refreshEditFilesBaselineFromSnapshots(context, snapshots);
     if (snapshotDiffs.length > 0) {
       block.diff = {
         structuredPatch: snapshotDiffs[0].structuredPatch,
@@ -478,17 +662,22 @@ function enrichEditFilesResult(
     }
   }
 
-  // Find git root once for relative path resolution
-  let gitRoot: string;
-  try {
-    gitRoot = execSync('git rev-parse --show-toplevel', {
-      encoding: 'utf-8',
-      timeout: 5000,
-      ...(workingDirectory ? { cwd: workingDirectory } : {}),
-    }).trim();
-  } catch {
-    return; // Not in a git repo or git unavailable
+  const baselineSnapshots = snapshotsFromEditFilesBaseline(changes, context);
+  if (baselineSnapshots.length > 0) {
+    const baselineDiffs = enrichFromEditFilesSnapshots(baselineSnapshots);
+    refreshEditFilesBaselineFromSnapshots(context, baselineSnapshots);
+    if (baselineDiffs.length > 0) {
+      block.diff = {
+        structuredPatch: baselineDiffs[0].structuredPatch,
+        files: baselineDiffs,
+      };
+      return;
+    }
   }
+
+  // Find git root once for relative path resolution
+  const gitRoot = getGitRoot(workingDirectory);
+  if (!gitRoot) return; // Not in a git repo or git unavailable
 
   const fileDiffs: FileDiff[] = [];
 
@@ -496,59 +685,32 @@ function enrichEditFilesResult(
     if (!change.path) continue;
 
     const kind = normalizeChangeKind(change.kind);
+
+    // Without a pre-edit snapshot, Codex SDK file_change items only tell us
+    // path + kind. Diffing updates/deletes against HEAD is misleading in dirty
+    // worktrees (e.g. files created or modified by earlier uncommitted tool
+    // calls can appear as whole-file additions). Only an explicit add has a
+    // trustworthy post-edit-only representation.
+    if (kind !== 'add') continue;
+
     const filePath = change.path;
     const resolvedPath = path.isAbsolute(filePath)
       ? filePath
       : path.resolve(workingDirectory || gitRoot, filePath);
 
     try {
-      if (kind === 'add') {
-        // New file — all additions
-        const stat = fs.statSync(resolvedPath);
-        if (stat.size > MAX_FILE_SIZE_BYTES) continue;
-        const content = fs.readFileSync(resolvedPath, 'utf-8');
-        const patch = structuredPatch(filePath, filePath, '', content, '', '', {
-          context: 0,
-        });
-        if (patch.hunks.length > 0) {
-          fileDiffs.push({ path: filePath, kind, structuredPatch: patch.hunks });
-        }
-      } else if (kind === 'delete') {
-        // Deleted file — get old content from git
-        const relativePath = resolveRepoRelativePath(gitRoot, resolvedPath);
-        if (!relativePath) continue;
-        const oldContent = gitShowHeadFile(gitRoot, relativePath);
-        if (oldContent === null) continue;
-        const patch = structuredPatch(filePath, filePath, oldContent, '', '', '', {
-          context: CONTEXT_LINES,
-        });
-        if (patch.hunks.length > 0) {
-          fileDiffs.push({ path: filePath, kind, structuredPatch: patch.hunks });
-        }
-      } else {
-        // Update — diff git HEAD vs current file
-        const stat = fs.statSync(resolvedPath);
-        if (stat.size > MAX_FILE_SIZE_BYTES) continue;
-        const currentContent = fs.readFileSync(resolvedPath, 'utf-8');
-        const relativePath = resolveRepoRelativePath(gitRoot, resolvedPath);
-        if (!relativePath) continue;
-        const oldContent = gitShowHeadFile(gitRoot, relativePath);
-        if (oldContent === null) {
-          // File may be new (not in HEAD) — treat as addition
-          const patch = structuredPatch(filePath, filePath, '', currentContent, '', '', {
-            context: 0,
-          });
-          if (patch.hunks.length > 0) {
-            fileDiffs.push({ path: filePath, kind: 'add', structuredPatch: patch.hunks });
-          }
-          continue;
-        }
-        const patch = structuredPatch(filePath, filePath, oldContent, currentContent, '', '', {
-          context: CONTEXT_LINES,
-        });
-        if (patch.hunks.length > 0) {
-          fileDiffs.push({ path: filePath, kind, structuredPatch: patch.hunks });
-        }
+      // Only render files inside the repo.
+      if (!resolveRepoRelativePath(gitRoot, resolvedPath)) continue;
+
+      const after = readTextFileSnapshot(resolvedPath);
+      if (!after.exists || after.content === undefined) continue;
+      const content = after.content;
+      const patch = structuredPatch(filePath, filePath, '', content, '', '', {
+        context: 0,
+      });
+      const hunks = truncateStructuredPatchHunks(patch.hunks);
+      if (hunks.length > 0) {
+        fileDiffs.push({ path: filePath, kind, structuredPatch: hunks });
       }
     } catch {
       // Best effort — skip files that fail
@@ -564,24 +726,6 @@ function enrichEditFilesResult(
   }
 }
 
-function gitShowHeadFile(gitRoot: string, relativePath: string): string | null {
-  // Ensure the ref path is safe and uses git's forward-slash separator.
-  const normalized = path.posix.normalize(relativePath.split(path.sep).join('/'));
-  if (!isSafeRepoRelativePath(normalized)) {
-    return null;
-  }
-
-  try {
-    return execFileSync('git', ['show', `HEAD:${normalized}`], {
-      encoding: 'utf-8',
-      timeout: 5000,
-      cwd: gitRoot,
-    });
-  } catch {
-    return null;
-  }
-}
-
 function normalizeChangeKind(kind: string | undefined): 'add' | 'update' | 'delete' {
   if (kind === 'add' || kind === 'delete' || kind === 'update') {
     return kind;
@@ -591,6 +735,10 @@ function normalizeChangeKind(kind: string | undefined): 'add' | 'update' | 'dele
 
 function getSnapshotKey(toolUseId: string, context?: DiffEnrichmentContext): string {
   return `${context?.snapshotScope ?? 'global'}:${toolUseId}`;
+}
+
+function getBaselineKey(context?: DiffEnrichmentContext): string {
+  return context?.snapshotScope ?? 'global';
 }
 
 function pruneOldestEditFilesSnapshots(): void {
@@ -612,22 +760,20 @@ function enrichFromEditFilesSnapshots(snapshots: EditFilesSnapshot[]): FileDiff[
 
   for (const snapshot of snapshots) {
     try {
-      let afterExists = false;
-      let afterContent = '';
+      const after = readTextFileSnapshot(snapshot.absolutePath);
+      const afterExists = after.exists;
 
-      try {
-        const stat = fs.statSync(snapshot.absolutePath);
-        if (stat.size <= MAX_FILE_SIZE_BYTES) {
-          afterContent = fs.readFileSync(snapshot.absolutePath, 'utf-8');
-        }
-        afterExists = true;
-      } catch {
-        afterExists = false;
+      // Existing but skipped means large/binary/non-regular. Avoid false full-file
+      // add/delete/update diffs from an unknown side of the comparison.
+      if (
+        (snapshot.beforeExists && snapshot.beforeContent === undefined) ||
+        (afterExists && after.content === undefined)
+      ) {
+        continue;
       }
 
-      const beforeContent = snapshot.beforeExists ? (snapshot.beforeContent ?? '') : '';
-      const beforeForDiff = snapshot.beforeExists ? beforeContent : '';
-      const afterForDiff = afterExists ? afterContent : '';
+      const beforeForDiff = snapshot.beforeExists ? (snapshot.beforeContent ?? '') : '';
+      const afterForDiff = afterExists ? (after.content ?? '') : '';
       if (!snapshot.beforeExists && !afterExists) continue;
       if (beforeForDiff === afterForDiff) continue;
 
@@ -652,11 +798,12 @@ function enrichFromEditFilesSnapshots(snapshots: EditFilesSnapshot[]): FileDiff[
         }
       );
 
-      if (patch.hunks.length > 0) {
+      const hunks = truncateStructuredPatchHunks(patch.hunks);
+      if (hunks.length > 0) {
         fileDiffs.push({
           path: snapshot.path,
           kind: resultKind,
-          structuredPatch: patch.hunks,
+          structuredPatch: hunks,
         });
       }
     } catch {
@@ -666,4 +813,55 @@ function enrichFromEditFilesSnapshots(snapshots: EditFilesSnapshot[]): FileDiff[
 
   // Keep fallback path in calling method if this yields no diffs.
   return fileDiffs;
+}
+
+function snapshotsFromEditFilesBaseline(
+  changes: FileChangeSpec[],
+  context?: DiffEnrichmentContext
+): EditFilesSnapshot[] {
+  const baseline = pendingEditFilesBaselines.get(getBaselineKey(context));
+  if (!baseline) return [];
+
+  const snapshots: EditFilesSnapshot[] = [];
+  for (const change of changes) {
+    if (!change?.path) continue;
+
+    const absolutePath = path.isAbsolute(change.path)
+      ? change.path
+      : path.resolve(context?.workingDirectory || baseline.gitRoot, change.path);
+    const relativePath = resolveRepoRelativePath(baseline.gitRoot, absolutePath);
+    if (!relativePath) continue;
+
+    const before = baseline.files.get(relativePath) ?? { exists: false };
+    snapshots.push({
+      path: relativePath,
+      kind: normalizeChangeKind(change.kind),
+      absolutePath,
+      beforeExists: before.exists,
+      beforeContent: before.content,
+    });
+  }
+
+  return snapshots;
+}
+
+function refreshEditFilesBaselineFromSnapshots(
+  context: DiffEnrichmentContext | undefined,
+  snapshots: EditFilesSnapshot[]
+): void {
+  const baseline = pendingEditFilesBaselines.get(getBaselineKey(context));
+  if (!baseline) return;
+
+  for (const snapshot of snapshots) {
+    const relativePath = resolveRepoRelativePath(baseline.gitRoot, snapshot.absolutePath);
+    if (!relativePath) continue;
+
+    const after = readTextFileSnapshot(snapshot.absolutePath);
+    if (!after.exists) {
+      baseline.files.delete(relativePath);
+      continue;
+    }
+
+    baseline.files.set(relativePath, after);
+  }
 }

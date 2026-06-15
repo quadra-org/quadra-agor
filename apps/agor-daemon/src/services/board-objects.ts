@@ -2,18 +2,41 @@
  * Board Objects Service
  *
  * Provides REST + WebSocket API for managing positioned entities on boards.
- * Supports both session cards and worktree cards (Phase 1: Hybrid support).
+ * Supports both session cards and branch cards (Phase 1: Hybrid support).
  */
 
 import { BoardObjectRepository, type Database } from '@agor/core/db';
-import type { BoardEntityObject, BoardID, QueryParams, WorktreeID } from '@agor/core/types';
+import type {
+  BoardEntityObject,
+  BoardEntityType,
+  BoardID,
+  BranchID,
+  CardID,
+  QueryParams,
+} from '@agor/core/types';
+
+export type BoardObjectPatchedEventPayload = Omit<BoardEntityObject, 'zone_id'> & {
+  zone_id?: string | null;
+};
+
+export function toBoardObjectPatchedEventPayload(
+  boardObject: BoardEntityObject
+): BoardObjectPatchedEventPayload {
+  return {
+    ...boardObject,
+    ...(boardObject.zone_id === undefined ? { zone_id: null } : {}),
+  };
+}
 
 /**
  * Board object service params
  */
 export type BoardObjectParams = QueryParams<{
   board_id?: BoardID;
-  worktree_id?: WorktreeID;
+  branch_id?: BranchID;
+  card_id?: CardID;
+  zone_id?: string;
+  entity_type?: BoardEntityType;
 }>;
 
 /**
@@ -28,15 +51,15 @@ export class BoardObjectsService {
   }
 
   /**
-   * Create board object (add worktree to board)
+   * Create board object (add branch to board)
    */
   async create(
     data: Partial<BoardEntityObject>,
     params?: BoardObjectParams
   ): Promise<BoardEntityObject> {
-    // Validate: worktree_id is provided
-    if (!data.worktree_id) {
-      throw new Error('worktree_id is required');
+    // Validate: branch_id is provided
+    if (!data.branch_id) {
+      throw new Error('branch_id is required');
     }
 
     // Validate: position is provided
@@ -52,7 +75,7 @@ export class BoardObjectsService {
     // Use repository to create
     const boardObject = await this.boardObjectRepo.create({
       board_id: data.board_id,
-      worktree_id: data.worktree_id,
+      branch_id: data.branch_id,
       position: data.position,
       zone_id: data.zone_id,
     });
@@ -67,28 +90,47 @@ export class BoardObjectsService {
    * Find board objects
    */
   async find(params?: BoardObjectParams) {
-    const { board_id } = params?.query || {};
+    const { board_id, branch_id, card_id, zone_id, entity_type } = params?.query || {};
+
+    let objects: BoardEntityObject[];
 
     // If board_id filter is provided, use repository method
     if (board_id) {
-      const objects = await this.boardObjectRepo.findByBoardId(board_id);
-
-      return {
-        total: objects.length,
-        limit: params?.query?.$limit || 100,
-        skip: params?.query?.$skip || 0,
-        data: objects,
-      };
+      objects = await this.boardObjectRepo.findByBoardId(board_id);
+    } else {
+      // No board_id - return ALL board objects
+      objects = await this.boardObjectRepo.findAll();
     }
 
-    // No board_id - return ALL board objects
-    const allObjects = await this.boardObjectRepo.findAll();
+    if (branch_id) {
+      objects = objects.filter((object) => object.branch_id === branch_id);
+    }
+    if (card_id) {
+      objects = objects.filter((object) => object.card_id === card_id);
+    }
+    if (zone_id) {
+      objects = objects.filter((object) => object.zone_id === zone_id);
+    }
+    if (entity_type) {
+      objects = objects.filter((object) => object.entity_type === entity_type);
+    }
+
+    const total = objects.length;
+    const requestedSkip = params?.query?.$skip ?? 0;
+    const requestedLimit = params?.query?.$limit;
+    const data =
+      requestedLimit !== undefined || requestedSkip > 0
+        ? objects.slice(
+            requestedSkip,
+            requestedLimit === undefined ? undefined : requestedSkip + requestedLimit
+          )
+        : objects;
 
     return {
-      total: allObjects.length,
-      limit: params?.query?.$limit || 100,
-      skip: params?.query?.$skip || 0,
-      data: allObjects,
+      total,
+      limit: requestedLimit ?? 100,
+      skip: requestedSkip,
+      data,
     };
   }
 
@@ -119,11 +161,11 @@ export class BoardObjectsService {
 
       // Emit single WebSocket event with both updates
       // Explicitly include zone_id field (even if undefined) to signal zone changes to clients
-      const eventPayload = {
-        ...boardObject,
-        ...(boardObject.zone_id === undefined ? { zone_id: null } : {}),
-      };
-      this.emit?.('patched', eventPayload as BoardEntityObject, params);
+      this.emit?.(
+        'patched',
+        toBoardObjectPatchedEventPayload(boardObject) as BoardEntityObject,
+        params
+      );
 
       return boardObject;
     }
@@ -178,13 +220,12 @@ export class BoardObjectsService {
   ): Promise<BoardEntityObject> {
     const boardObject = await this.boardObjectRepo.updateZone(objectId, zoneId);
 
-    // Emit WebSocket event with explicit null for undefined zone_id
-    // JSON.stringify strips undefined fields, so convert to null to signal zone was cleared
-    const eventPayload = {
-      ...boardObject,
-      ...(boardObject.zone_id === undefined ? { zone_id: null } : {}),
-    };
-    this.emit?.('patched', eventPayload as BoardEntityObject, params);
+    // Emit WebSocket event with explicit null for undefined zone_id.
+    this.emit?.(
+      'patched',
+      toBoardObjectPatchedEventPayload(boardObject) as BoardEntityObject,
+      params
+    );
 
     return boardObject;
   }
@@ -195,19 +236,30 @@ export class BoardObjectsService {
   async clearZoneReferences(
     boardId: BoardID,
     zoneId: string,
-    zonePosition?: { x: number; y: number }
-  ): Promise<number> {
-    return this.boardObjectRepo.clearZoneReferences(boardId, zoneId, zonePosition);
+    zonePosition?: { x: number; y: number },
+    params?: BoardObjectParams
+  ): Promise<BoardEntityObject[]> {
+    const cleared = await this.boardObjectRepo.clearZoneReferences(boardId, zoneId, zonePosition);
+
+    for (const boardObject of cleared) {
+      this.emit?.(
+        'patched',
+        toBoardObjectPatchedEventPayload(boardObject) as BoardEntityObject,
+        params
+      );
+    }
+
+    return cleared;
   }
 
   /**
-   * Custom method: Find by worktree ID
+   * Custom method: Find by branch ID
    */
-  async findByWorktreeId(
-    worktreeId: WorktreeID,
+  async findByBranchId(
+    branchId: BranchID,
     _params?: BoardObjectParams
   ): Promise<BoardEntityObject | null> {
-    return this.boardObjectRepo.findByWorktreeId(worktreeId);
+    return this.boardObjectRepo.findByBranchId(branchId);
   }
 }
 

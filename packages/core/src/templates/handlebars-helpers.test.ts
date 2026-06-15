@@ -1,7 +1,7 @@
 import Handlebars from 'handlebars';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  buildWorktreeContext,
+  buildBranchContext,
   registerHandlebarsHelpers,
   renderTemplate,
 } from './handlebars-helpers';
@@ -983,19 +983,21 @@ describe('handlebars-helpers', () => {
 
     it('should render complex template with multiple helpers', () => {
       const template = `
-PORT={{add 6000 worktree.unique_id}}
-NAME={{replace (uppercase worktree.name) "-" "_"}}
-{{#if (gt worktree.unique_id 5)}}HIGH{{else}}LOW{{/if}}
+PORT={{add 6000 branch.unique_id}}
+NAME={{replace (uppercase branch.name) "-" "_"}}
+{{#if (gt branch.unique_id 5)}}HIGH{{else}}LOW{{/if}}
       `.trim();
       const result = renderTemplate(template, {
-        worktree: { unique_id: 10, name: 'test-worktree' },
+        branch: { unique_id: 10, name: 'test-branch' },
       });
       expect(result).toContain('PORT=6010');
-      expect(result).toContain('NAME=TEST_WORKTREE');
+      expect(result).toContain('NAME=TEST_BRANCH');
       expect(result).toContain('HIGH');
     });
 
-    it('should not throw on invalid template syntax; returns empty string and logs', () => {
+    it('should not throw on invalid template syntax; returns "" by default and logs', () => {
+      // Default fallback is '' (safe for command/env/prompt callers); UI
+      // surfaces opt into raw-template fallback via { onError: 'raw' }.
       const result = renderTemplate('{{#if unclosed', {});
       expect(result).toBe('');
       expect(consoleErrorSpy).toHaveBeenCalledWith(
@@ -1039,23 +1041,26 @@ NAME={{replace (uppercase worktree.name) "-" "_"}}
     });
   });
 
-  describe('buildWorktreeContext', () => {
+  describe('buildBranchContext', () => {
     it('should build basic context with all fields', () => {
-      const context = buildWorktreeContext({
-        worktree_unique_id: 42,
-        name: 'my-worktree',
-        path: '/path/to/worktree',
+      const context = buildBranchContext({
+        branch_unique_id: 42,
+        name: 'my-branch',
+        path: '/path/to/branch',
         repo_slug: 'my-repo',
         custom_context: { foo: 'bar' },
       });
 
+      const expectedBranchEntity = {
+        unique_id: 42,
+        name: 'my-branch',
+        path: '/path/to/branch',
+        gid: undefined,
+      };
       expect(context).toEqual({
-        worktree: {
-          unique_id: 42,
-          name: 'my-worktree',
-          path: '/path/to/worktree',
-          gid: undefined,
-        },
+        branch: expectedBranchEntity,
+        // v0.19 backwards-compat alias — same object as `branch`.
+        worktree: expectedBranchEntity,
         repo: {
           slug: 'my-repo',
         },
@@ -1067,8 +1072,8 @@ NAME={{replace (uppercase worktree.name) "-" "_"}}
     });
 
     it('should expose host.ip_address when provided', () => {
-      const context = buildWorktreeContext({
-        worktree_unique_id: 1,
+      const context = buildBranchContext({
+        branch_unique_id: 1,
         name: 'test',
         path: '/test',
         host_ip_address: '10.0.0.5',
@@ -1081,8 +1086,8 @@ NAME={{replace (uppercase worktree.name) "-" "_"}}
     });
 
     it('should render empty string for {{host.ip_address}} when unresolved', () => {
-      const context = buildWorktreeContext({
-        worktree_unique_id: 1,
+      const context = buildBranchContext({
+        branch_unique_id: 1,
         name: 'test',
         path: '/test',
       });
@@ -1092,8 +1097,8 @@ NAME={{replace (uppercase worktree.name) "-" "_"}}
     });
 
     it('should handle missing repo_slug', () => {
-      const context = buildWorktreeContext({
-        worktree_unique_id: 1,
+      const context = buildBranchContext({
+        branch_unique_id: 1,
         name: 'test',
         path: '/test',
       });
@@ -1102,8 +1107,8 @@ NAME={{replace (uppercase worktree.name) "-" "_"}}
     });
 
     it('should handle missing custom_context', () => {
-      const context = buildWorktreeContext({
-        worktree_unique_id: 1,
+      const context = buildBranchContext({
+        branch_unique_id: 1,
         name: 'test',
         path: '/test',
         repo_slug: 'repo',
@@ -1113,8 +1118,8 @@ NAME={{replace (uppercase worktree.name) "-" "_"}}
     });
 
     it('should handle empty custom_context', () => {
-      const context = buildWorktreeContext({
-        worktree_unique_id: 1,
+      const context = buildBranchContext({
+        branch_unique_id: 1,
         name: 'test',
         path: '/test',
         repo_slug: 'repo',
@@ -1125,8 +1130,8 @@ NAME={{replace (uppercase worktree.name) "-" "_"}}
     });
 
     it('should preserve nested custom context', () => {
-      const context = buildWorktreeContext({
-        worktree_unique_id: 1,
+      const context = buildBranchContext({
+        branch_unique_id: 1,
         name: 'test',
         path: '/test',
         repo_slug: 'repo',
@@ -1147,8 +1152,8 @@ NAME={{replace (uppercase worktree.name) "-" "_"}}
     });
 
     it('should build context usable in templates', () => {
-      const context = buildWorktreeContext({
-        worktree_unique_id: 5,
+      const context = buildBranchContext({
+        branch_unique_id: 5,
         name: 'test-wt',
         path: '/path/to/test',
         repo_slug: 'test-repo',
@@ -1156,48 +1161,48 @@ NAME={{replace (uppercase worktree.name) "-" "_"}}
       });
 
       const result = renderTemplate(
-        'Port: {{add custom.port_base worktree.unique_id}}, Name: {{worktree.name}}, Repo: {{repo.slug}}',
+        'Port: {{add custom.port_base branch.unique_id}}, Name: {{branch.name}}, Repo: {{repo.slug}}',
         context
       );
       expect(result).toBe('Port: 3005, Name: test-wt, Repo: test-repo');
     });
 
     it('should handle zero unique_id', () => {
-      const context = buildWorktreeContext({
-        worktree_unique_id: 0,
+      const context = buildBranchContext({
+        branch_unique_id: 0,
         name: 'test',
         path: '/test',
         repo_slug: 'repo',
       });
 
-      expect((context.worktree as any).unique_id).toBe(0);
+      expect((context.branch as any).unique_id).toBe(0);
     });
 
     it('should handle special characters in name', () => {
-      const context = buildWorktreeContext({
-        worktree_unique_id: 1,
-        name: 'test-worktree_123',
+      const context = buildBranchContext({
+        branch_unique_id: 1,
+        name: 'test-branch_123',
         path: '/test',
         repo_slug: 'repo',
       });
 
-      expect((context.worktree as any).name).toBe('test-worktree_123');
+      expect((context.branch as any).name).toBe('test-branch_123');
     });
 
     it('should handle absolute paths', () => {
-      const context = buildWorktreeContext({
-        worktree_unique_id: 1,
+      const context = buildBranchContext({
+        branch_unique_id: 1,
         name: 'test',
-        path: '/absolute/path/to/worktree',
+        path: '/absolute/path/to/branch',
         repo_slug: 'repo',
       });
 
-      expect((context.worktree as any).path).toBe('/absolute/path/to/worktree');
+      expect((context.branch as any).path).toBe('/absolute/path/to/branch');
     });
 
     it('should handle custom context with various types', () => {
-      const context = buildWorktreeContext({
-        worktree_unique_id: 1,
+      const context = buildBranchContext({
+        branch_unique_id: 1,
         name: 'test',
         path: '/test',
         repo_slug: 'repo',
@@ -1265,20 +1270,138 @@ NAME={{replace (uppercase worktree.name) "-" "_"}}
     });
   });
 
+  // Regression test for the zone trigger dialog rendering bug (PR #1090 + v2).
+  //
+  // PR #1090 swapped a direct `Handlebars.compile()` call (which used a UI-
+  // local Handlebars instance with no helpers registered) for the shared
+  // `renderTemplate()`. The intent was that `initializeHandlebarsHelpers()`
+  // at app startup would populate helpers on the *same* instance that
+  // `renderTemplate()` compiles against. That works when both modules
+  // resolve to the same physical Handlebars instance, but in tsup-bundled
+  // environments the bundle can capture a *separate* Handlebars instance —
+  // helpers register on the host-app instance, while renderTemplate compiles
+  // against the bundled instance. Templates using helpers like {{add}} then
+  // throw at render time, which renderTemplate's catch-all swallowed into
+  // an empty string — producing the v1 symptom of an empty modal.
+  //
+  // The v2 fix makes renderTemplate self-register helpers on the same
+  // instance it compiles against, eliminating the dual-instance hazard.
+  describe('regression: renderTemplate is self-sufficient (no prior register call)', () => {
+    it('renders a helper-using template even when our helpers are absent from Handlebars at call time', async () => {
+      // Reproduce the production failure mode: in the tsup-bundled
+      // @agor-live/client, the Handlebars singleton renderTemplate compiles
+      // against has *no* Agor helpers registered (because the host app
+      // registered them on a different physical instance). Simulate that
+      // here by stripping our helpers off the Handlebars singleton AND
+      // re-importing the module so its `helpersRegistered` flag resets.
+      const ourHelpers = [
+        'add',
+        'sub',
+        'mul',
+        'div',
+        'eq',
+        'ne',
+        'lt',
+        'lte',
+        'gt',
+        'gte',
+        'and',
+        'or',
+        'not',
+        'concat',
+        'uppercase',
+        'lowercase',
+        'replace',
+        'trim',
+        'default',
+        'json',
+      ];
+      const saved: Record<string, unknown> = {};
+      for (const name of ourHelpers) {
+        saved[name] = Handlebars.helpers[name];
+        Handlebars.unregisterHelper(name);
+      }
+      try {
+        vi.resetModules();
+        const fresh = await import('./handlebars-helpers');
+        const result = fresh.renderTemplate(
+          'Open issue #{{add 1000 branch.unique_id}} for {{uppercase branch.name}}',
+          { branch: { unique_id: 90, name: 'feature-x' } }
+        );
+        expect(result).toBe('Open issue #1090 for FEATURE-X');
+      } finally {
+        // Restore helpers for downstream tests in this file (which reuse
+        // the global Handlebars singleton via the top-level beforeEach).
+        for (const [name, helper] of Object.entries(saved)) {
+          if (helper) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            Handlebars.registerHelper(name, helper as any);
+          }
+        }
+      }
+    });
+
+    it('renders the zone-trigger-style template the modal actually feeds in', () => {
+      // Mirrors the context shape the ZoneTriggerModal builds in
+      // apps/agor-ui/src/components/SessionCanvas/canvas/ZoneTriggerModal.tsx
+      const template =
+        'Branch: {{branch.name}} ({{branch.ref}})\n' +
+        'Issue: {{branch.issue_url}}\n' +
+        'Notes: {{branch.notes}}\n' +
+        'Board: {{board.name}}';
+      const context = {
+        branch: {
+          name: 'fix-zone-trigger',
+          ref: 'fix-zone-trigger',
+          issue_url: 'https://example.com/issues/123',
+          pull_request_url: '',
+          notes: 'render the interpolated template',
+          path: '/tmp/wt',
+          context: {},
+        },
+        board: { name: 'main', description: '', context: {} },
+        session: { description: '', context: {} },
+      };
+      const result = renderTemplate(template, context);
+      expect(result).toContain('Branch: fix-zone-trigger (fix-zone-trigger)');
+      expect(result).toContain('Issue: https://example.com/issues/123');
+      expect(result).toContain('Notes: render the interpolated template');
+      expect(result).toContain('Board: main');
+      // Crucially, it must NOT be empty (v1 symptom) or the raw template (pre-v1).
+      expect(result).not.toBe('');
+      expect(result).not.toBe(template);
+    });
+
+    it('returns "" by default on render error (safe for command/env/prompt callers)', () => {
+      // Unknown helpers are a runtime error. Default fallback is '' so
+      // callers that compose the result into shell commands, env vars, or
+      // system prompts don't leak literal {{...}} placeholders.
+      const raw = '{{nonExistentHelper foo bar}}';
+      const result = renderTemplate(raw, { foo: 1, bar: 2 });
+      expect(result).toBe('');
+    });
+
+    it('returns the raw template on render error when onError: "raw" is set (UI preview surfaces)', () => {
+      const raw = '{{nonExistentHelper foo bar}}';
+      const result = renderTemplate(raw, { foo: 1, bar: 2 }, { onError: 'raw' });
+      expect(result).toBe(raw);
+    });
+  });
+
   // ===== Real-world Usage Scenarios =====
 
   describe('real-world scenarios', () => {
     it('should handle environment config template', () => {
       const template = `
-export PORT={{add 6000 worktree.unique_id}}
-export DB_NAME={{replace (lowercase worktree.name) "-" "_"}}_db
-export ENV={{#if (eq worktree.unique_id 1)}}production{{else}}development{{/if}}
+export PORT={{add 6000 branch.unique_id}}
+export DB_NAME={{replace (lowercase branch.name) "-" "_"}}_db
+export ENV={{#if (eq branch.unique_id 1)}}production{{else}}development{{/if}}
       `.trim();
 
-      const context = buildWorktreeContext({
-        worktree_unique_id: 1,
+      const context = buildBranchContext({
+        branch_unique_id: 1,
         name: 'Main-Branch',
-        path: '/path/to/worktree',
+        path: '/path/to/branch',
         repo_slug: 'my-repo',
       });
 
@@ -1289,10 +1412,10 @@ export ENV={{#if (eq worktree.unique_id 1)}}production{{else}}development{{/if}}
     });
 
     it('should handle zone trigger template', () => {
-      const template = 'docker run -p {{add 8080 worktree.unique_id}}:8080 {{repo.slug}}:latest';
+      const template = 'docker run -p {{add 8080 branch.unique_id}}:8080 {{repo.slug}}:latest';
 
-      const context = buildWorktreeContext({
-        worktree_unique_id: 5,
+      const context = buildBranchContext({
+        branch_unique_id: 5,
         name: 'feature-branch',
         path: '/path',
         repo_slug: 'my-app',
@@ -1304,25 +1427,25 @@ export ENV={{#if (eq worktree.unique_id 1)}}production{{else}}development{{/if}}
 
     it('should handle report template with custom context', () => {
       const template = `
-## Worktree Report: {{uppercase worktree.name}}
+## Branch Report: {{uppercase branch.name}}
 
-**Unique ID:** {{worktree.unique_id}}
-**Path:** {{worktree.path}}
+**Unique ID:** {{branch.unique_id}}
+**Path:** {{branch.path}}
 **Repository:** {{repo.slug}}
 **Custom Port:** {{default custom.port 3000}}
-**Status:** {{#if (gte worktree.unique_id 10)}}High Usage{{else}}Normal{{/if}}
+**Status:** {{#if (gte branch.unique_id 10)}}High Usage{{else}}Normal{{/if}}
       `.trim();
 
-      const context = buildWorktreeContext({
-        worktree_unique_id: 15,
-        name: 'test-worktree',
+      const context = buildBranchContext({
+        branch_unique_id: 15,
+        name: 'test-branch',
         path: '/workspace/test',
         repo_slug: 'test-repo',
         custom_context: { port: 4000 },
       });
 
       const result = renderTemplate(template, context);
-      expect(result).toContain('## Worktree Report: TEST-WORKTREE');
+      expect(result).toContain('## Branch Report: TEST-BRANCH');
       expect(result).toContain('**Unique ID:** 15');
       expect(result).toContain('**Path:** /workspace/test');
       expect(result).toContain('**Repository:** test-repo');
@@ -1331,10 +1454,10 @@ export ENV={{#if (eq worktree.unique_id 1)}}production{{else}}development{{/if}}
     });
 
     it('should handle complex arithmetic in templates', () => {
-      const template = '{{add (mul worktree.unique_id 100) (div custom.offset 2)}}';
+      const template = '{{add (mul branch.unique_id 100) (div custom.offset 2)}}';
 
-      const context = buildWorktreeContext({
-        worktree_unique_id: 5,
+      const context = buildBranchContext({
+        branch_unique_id: 5,
         name: 'test',
         path: '/test',
         custom_context: { offset: 10 },
@@ -1346,13 +1469,13 @@ export ENV={{#if (eq worktree.unique_id 1)}}production{{else}}development{{/if}}
 
     it('should handle conditional chains', () => {
       const template = `
-{{#if (gt worktree.unique_id 100)}}
+{{#if (gt branch.unique_id 100)}}
   Very High
 {{else}}
-  {{#if (gt worktree.unique_id 50)}}
+  {{#if (gt branch.unique_id 50)}}
     High
   {{else}}
-    {{#if (gt worktree.unique_id 10)}}
+    {{#if (gt branch.unique_id 10)}}
       Medium
     {{else}}
       Low
@@ -1361,8 +1484,8 @@ export ENV={{#if (eq worktree.unique_id 1)}}production{{else}}development{{/if}}
 {{/if}}
       `.trim();
 
-      const context = buildWorktreeContext({
-        worktree_unique_id: 25,
+      const context = buildBranchContext({
+        branch_unique_id: 25,
         name: 'test',
         path: '/test',
       });

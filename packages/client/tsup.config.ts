@@ -5,9 +5,10 @@ export default defineConfig({
     index: 'src/index.ts',
     config: 'src/config.ts',
     yaml: 'src/yaml.ts',
+    jwt: 'src/jwt.ts',
   },
   format: ['cjs', 'esm'],
-  dts: true,
+  dts: false,
   clean: true,
   splitting: false,
   // Keep FeathersJS + socket.io as runtime dependencies (not bundled)

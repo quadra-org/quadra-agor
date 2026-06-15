@@ -4,8 +4,9 @@ How Agor's daemon handles Content-Security-Policy (CSP) and Cross-Origin
 Resource Sharing (CORS), and how operators tune both from `~/.agor/config.yaml`.
 
 > This document is scoped to **web-layer hardening** (CSP / CORS / response
-> headers). For authentication, RBAC, and Unix isolation see `auth.md` and
-> `rbac-and-unix-isolation.md`.
+> headers). For authentication, RBAC, and Unix isolation see
+> [`apps/agor-docs/pages/guide/multiplayer-unix-isolation.mdx`](../../apps/agor-docs/pages/guide/multiplayer-unix-isolation.mdx)
+> and [`context/guides/rbac-and-unix-isolation.md`](../guides/rbac-and-unix-isolation.md).
 
 ---
 
@@ -81,7 +82,7 @@ security:
 
 | Mode          | Behaviour                                                         | Credentials |
 | ------------- | ----------------------------------------------------------------- | ----------- |
-| `list`        | Only origins in `origins[]` + built-ins (localhost, Sandpack, Codespaces) | Allowed (default) |
+| `list`        | Only origins in `origins[]` + built-ins (localhost, Sandpack)     | Allowed (default) |
 | `wildcard`    | Accept any origin (returns `Access-Control-Allow-Origin: *`)      | Forced off  |
 | `reflect`     | Echo the request's `Origin` header back                           | Forced off  |
 | `null-origin` | Accept `Origin: null` (sandboxed iframes, `file://` docs) plus no-origin non-browser clients (curl, server-to-server) | Allowed     |
@@ -100,16 +101,24 @@ work. Operators rarely need to override them:
 ```
 default-src        'self'
 script-src         'self'
-style-src          'self' 'unsafe-inline'           # Ant Design injects inline styles
+style-src          'self' 'unsafe-inline' https://fonts.bunny.net # Ant Design inline + Inter font CSS
 img-src            'self' data: blob: https://*.codesandbox.io
-font-src           'self' data:
+font-src           'self' data: https://fonts.bunny.net           # Inter font files
 connect-src        'self' ws: wss: <daemon-url>
-frame-src          'self' https://*.codesandbox.io  # Sandpack iframes
-worker-src         'self' blob:                     # Sandpack workers
+frame-src          'self' https://*.codesandbox.io               # Sandpack iframes
+worker-src         'self' blob:                                  # Sandpack workers
 frame-ancestors    'none'
 object-src         'none'
 base-uri           'self'
 ```
+
+`script-src` deliberately does NOT include `'unsafe-eval'`. Handlebars
+template rendering — used for zone triggers, env health URLs, and the
+spawn-subsession prompt — runs server-side via the daemon's `/templates`
+service (`apps/agor-daemon/src/services/templates.ts`). The browser bundle
+ships no Handlebars and never calls `new Function` / `eval`.
+
+`fonts.bunny.net` hosts the Inter font CSS imported by `apps/agor-ui/src/index.css`.
 
 The Sandpack origins (`https://*.codesandbox.io` + `blob:` for workers) are
 the load-bearing piece — without them the hosted bundler iframe renders but
@@ -240,5 +249,5 @@ error message.
 - `apps/agor-daemon/src/setup/security-headers.ts` — CSP middleware
 - `apps/agor-daemon/src/setup/cors.ts` — CORS policy builder
 - `packages/core/src/config/security-resolver.ts` — config resolver
-- `auth.md` — daemon auth (JWT, RBAC, session tokens)
-- `rbac-and-unix-isolation.md` — OS-level isolation tiers
+- [`apps/agor-docs/pages/guide/multiplayer-unix-isolation.mdx`](../../apps/agor-docs/pages/guide/multiplayer-unix-isolation.mdx) — daemon auth, RBAC, OS-level isolation tiers
+- [`context/guides/rbac-and-unix-isolation.md`](../guides/rbac-and-unix-isolation.md) — implementation guide
