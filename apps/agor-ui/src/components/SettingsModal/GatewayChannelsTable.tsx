@@ -886,7 +886,7 @@ const ChannelFormFields: React.FC<{
                     }
                     tooltip="Azure Bot Registration Application (client) ID"
                   >
-                    <Input placeholder="abe4fa14-3dc2-4d99-81e4-62d039f1fb23" />
+                    <Input placeholder="00000000-0000-0000-0000-000000000000" />
                   </Form.Item>
 
                   <Form.Item
@@ -915,7 +915,7 @@ const ChannelFormFields: React.FC<{
                     ]}
                     tooltip="Azure AD Tenant ID. Required so the bot can acquire tokens to send replies."
                   >
-                    <Input placeholder="25f44488-c176-4a87-8d0a-25d7448dc676" />
+                    <Input placeholder="00000000-0000-0000-0000-000000000000" />
                   </Form.Item>
 
                   <Alert
