@@ -6821,7 +6821,6 @@ packages:
 
   libsql@0.5.29:
     resolution: {integrity: sha512-8lMP8iMgiBzzoNbAPQ59qdVcj6UaE/Vnm+fiwX4doX4Narook0a4GPKWBEv+CR8a1OwbfkgL18uBfBjWdF0Fzg==}
-    cpu: [x64, arm64, wasm32, arm]
     os: [darwin, linux, win32]
 
   lightningcss-android-arm64@1.32.0:
@@ -14140,13 +14139,13 @@ snapshots:
     dependencies:
       '@azure/core-rest-pipeline': 1.24.0
       '@azure/msal-node': 2.16.3
-      axios: 1.16.1
+      axios: 1.17.0
       botbuilder-core: 4.23.3(encoding@0.1.13)
       botbuilder-stdlib: 4.23.3-internal
       botframework-connector: 4.23.3(encoding@0.1.13)
       botframework-schema: 4.23.3
       botframework-streaming: 4.23.3
-      dayjs: 1.11.20
+      dayjs: 1.11.21
       filenamify: 6.0.0
       fs-extra: 11.3.5
       htmlparser2: 9.1.0
@@ -14165,7 +14164,7 @@ snapshots:
       '@azure/identity': 4.13.1
       '@azure/msal-node': 2.16.3
       '@types/jsonwebtoken': 9.0.6
-      axios: 1.16.1
+      axios: 1.17.0
       base64url: 3.0.1
       botbuilder-stdlib: 4.23.3-internal
       botframework-schema: 4.23.3
