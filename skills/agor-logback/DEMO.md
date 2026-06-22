@@ -26,7 +26,7 @@ You register the central Agor MCP server once. No local daemon, no repo changes.
 ### b. Register the MCP server (user scope → applies in every repo)
 
 ```bash
-claude mcp add --scope user --transport http agor https://agor.quadraplatform.com/mcp \
+claude mcp add --scope user --transport http quadra_central_agor_mcp https://agor.quadraplatform.com/mcp \
   --header "Authorization: Bearer <agor_sk_…>" \
   --header "CF-Access-Client-Id: <client-id>.access" \
   --header "CF-Access-Client-Secret: <client-secret>"
@@ -36,7 +36,7 @@ claude mcp add --scope user --transport http agor https://agor.quadraplatform.co
 
 ```bash
 claude mcp list
-# agor: https://agor.quadraplatform.com/mcp (HTTP) - ✔ Connected
+# quadra_central_agor_mcp: https://agor.quadraplatform.com/mcp (HTTP) - ✔ Connected
 ```
 
 ### d. Install the skill (teaches Claude _when_ to log)
