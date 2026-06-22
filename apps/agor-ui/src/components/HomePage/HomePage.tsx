@@ -4,6 +4,7 @@ import { DEFAULT_BACKGROUNDS } from '../../constants/ui';
 import { isDarkTheme } from '../../utils/theme';
 import { HomeActivitySection } from './HomeActivitySection';
 import { HomeBoardsSection } from './HomeBoardsSection';
+import { HomeExternalRunsSection } from './HomeExternalRunsSection';
 import { HomeKnowledgeSection } from './HomeKnowledgeSection';
 import { HomeSessionsSection } from './HomeSessionsSection';
 import type { HomePageProps } from './types';
@@ -64,6 +65,7 @@ export const HomePage: React.FC<HomePageProps> = (props) => {
             onBranchClick={props.onBranchClick}
             onSessionClick={props.onSessionClick}
           />
+          <HomeExternalRunsSection client={props.client} connected={props.connected} />
           <HomeKnowledgeSection client={props.client} connected={props.connected} />
         </aside>
       </div>

@@ -17,6 +17,7 @@ import type {
   ArtifactID,
   BoardID,
   BranchID,
+  ExternalRunID,
   IdInput,
   RepoID,
   ScheduleID,
@@ -74,4 +75,9 @@ export async function resolveArtifactId(ctx: McpContext, id: IdInput): Promise<A
 export async function resolveScheduleId(ctx: McpContext, id: IdInput): Promise<ScheduleID> {
   const entity = await ctx.app.service('schedules').get(id, ctx.baseServiceParams);
   return entity.schedule_id;
+}
+
+export async function resolveExternalRunId(ctx: McpContext, id: IdInput): Promise<ExternalRunID> {
+  const entity = await ctx.app.service('external-runs').get(id, ctx.baseServiceParams);
+  return entity.run_id;
 }

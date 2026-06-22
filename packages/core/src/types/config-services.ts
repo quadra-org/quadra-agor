@@ -134,7 +134,9 @@ export const SERVICE_GROUP_TO_MCP_DOMAINS: Partial<Record<ServiceGroupName, stri
   mcp_servers: ['mcp-servers'],
   leaderboard: ['analytics'],
   scheduler: ['schedules'],
-  knowledge: ['knowledge'],
+  // External Runs piggyback on the knowledge tier (summaries live in the KB).
+  // ponytail: graduate to its own service group if it needs independent gating.
+  knowledge: ['knowledge', 'external-runs'],
 };
 
 /**

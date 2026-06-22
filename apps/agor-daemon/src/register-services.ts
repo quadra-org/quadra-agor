@@ -67,6 +67,11 @@ import { createConfigService } from './services/config.js';
 import { createContextService } from './services/context.js';
 import { createCopilotModelsService } from './services/copilot-models.js';
 import { createCursorModelsService } from './services/cursor-models.js';
+import {
+  createExternalRunEventsService,
+  createExternalRunLinksService,
+  createExternalRunsService,
+} from './services/external-runs.js';
 import { createFileService } from './services/file.js';
 import { createFilesService } from './services/files.js';
 import { createGatewayService } from './services/gateway.js';
@@ -426,6 +431,21 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   });
   app.use('/kb/graph', createKnowledgeGraphService(db), {
     methods: ['find', 'create', 'link', 'neighbors'],
+  });
+
+  // ============================================================================
+  // External Runs (native-harness log-back; see external-runs design doc).
+  // Registered alongside Knowledge — the curated summary lives in the KB.
+  // ============================================================================
+
+  app.use('/external-runs', createExternalRunsService(db), {
+    methods: ['find', 'get', 'create', 'patch', 'remove'],
+  });
+  app.use('/external-run-events', createExternalRunEventsService(db), {
+    methods: ['find', 'get', 'create'],
+  });
+  app.use('/external-run-links', createExternalRunLinksService(db), {
+    methods: ['find', 'get', 'create', 'remove'],
   });
 
   // ============================================================================
