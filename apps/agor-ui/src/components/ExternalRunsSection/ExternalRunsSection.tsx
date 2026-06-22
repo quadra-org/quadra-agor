@@ -107,15 +107,16 @@ interface DetailProps {
   client: AgorClient | null;
   run: ExternalRun;
   onBack: () => void;
+  backLabel?: string;
 }
 
-function ExternalRunDetail({ client, run, onBack }: DetailProps) {
+export function ExternalRunDetail({ client, run, onBack, backLabel = '← All runs' }: DetailProps) {
   const { events, links, loading } = useExternalRunDetail(client, run.run_id);
 
   return (
     <div style={{ height: '100%', overflow: 'auto', padding: '8px 12px' }}>
       <Button type="link" size="small" onClick={onBack} style={{ paddingLeft: 0 }}>
-        ← All runs
+        {backLabel}
       </Button>
 
       <Space direction="vertical" size={4} style={{ width: '100%', marginBottom: 12 }}>
@@ -180,7 +181,7 @@ function ExternalRunDetail({ client, run, onBack }: DetailProps) {
           style={{ marginTop: 8 }}
           items={events.map((e) => ({
             color: EVENT_COLOR[e.event_type] ?? 'gray',
-            children: (
+            content: (
               <Space direction="vertical" size={0}>
                 <Text style={{ fontSize: 13 }}>
                   <Text type="secondary">[{e.event_type}]</Text> {e.body?.message ?? ''}
