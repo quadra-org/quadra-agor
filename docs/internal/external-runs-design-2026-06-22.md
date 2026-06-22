@@ -106,13 +106,12 @@ sessions — **deferred**, not needed for the External Run model.
 
 ## 3. Data model
 
-Three new tables, Drizzle dual-dialect (`packages/core/src/db/schema.sqlite.ts`
-
-- `schema.postgres.ts`, re-exported from `schema.ts`; generate with
-  `pnpm db:generate` in `packages/core`). Follow the `sessions`/`branches` column
-  conventions: `text(36)` UUID PKs, `t.timestamp()` / `t.bool()` / `t.json<T>()`
-  helpers, FK `onDelete` cascade/set-null, soft-delete via `archived` +
-  `archived_at`.
+Three new tables, Drizzle dual-dialect — schemas in
+`packages/core/src/db/schema.sqlite.ts` and `schema.postgres.ts`, re-exported
+from `schema.ts`; generate with `pnpm db:generate` in `packages/core`. Follow
+the `sessions`/`branches` column conventions: `text(36)` UUID PKs,
+`t.timestamp()` / `t.bool()` / `t.json<T>()` helpers, FK `onDelete`
+cascade/set-null, soft-delete via `archived` + `archived_at`.
 
 ### `external_runs`
 
