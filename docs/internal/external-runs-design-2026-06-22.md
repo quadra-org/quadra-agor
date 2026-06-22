@@ -280,14 +280,15 @@ contract is proven with Claude.
   `external-runs` domain (piggybacks the `knowledge` service tier).
 - **Skill** — `skills/agor-logback/` (SKILL.md + `references/setup.md`): when/how
   to log back + the Cloudflare-service-token + `claude mcp add` registration.
-- `@agor/core` and `@agor/daemon` typecheck clean; biome clean.
+- **UI** — External lane: an **External** tab in `BoardAssistantPanel` rendering
+  `ExternalRunsSection` (master list → detail = event timeline + linked artefacts
+  - KB-summary pointer), live via `useExternalRuns` / `useExternalRunDetail`
+    (self-contained Feathers socket subscriptions, no App.tsx plumbing). ponytail:
+    lists all runs (not board-scoped) — runs anchor to branches, not boards.
+- `@agor/core`, `@agor/daemon`, and `apps/agor-ui` typecheck clean; biome clean.
 
 **Remaining for Phase 1 MVP:**
 
-- **UI** — the External lane (`AppExternalRunDataContext`, `ExternalRunsSection`,
-  `ExternalRunPanel`) per §5. Backend already emits Feathers `created`/`patched`
-  events for live updates. _(Largest remaining piece; can be its own PR — the
-  feature is already functional/searchable over MCP without it.)_
 - **Deploy** — repoint the VM `infra/central-daemon/Dockerfile` clone to this
   fork's commit + bump `AGOR_COMMIT` **(change lives in `quadra-q`, not this
   repo)**; provision the Cloudflare Access service token; distribute the skill.

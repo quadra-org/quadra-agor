@@ -30,11 +30,12 @@ import { BranchHeaderPill } from '../BranchHeaderPill';
 import { BoardSessionList } from '../BranchListDrawer';
 import type { BranchModalTab } from '../BranchModal';
 import { CommentsPanel } from '../CommentsPanel';
+import { ExternalRunsSection } from '../ExternalRunsSection/ExternalRunsSection';
 import { MarkdownRenderer } from '../MarkdownRenderer';
 import { CreatedByTag } from '../metadata';
 import { IssuePill, PullRequestPill } from '../Pill';
 
-export type BoardAssistantPanelTab = 'assistant' | 'all-sessions' | 'comments';
+export type BoardAssistantPanelTab = 'assistant' | 'all-sessions' | 'comments' | 'external';
 
 interface BoardAssistantPanelProps {
   board: Board | null;
@@ -401,6 +402,15 @@ export const BoardAssistantPanel: React.FC<BoardAssistantPanelProps> = ({
               </div>
             ) : (
               <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No board selected" />
+            ),
+          },
+          {
+            key: 'external',
+            label: 'External',
+            children: (
+              <div style={{ height: 'calc(100vh - 112px)' }}>
+                <ExternalRunsSection client={client} />
+              </div>
             ),
           },
           {
