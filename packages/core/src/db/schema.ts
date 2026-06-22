@@ -57,6 +57,9 @@ export const kbDocumentUnits = schema.kbDocumentUnits;
 export const kbEmbeddingSpaces = schema.kbEmbeddingSpaces;
 export const kbGraphNodes = schema.kbGraphNodes;
 export const kbGraphEdges = schema.kbGraphEdges;
+export const externalRuns = schema.externalRuns;
+export const externalRunEvents = schema.externalRunEvents;
+export const externalRunLinks = schema.externalRunLinks;
 
 // Re-export all types
 export type * from './schema.sqlite';

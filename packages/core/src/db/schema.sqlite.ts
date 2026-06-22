@@ -2237,3 +2237,128 @@ export const schedulesRelations = relations(schedules, ({ one, many }) => ({
   }),
   sessions: many(sessions),
 }));
+
+/**
+ * External runs - first-class record of work done in a NATIVE harness
+ * (Claude Code, Codex) outside an Agor-spawned session. The harness logs back
+ * over MCP; the daemon owns the writes. NOT a session (no transcript capture in
+ * MVP - structured events + a curated KB summary only).
+ *
+ * See docs/internal/external-runs-design-2026-06-22.md.
+ */
+export const externalRuns = sqliteTable(
+  'external_runs',
+  {
+    run_id: text('run_id', { length: 36 }).primaryKey(),
+    created_by: text('created_by', { length: 36 }).references(() => users.user_id, {
+      onDelete: 'set null',
+    }),
+    harness: text('harness', { enum: ['claude-code', 'codex'] }).notNull(),
+    title: text('title').notNull(),
+    status: text('status', {
+      enum: ['running', 'completed', 'failed', 'abandoned'],
+    })
+      .notNull()
+      .default('running'),
+    // MVP only supports events-only; column exists so opt-in transcript capture
+    // is a value change, not a migration.
+    capture_mode: text('capture_mode', { enum: ['events-only'] })
+      .notNull()
+      .default('events-only'),
+    // Primary work anchor. 'branch' materializes primary_branch_id; 'card' (and
+    // any other anchor) is recorded as the single relationship='primary' row in
+    // external_run_links.
+    primary_anchor_type: text('primary_anchor_type', { enum: ['branch', 'card'] }),
+    primary_branch_id: text('primary_branch_id', { length: 36 }).references(
+      () => branches.branch_id,
+      { onDelete: 'set null' }
+    ),
+    summary_document_id: text('summary_document_id', { length: 36 }).references(
+      () => kbDocuments.document_id,
+      { onDelete: 'set null' }
+    ),
+    data: t.json<{
+      cwd?: string;
+      git_repo?: string;
+      git_branch?: string;
+      git_sha?: string;
+      harness_version?: string;
+      host?: string;
+    }>('data'),
+    created_at: t.timestamp('created_at').notNull(),
+    updated_at: t.timestamp('updated_at'),
+    completed_at: t.timestamp('completed_at'),
+    archived: t.bool('archived').notNull().default(false),
+    archived_at: t.timestamp('archived_at'),
+  },
+  (table) => ({
+    createdByIdx: index('external_runs_created_by_idx').on(table.created_by),
+    statusIdx: index('external_runs_status_idx').on(table.status),
+    harnessIdx: index('external_runs_harness_idx').on(table.harness),
+    primaryBranchIdx: index('external_runs_primary_branch_idx').on(table.primary_branch_id),
+    createdAtIdx: index('external_runs_created_at_idx').on(table.created_at),
+    archivedIdx: index('external_runs_archived_idx').on(table.archived),
+  })
+);
+
+/**
+ * External run events - the continuous structured record of a run. Ordered by
+ * created_at for the UI timeline.
+ */
+export const externalRunEvents = sqliteTable(
+  'external_run_events',
+  {
+    event_id: text('event_id', { length: 36 }).primaryKey(),
+    run_id: text('run_id', { length: 36 })
+      .notNull()
+      .references(() => externalRuns.run_id, { onDelete: 'cascade' }),
+    event_type: text('event_type', {
+      enum: ['start', 'progress', 'checkpoint', 'link', 'summary', 'complete', 'error'],
+    }).notNull(),
+    body: t.json<{ message?: string; details?: Record<string, unknown> }>('body'),
+    created_at: t.timestamp('created_at').notNull(),
+  },
+  (table) => ({
+    runCreatedIdx: index('external_run_events_run_created_idx').on(table.run_id, table.created_at),
+    runIdx: index('external_run_events_run_idx').on(table.run_id),
+    typeIdx: index('external_run_events_type_idx').on(table.event_type),
+  })
+);
+
+/**
+ * External run links - secondary artefacts/work items connected to a run, plus
+ * the one relationship='primary' row when the primary anchor is not a branch.
+ */
+export const externalRunLinks = sqliteTable(
+  'external_run_links',
+  {
+    link_id: text('link_id', { length: 36 }).primaryKey(),
+    run_id: text('run_id', { length: 36 })
+      .notNull()
+      .references(() => externalRuns.run_id, { onDelete: 'cascade' }),
+    target_kind: text('target_kind', {
+      enum: [
+        'github_issue',
+        'github_pr',
+        'commit',
+        'agor_branch',
+        'agor_card',
+        'agor_session',
+        'kb_document',
+      ],
+    }).notNull(),
+    // URL, id, or agor:// URI depending on target_kind.
+    target_ref: text('target_ref').notNull(),
+    relationship: text('relationship', { enum: ['primary', 'secondary'] })
+      .notNull()
+      .default('secondary'),
+    created_at: t.timestamp('created_at').notNull(),
+  },
+  (table) => ({
+    runIdx: index('external_run_links_run_idx').on(table.run_id),
+    runRelationshipIdx: index('external_run_links_run_relationship_idx').on(
+      table.run_id,
+      table.relationship
+    ),
+  })
+);
