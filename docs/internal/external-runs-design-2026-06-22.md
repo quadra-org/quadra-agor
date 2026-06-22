@@ -263,3 +263,37 @@ contract is proven with Claude.
 - Upstreaming: prefer a PR to `preset-io/agor` so we don't carry fork drift
   (External Runs is a generally useful feature); fall back to fork-pin if the
   upstream timeline doesn't fit.
+
+## 10. Implementation status (branch `feat/external-runs-logback`)
+
+**Done:**
+
+- **DB** — `external_runs` / `external_run_events` / `external_run_links` in both
+  Drizzle dialects + additive migrations (sqlite `0059`, postgres `0050`).
+  Migrations hand-authored (main has pre-existing snapshot drift that makes
+  `pnpm db:generate` prompt); sqlite migration verified to apply via `node:sqlite`.
+- **Backend** — `ExternalRun*Repository` (`@agor/core`), three Feathers services
+  (`/external-runs`, `/external-run-events`, `/external-run-links`) registered
+  alongside Knowledge, auth/role hooks, `resolveExternalRunId`.
+- **MCP** — `agor_external_run_*` tools (`start`, `log`, `set_anchor`, `link`,
+  `publish_summary`, `complete`) + `agor_external_runs_list` / `_get`, under a new
+  `external-runs` domain (piggybacks the `knowledge` service tier).
+- **Skill** — `skills/agor-logback/` (SKILL.md + `references/setup.md`): when/how
+  to log back + the Cloudflare-service-token + `claude mcp add` registration.
+- `@agor/core` and `@agor/daemon` typecheck clean; biome clean.
+
+**Remaining for Phase 1 MVP:**
+
+- **UI** — the External lane (`AppExternalRunDataContext`, `ExternalRunsSection`,
+  `ExternalRunPanel`) per §5. Backend already emits Feathers `created`/`patched`
+  events for live updates. _(Largest remaining piece; can be its own PR — the
+  feature is already functional/searchable over MCP without it.)_
+- **Deploy** — repoint the VM `infra/central-daemon/Dockerfile` clone to this
+  fork's commit + bump `AGOR_COMMIT` **(change lives in `quadra-q`, not this
+  repo)**; provision the Cloudflare Access service token; distribute the skill.
+- **Validation** — boot the daemon on the VM (runs the migration), register the
+  MCP server in a native Claude Code session, run the full lifecycle end-to-end.
+
+**`work_items_search` (issue item 2)** intentionally not a dedicated tool — the
+skill uses existing `agor_branches_list` / `agor_kb_search` / GitHub to find an
+anchor. Add a wrapper later only if the indirection proves clumsy.
