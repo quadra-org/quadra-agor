@@ -2207,6 +2207,12 @@ export type KBGraphNodeRow = typeof kbGraphNodes.$inferSelect;
 export type KBGraphNodeInsert = typeof kbGraphNodes.$inferInsert;
 export type KBGraphEdgeRow = typeof kbGraphEdges.$inferSelect;
 export type KBGraphEdgeInsert = typeof kbGraphEdges.$inferInsert;
+export type ExternalRunRow = typeof externalRuns.$inferSelect;
+export type ExternalRunInsert = typeof externalRuns.$inferInsert;
+export type ExternalRunEventRow = typeof externalRunEvents.$inferSelect;
+export type ExternalRunEventInsert = typeof externalRunEvents.$inferInsert;
+export type ExternalRunLinkRow = typeof externalRunLinks.$inferSelect;
+export type ExternalRunLinkInsert = typeof externalRunLinks.$inferInsert;
 
 /**
  * Drizzle Relations for Relational Queries

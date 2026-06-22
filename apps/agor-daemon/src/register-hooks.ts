@@ -2435,6 +2435,34 @@ export function registerHooks(ctx: RegisterHooksContext): void {
   });
 
   // ============================================================================
+  // External Runs hooks (native-harness log-back)
+  // ============================================================================
+  // v1 scope: authenticated users can read/write their own runs. Branch-level
+  // RBAC on the primary anchor is deferred (see external-runs design §2.2);
+  // runs are created by an agor_sk_ key owner and attributed via created_by.
+  app.service('external-runs').hooks({
+    before: {
+      all: [requireAuth],
+      create: [requireMinimumRole(ROLES.MEMBER, 'create external runs'), injectCreatedBy()],
+      patch: [requireMinimumRole(ROLES.MEMBER, 'update external runs')],
+      remove: [requireMinimumRole(ROLES.MEMBER, 'delete external runs')],
+    },
+  });
+  app.service('external-run-events').hooks({
+    before: {
+      all: [requireAuth],
+      create: [requireMinimumRole(ROLES.MEMBER, 'log external run events')],
+    },
+  });
+  app.service('external-run-links').hooks({
+    before: {
+      all: [requireAuth],
+      create: [requireMinimumRole(ROLES.MEMBER, 'link external run artefacts')],
+      remove: [requireMinimumRole(ROLES.MEMBER, 'remove external run links')],
+    },
+  });
+
+  // ============================================================================
   // Tasks hooks
   // ============================================================================
 

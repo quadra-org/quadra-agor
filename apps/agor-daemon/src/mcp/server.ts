@@ -36,6 +36,7 @@ import { registerBranchTools } from './tools/branches.js';
 import { registerCardTypeTools } from './tools/card-types.js';
 import { registerCardTools } from './tools/cards.js';
 import { registerEnvironmentTools } from './tools/environment.js';
+import { registerExternalRunTools } from './tools/external-runs.js';
 import { registerKnowledgeTools } from './tools/knowledge.js';
 import { registerMcpServerTools } from './tools/mcp-servers.js';
 import { registerMessageTools } from './tools/messages.js';
@@ -210,6 +211,7 @@ const DOMAIN_TOOL_REGISTRARS: DomainToolRegistrar[] = [
   { domain: 'analytics', register: registerAnalyticsTools },
   { domain: 'mcp-servers', register: registerMcpServerTools },
   { domain: 'knowledge', register: registerKnowledgeTools },
+  { domain: 'external-runs', register: registerExternalRunTools },
   { domain: 'schedules', register: registerScheduleTools },
 ];
 

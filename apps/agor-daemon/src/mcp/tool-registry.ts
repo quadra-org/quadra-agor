@@ -56,6 +56,8 @@ export const DOMAIN_DESCRIPTIONS: Record<string, string> = {
   widgets:
     'In-conversation interactive widgets — agents render small forms/buttons inline in the transcript to capture user input that never enters the LLM context',
   knowledge: 'DB-backed markdown knowledge documents, version history, search, and graph links',
+  'external-runs':
+    'First-class records of work done in a native harness (Claude Code, Codex) outside an Agor session — start/log/anchor/link/summarize/complete a logged external run',
   schedules: 'Cron-based branch schedules that create sessions from prompt templates',
 };
 

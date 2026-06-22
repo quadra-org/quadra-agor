@@ -12,6 +12,7 @@ export * from './boards';
 export * from './branches';
 export * from './card-types';
 export * from './cards';
+export * from './external-runs';
 export * from './gateway-channels';
 export * from './groups';
 export * from './knowledge';
