@@ -23,6 +23,7 @@ and stop; don't fake the log-back.
 ## When to call what
 
 Lifecycle: **start → log\* → (set_anchor, link)\* → publish_summary? → complete.**
+Reopen and delete are recovery tools, off the happy path — see below.
 
 | Moment                                                                       | Tool                                                                                                                          |
 | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
@@ -30,7 +31,7 @@ Lifecycle: **start → log\* → (set_anchor, link)\* → publish_summary? → c
 | A meaningful checkpoint — a decision, milestone, or blocker (NOT every turn) | `agor_external_run_log` — `eventType: progress\|checkpoint\|error` + a one-line `message`.                                    |
 | Once a branch exists for the work                                            | `agor_external_run_set_anchor` — `branchId` (preferred) or `cardId`.                                                          |
 | When a PR / issue / commit appears                                           | `agor_external_run_link` — `targetKind` + `targetRef` (URL or id).                                                            |
-| At completion (or a major checkpoint)                                        | publish a summary, then complete (below).                                                                                     |
+| At completion (and only when the user says so)                               | publish a summary, then complete (below).                                                                                     |
 
 ### Self-pacing the event log
 
@@ -44,14 +45,41 @@ to summarizing at completion**, not mid-run, unless the user asks earlier.
 
 1. Author/update the doc with **`agor_kb_put`** — `kind: "external"`, covering:
    **outcome, artefacts (PR/branch/files), decisions, follow-ups.**
-2. Pass its `documentId` to **`agor_external_run_publish_summary`**.
+2. **Suggest links before saving.** Run `agor_kb_search` scoped to the target
+   `namespace` (and a `pathPrefix` if you know one) using the run's key terms —
+   repos, features, components, the issue/PR subject. Each hit carries a
+   `reference_uri` (`agor://kb/document/<id>`). Pick the genuinely related ones
+   and embed them as markdown links in the summary body; each resolvable link
+   becomes a `references` graph edge automatically on save. Show the user the
+   candidates you found and which you linked — don't link blindly, and don't
+   invent URIs. Prefer the rename-proof `reference_uri` form over namespace/path.
+3. Pass the doc's `documentId` to **`agor_external_run_publish_summary`**.
 
-Don't reimplement KB writes — `agor_kb_put` owns that.
+Don't reimplement KB writes or link resolution — `agor_kb_put` owns that.
 
 ### Completing
 
 `agor_external_run_complete` — `status: completed` (success), `failed` (errored
 stop), or `abandoned` (dropped). Add a closing `message`.
+
+**Never complete a run on your own initiative.** Completion is terminal and the
+user owns it. Call `agor_external_run_complete` ONLY when the user explicitly
+says they are done (e.g. "complete the run", "mark it done", "wrap up agor").
+Finishing a code change, opening a PR, or going quiet are NOT completion
+signals — the user often keeps working past those. When work looks finished but
+the user hasn't said so, keep the run `running` and, at most, ask whether to
+complete; do not call it.
+
+## Reversing & cleanup (recovery tools)
+
+- **Completed too early / by mistake** → `agor_external_run_reopen`. Sets status
+  back to `running`, clears the completed timestamp, appends a reopen marker to
+  the timeline (the prior `complete` event stays — the log is append-only). Then
+  keep logging as normal.
+- **Run created in error / test junk** → `agor_external_run_delete`. PERMANENTLY
+  removes the run and all its events and links. Irreversible — confirm with the
+  user first, and never delete a run that holds real work history. To merely set
+  it aside, reopen or leave it completed instead.
 
 ## Resuming / inspecting
 
@@ -63,3 +91,5 @@ stop), or `abandoned` (dropped). Add a closing `message`.
 - One run per coherent task. Don't start a new run for every prompt.
 - Never block real work on log-back; if a tool errors, note it and continue.
 - The run is attributed to the API-key owner — no need to pass a user.
+- Completion and deletion are user-driven, not agent-driven — wait for an
+  explicit instruction (see Completing / Reversing & cleanup above).
