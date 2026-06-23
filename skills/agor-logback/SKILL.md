@@ -13,12 +13,12 @@ event log, links to the branch/PR/issue, and a curated Knowledge summary.
 Do NOT dump the transcript — this is structured events + a summary, not a
 chat mirror.
 
-## Prerequisite: the `agor` MCP server
+## Prerequisite: the `quadra_central_agor_mcp` MCP server
 
-These tools come from the `agor` MCP server pointed at the central instance.
-Register it once (user scope) — see `references/setup.md`. Verify with
-`claude mcp list` → `agor … ✔ Connected`. If it's not connected, tell the user
-and stop; don't fake the log-back.
+These tools come from the `quadra_central_agor_mcp` MCP server pointed at the
+central instance. Register it once (user scope) — see `references/setup.md`.
+Verify with `claude mcp list` → `quadra_central_agor_mcp … ✔ Connected`. If it's
+not connected, tell the user and stop; don't fake the log-back.
 
 ## When to call what
 
