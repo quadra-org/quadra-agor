@@ -83,6 +83,42 @@ Claude will drive the tools as it works:
 You don't run any of these by hand — the skill paces them. You can also nudge:
 "log that as a checkpoint", "link PR #123", "wrap up and publish the summary".
 
+### Two ways to drive it
+
+**Minimal** — just trace the work:
+
+> start run → "checkpoint that" at each milestone → (PR opens) "link the PR and
+> the commit, then complete the run"
+
+No Knowledge doc, no branch anchor — a clean event trail + links. Good for small
+tasks.
+
+**Full** — trace + anchor + durable writeup:
+
+> start run → "checkpoint that" × N → "anchor this run to branch `<name>`" →
+> "link the PR and commit" → **"publish a summary"** → "complete the run"
+
+Adds the branch anchor (`set_anchor`) and a curated Knowledge doc
+(`publish_summary`). Use when the work deserves a writeup the team will read
+later.
+
+> **`complete` does NOT write Knowledge.** If you want the summary doc, say
+> "publish a summary" _before_ (or as part of) completing. `complete` only flips
+> the run to its terminal status.
+
+### Publishing to Knowledge directly (no run needed)
+
+The Knowledge base is a separate capability of the same MCP server — you don't
+need a run to write to it. Any time, say:
+
+> "save this to the Agor knowledge base" (e.g. a decision, a design note, a
+> runbook)
+
+Claude writes a KB doc via `agor_kb_put` and it lands at
+https://agor.quadraplatform.com → **Knowledge** / the Home "Recent Knowledge"
+card. A run's `publish_summary` is just the special case of _attaching_ a KB doc
+to a run — the KB write itself stands alone.
+
 ---
 
 ## 3. Where to watch it (the payoff)
