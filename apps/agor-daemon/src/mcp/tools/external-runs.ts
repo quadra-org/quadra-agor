@@ -336,4 +336,73 @@ export function registerExternalRunTools(server: McpServer, ctx: McpContext): vo
       return textResult(run);
     }
   );
+
+  // agor_external_run_reopen
+  server.registerTool(
+    'agor_external_run_reopen',
+    {
+      description:
+        'Reopen a run that was completed prematurely or by mistake: sets status back to "running", clears the completed timestamp, and logs a checkpoint event so the timeline records the reversal. Use when work continued after a complete call. Does NOT remove the prior complete event (the log is append-only) — it appends a reopen marker.',
+      inputSchema: z.strictObject({
+        runId: mcpRequiredId('runId', 'ExternalRun'),
+        message: mcpOptionalString('message', 'Why the run is being reopened'),
+      }),
+    },
+    async (args) => {
+      const runId = await resolveExternalRunId(ctx, args.runId);
+      const run = await ctx.app
+        .service('external-runs')
+        .patch(runId, { status: 'running', completed_at: null }, ctx.baseServiceParams);
+      await ctx.app.service('external-run-events').create(
+        {
+          run_id: runId,
+          event_type: 'checkpoint',
+          body: { message: args.message ?? 'Reopened run (was completed)' },
+        },
+        ctx.baseServiceParams
+      );
+      return textResult(run);
+    }
+  );
+
+  // agor_external_run_delete
+  server.registerTool(
+    'agor_external_run_delete',
+    {
+      description:
+        'PERMANENTLY delete an external run and all of its events and links. Irreversible — use only for runs created in error or test/junk runs. To merely hide a finished run, complete it (or reopen) instead; do not delete real work history.',
+      annotations: { destructiveHint: true },
+      inputSchema: z.strictObject({
+        runId: mcpRequiredId('runId', 'ExternalRun'),
+      }),
+    },
+    async (args) => {
+      const runId = await resolveExternalRunId(ctx, args.runId);
+      // Explicit child cleanup: the FK cascade only fires when SQLite FK
+      // enforcement is on, so delete events/links directly to avoid orphans.
+      const events = rows<ExternalRunEvent>(
+        await ctx.app
+          .service('external-run-events')
+          .find({ query: { run_id: runId, $limit: 1000 }, ...ctx.baseServiceParams })
+      );
+      for (const event of events) {
+        await ctx.app.service('external-run-events').remove(event.event_id, ctx.baseServiceParams);
+      }
+      const links = rows<ExternalRunLink>(
+        await ctx.app
+          .service('external-run-links')
+          .find({ query: { run_id: runId, $limit: 1000 }, ...ctx.baseServiceParams })
+      );
+      for (const link of links) {
+        await ctx.app.service('external-run-links').remove(link.link_id, ctx.baseServiceParams);
+      }
+      await ctx.app.service('external-runs').remove(runId, ctx.baseServiceParams);
+      return textResult({
+        deleted: true,
+        run_id: runId,
+        events: events.length,
+        links: links.length,
+      });
+    }
+  );
 }
